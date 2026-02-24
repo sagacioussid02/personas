@@ -63,9 +63,9 @@ fi
 
 # Run terraform destroy with auto-approve
 if [ "$ENVIRONMENT" = "prod" ] && [ -f "prod.tfvars" ]; then
-    terraform destroy -var-file=prod.tfvars -var="project_name=$PROJECT_NAME" -var="environment=$ENVIRONMENT" -auto-approve
+    terraform destroy -lock=false -var-file=prod.tfvars -var="project_name=$PROJECT_NAME" -var="environment=$ENVIRONMENT" -auto-approve
 else
-    terraform destroy -var="project_name=$PROJECT_NAME" -var="environment=$ENVIRONMENT" -auto-approve
+    terraform destroy -lock=false -var="project_name=$PROJECT_NAME" -var="environment=$ENVIRONMENT" -auto-approve
 fi
 
 echo "✅ Infrastructure for ${ENVIRONMENT} has been destroyed!"
