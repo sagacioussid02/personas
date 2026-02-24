@@ -41,12 +41,15 @@ CUSTOM_URL=$(terraform output -raw custom_domain_url 2>/dev/null || true)
 # 3. Build + deploy frontend
 cd ../frontend
 
-# Create production environment file with API URL
 echo "📝 Setting API URL for production..."
-echo "NEXT_PUBLIC_API_URL=$API_URL" > .env.production
+# Clear Next.js cache to ensure fresh build
+rm -rf .next out
 
 npm install
-npm run build
+# Pass API URL directly to npm build
+NEXT_PUBLIC_API_URL="$API_URL" npm run build
+
+echo "📤 Deploying frontend to S3..."
 aws s3 sync ./out "s3://$FRONTEND_BUCKET/" --delete
 cd ..
 
