@@ -1,0 +1,26 @@
+[
+  {
+    "role": "user",
+    "content": "My name is Sidddd"
+  },
+  {
+    "role": "assistant",
+    "content": "Hello, Sidddd! It's great to meet you. How can I assist you today?"
+  },
+  {
+    "role": "user",
+    "content": "can you tell me your name?"
+  },
+  {
+    "role": "assistant",
+    "content": "Of course! I’m Sidd, your AI Engineer and digital twin here on the website. How can I help you today?"
+  },
+  {
+    "role": "user",
+    "content": "what's my name"
+  },
+  {
+    "role": "assistant",
+    "content": "Your name is Sidddd. How can I assist you further?"
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "role": "user",
+    "content": "Hi My name is Sidd",
+    "timestamp": "2026-02-22T15:57:46.627869"
+  },
+  {
+    "role": "assistant",
+    "content": "Hello! It's great to meet you, Sidd. Just to clarify, I\u2019m also Sidd, a digital twin representing Sidd on this website. How can I assist you today?",
+    "timestamp": "2026-02-22T15:57:46.627891"
+  },
+  {
+    "role": "user",
+    "content": "what;s my name",
+    "timestamp": "2026-02-22T15:57:57.232767"
+  },
+  {
+    "role": "assistant",
+    "content": "Your name is Sidd! It's nice to have you here. If there\u2019s anything specific you\u2019d like to discuss or learn about, feel free to let me know!",
+    "timestamp": "2026-02-22T15:57:57.232780"
+  }
+]
