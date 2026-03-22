@@ -356,7 +356,7 @@ export default function CreatePage() {
                   <h2 className="text-2xl font-semibold text-gray-800 mb-1">Your twin is ready!</h2>
                   {twinResult && (
                     <a
-                      href={`/twin/${twinResult.twin_id}`}
+                      href={`/twin?id=${twinResult.twin_id}`}
                       className="mt-2 inline-flex items-center gap-2 px-5 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors text-sm font-medium"
                     >
                       Talk to your twin →

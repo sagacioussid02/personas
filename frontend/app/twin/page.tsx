@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useRef, useEffect, use } from 'react';
+import { useState, useRef, useEffect, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { Send, User, ArrowLeft } from 'lucide-react';
 
 interface Message {
@@ -20,8 +21,9 @@ interface TwinProfile {
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
-export default function TwinPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+function TwinChat() {
+  const searchParams = useSearchParams();
+  const id = searchParams.get('id');
 
   const [profile, setProfile] = useState<TwinProfile | null>(null);
   const [profileError, setProfileError] = useState('');
@@ -32,13 +34,14 @@ export default function TwinPage({ params }: { params: Promise<{ id: string }> }
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (!id) { setProfileError('No twin ID provided.'); return; }
     fetch(`${API}/twin/${id}`)
       .then(r => {
         if (!r.ok) throw new Error('Twin not found');
         return r.json();
       })
       .then(setProfile)
-      .catch(() => setProfileError('This twin doesn\'t exist or has been removed.'));
+      .catch(() => setProfileError("This twin doesn't exist or has been removed."));
   }, [id]);
 
   useEffect(() => {
@@ -148,13 +151,11 @@ export default function TwinPage({ params }: { params: Promise<{ id: string }> }
 
           {/* Chat */}
           <div className="h-[520px] flex flex-col bg-white rounded-xl shadow-sm border border-gray-100">
-            {/* Chat header */}
             <div className="bg-gradient-to-r from-purple-600 to-blue-600 text-white p-4 rounded-t-xl">
               <p className="font-semibold">Talk to {firstName}&apos;s Twin</p>
               <p className="text-xs text-purple-100 mt-0.5">Ask anything — including &quot;what would you do?&quot;</p>
             </div>
 
-            {/* Messages */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
               {messages.length === 0 && (
                 <div className="text-center text-gray-400 mt-10 space-y-3">
@@ -164,9 +165,9 @@ export default function TwinPage({ params }: { params: Promise<{ id: string }> }
                   <p className="font-medium text-gray-600">Hi, I&apos;m {firstName}&apos;s AI Twin</p>
                   <div className="flex flex-wrap gap-2 justify-center max-w-sm mx-auto">
                     {[
-                      `What would you do if you had to choose between X and Y?`,
-                      `How do you approach hard decisions?`,
-                      `Tell me about yourself`,
+                      'What would you do if you had to choose between X and Y?',
+                      'How do you approach hard decisions?',
+                      'Tell me about yourself',
                     ].map((q, i) => (
                       <button key={i} onClick={() => setInput(q)}
                         className="text-xs bg-gray-50 border border-gray-200 text-gray-600 px-3 py-1.5 rounded-full hover:bg-purple-50 hover:border-purple-200 hover:text-purple-600 transition-colors">
@@ -215,7 +216,6 @@ export default function TwinPage({ params }: { params: Promise<{ id: string }> }
               <div ref={messagesEndRef} />
             </div>
 
-            {/* Input */}
             <div className="border-t border-gray-100 p-4">
               <div className="flex gap-2">
                 <input
@@ -245,5 +245,21 @@ export default function TwinPage({ params }: { params: Promise<{ id: string }> }
         </div>
       </div>
     </main>
+  );
+}
+
+export default function TwinPage() {
+  return (
+    <Suspense fallback={
+      <main className="min-h-screen bg-gradient-to-br from-slate-50 to-gray-100 flex items-center justify-center">
+        <div className="flex gap-2">
+          <div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" />
+          <div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce delay-100" />
+          <div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce delay-200" />
+        </div>
+      </main>
+    }>
+      <TwinChat />
+    </Suspense>
   );
 }
