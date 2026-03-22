@@ -528,4 +528,4 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)  # nosec B104 — local dev only, not used in Lambda
