@@ -48,9 +48,22 @@ if USE_S3:
 
 
 # Request/Response models
+TWINS_DIR = os.path.join(os.path.dirname(__file__), "twins")
+
+
+def load_twin(twin_id: str) -> Optional[dict]:
+    """Load a saved twin's data by ID"""
+    path = os.path.join(TWINS_DIR, f"{twin_id}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    twin_id: Optional[str] = None  # if set, chat with a user-created twin
 
 
 class ChatResponse(BaseModel):
@@ -105,17 +118,16 @@ def save_conversation(session_id: str, messages: List[Dict]):
             json.dump(messages, f, indent=2)
 
 
-def call_bedrock(conversation: List[Dict], user_message: str) -> str:
+def call_bedrock(conversation: List[Dict], user_message: str, personality_model: Optional[dict] = None, twin_name: Optional[str] = None, twin_title: Optional[str] = None) -> str:
     """Call AWS Bedrock with conversation history"""
-    
+
     # Build messages in Bedrock format
     messages = []
-    
-    # Add system prompt as first user message
-    # Or there's a better way to do this - pass in system=[{"text": prompt()}] to the converse call below
+
+    system_prompt = prompt(personality_model=personality_model, twin_name=twin_name, twin_title=twin_title)
     messages.append({
-        "role": "user", 
-        "content": [{"text": f"System: {prompt()}"}]
+        "role": "user",
+        "content": [{"text": f"System: {system_prompt}"}]
     })
     
     # Add conversation history (limit to last 25 exchanges)
@@ -182,14 +194,24 @@ async def health_check():
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
-        # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
-
-        # Load conversation history
         conversation = load_conversation(session_id)
 
-        # Call Bedrock for response
-        assistant_response = call_bedrock(conversation, request.message)
+        # Load twin personality model if twin_id provided
+        personality_model = None
+        twin_name = None
+        twin_title = None
+        if request.twin_id:
+            twin_data = load_twin(request.twin_id)
+            if not twin_data:
+                raise HTTPException(status_code=404, detail=f"Twin '{request.twin_id}' not found")
+            personality_model = twin_data.get("personality_model", {})
+            # Attach raw fields so context builder can access them
+            personality_model["_raw"] = twin_data.get("raw", {})
+            twin_name = twin_data.get("name")
+            twin_title = twin_data.get("title")
+
+        assistant_response = call_bedrock(conversation, request.message, personality_model, twin_name, twin_title)
 
         # Update conversation history
         conversation.append(
