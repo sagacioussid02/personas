@@ -88,6 +88,12 @@ export default function Home() {
 
           <footer className="mt-8 text-center text-sm text-gray-500">
             <p>Your AI Companion Awaits</p>
+            <a
+              href="/create"
+              className="mt-3 inline-block text-purple-600 hover:text-purple-800 font-medium underline underline-offset-2"
+            >
+              Create your own twin →
+            </a>
           </footer>
         </div>
       </div>

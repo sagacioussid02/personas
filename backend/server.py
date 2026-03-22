@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -9,6 +9,8 @@ import uuid
 from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
+from pypdf import PdfReader
+import io
 from context import prompt
 
 # Load environment variables
@@ -301,6 +303,66 @@ async def get_taglines():
         tagline_cache["taglines"] = fallback
         tagline_cache["timestamp"] = datetime.now()
         return {"taglines": fallback}
+
+
+@app.post("/parse-linkedin")
+async def parse_linkedin(file: UploadFile = File(...)):
+    """Extract structured profile data from a LinkedIn PDF using Bedrock"""
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    try:
+        contents = await file.read()
+        reader = PdfReader(io.BytesIO(contents))
+        text = ""
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {str(e)}")
+
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
+
+    extract_prompt = f"""You are extracting structured profile data from a LinkedIn PDF export.
+
+LinkedIn PDF content:
+{text[:6000]}
+
+Extract the following fields and return ONLY a valid JSON object with these exact keys:
+{{
+  "name": "full name",
+  "title": "current job title and company",
+  "bio": "2-3 sentence professional summary",
+  "skills": "comma-separated list of top skills",
+  "experience": "bullet list of roles: Company (dates): what they did",
+  "achievements": "notable achievements, awards, or highlights",
+  "communicationStyle": "inferred communication style based on their writing and background"
+}}
+
+If a field cannot be determined, use an empty string. Return only the JSON, no other text."""
+
+    try:
+        response = bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": extract_prompt}]}],
+            inferenceConfig={"maxTokens": 1500, "temperature": 0.2},
+        )
+        response_text = response["output"]["message"]["content"][0]["text"]
+
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not json_match:
+            raise HTTPException(status_code=500, detail="Could not parse AI response")
+
+        parsed = json.loads(json_match.group())
+        return parsed
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
 
 
 if __name__ == "__main__":
