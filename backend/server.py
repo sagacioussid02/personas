@@ -404,6 +404,22 @@ class CreateTwinRequest(BaseModel):
     blindSpots: str = ""
 
 
+@app.get("/twin/{twin_id}")
+async def get_twin(twin_id: str):
+    """Fetch public profile data for a twin"""
+    twin_data = load_twin(twin_id)
+    if not twin_data:
+        raise HTTPException(status_code=404, detail="Twin not found")
+    return {
+        "twin_id": twin_data["twin_id"],
+        "name": twin_data["name"],
+        "title": twin_data.get("title", ""),
+        "personality_summary": twin_data.get("personality_model", {}).get("personality_summary", ""),
+        "core_values": twin_data.get("personality_model", {}).get("core_values", []),
+        "created_at": twin_data.get("created_at", ""),
+    }
+
+
 @app.post("/create-twin")
 async def create_twin(request: CreateTwinRequest):
     """Synthesize submitted profile data into a structured personality model via Bedrock"""
@@ -497,6 +513,7 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
         "personality_model": personality_model,
         "raw": request.model_dump(),
         "created_at": datetime.now().isoformat(),
+        "chat_url": f"/twin/{twin_id}",
     }
 
     # Save locally for now (will move to DB/S3 in next step)

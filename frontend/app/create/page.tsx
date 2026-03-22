@@ -353,10 +353,18 @@ export default function CreatePage() {
                   <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-4">
                     <Check className="w-8 h-8 text-purple-600" />
                   </div>
-                  <h2 className="text-2xl font-semibold text-gray-800 mb-1">Your twin is being built!</h2>
-                  <p className="text-gray-500 text-sm">
-                    {form.email ? `We'll send the link to ${form.email} when it's ready.` : "We'll have it ready for you soon."}
-                  </p>
+                  <h2 className="text-2xl font-semibold text-gray-800 mb-1">Your twin is ready!</h2>
+                  {twinResult && (
+                    <a
+                      href={`/twin/${twinResult.twin_id}`}
+                      className="mt-2 inline-flex items-center gap-2 px-5 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors text-sm font-medium"
+                    >
+                      Talk to your twin →
+                    </a>
+                  )}
+                  {form.email && (
+                    <p className="text-gray-400 text-xs mt-2">We&apos;ll also send the link to {form.email}</p>
+                  )}
                 </div>
 
                 {twinResult && (
