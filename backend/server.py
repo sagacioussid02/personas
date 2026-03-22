@@ -365,6 +365,127 @@ If a field cannot be determined, use an empty string. Return only the JSON, no o
         raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
 
 
+class CreateTwinRequest(BaseModel):
+    name: str
+    title: str
+    bio: str
+    email: str = ""
+    skills: str = ""
+    experience: str = ""
+    achievements: str = ""
+    coreValues: str = ""
+    decisionStyle: str = ""
+    riskTolerance: str = ""
+    pastDecisions: str = ""
+    communicationStyle: str = ""
+    writingSamples: str = ""
+    blindSpots: str = ""
+
+
+@app.post("/create-twin")
+async def create_twin(request: CreateTwinRequest):
+    """Synthesize submitted profile data into a structured personality model via Bedrock"""
+
+    synthesis_prompt = f"""You are building a personality model for an AI twin. Your job is to deeply analyze everything provided and produce a structured JSON model that captures how this person THINKS and DECIDES — not just what they've done.
+
+This model will be used to answer questions like "What would {request.name} do?" in real situations.
+
+=== PROFILE DATA ===
+
+Name: {request.name}
+Title: {request.title}
+Bio: {request.bio}
+
+Skills: {request.skills}
+
+Work Experience:
+{request.experience}
+
+Achievements:
+{request.achievements}
+
+Core Values:
+{request.coreValues}
+
+Decision-Making Style:
+{request.decisionStyle}
+
+Risk Tolerance: {request.riskTolerance}
+
+Past Decisions & Reasoning:
+{request.pastDecisions}
+
+Communication Style:
+{request.communicationStyle}
+
+Writing Samples/Links:
+{request.writingSamples}
+
+Blind Spots & Biases:
+{request.blindSpots}
+
+=== TASK ===
+
+Analyze all of the above and return ONLY a valid JSON object with this exact structure:
+
+{{
+  "core_values": ["value 1", "value 2", ...],
+  "decision_heuristics": [
+    "When facing X type of decision, they tend to Y",
+    ...
+  ],
+  "risk_profile": "one paragraph describing how they approach risk and uncertainty",
+  "what_they_optimize_for": ["thing 1", "thing 2", ...],
+  "what_they_avoid": ["thing 1", "thing 2", ...],
+  "communication_traits": ["trait 1", "trait 2", ...],
+  "blind_spots": ["blind spot 1", "blind spot 2", ...],
+  "decision_framework": "2-3 sentence summary of their overall decision-making philosophy",
+  "personality_summary": "3-4 sentence paragraph capturing the essence of who this person is and how they operate — written in second person as if talking to their twin"
+}}
+
+Be specific and concrete. Avoid generic statements. Infer from the data even when not explicit. Return only the JSON."""
+
+    try:
+        response = bedrock_client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": synthesis_prompt}]}],
+            inferenceConfig={"maxTokens": 2000, "temperature": 0.3},
+        )
+        response_text = response["output"]["message"]["content"][0]["text"]
+
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not json_match:
+            raise HTTPException(status_code=500, detail="Could not parse personality model from AI response")
+
+        personality_model = json.loads(json_match.group())
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
+
+    twin_id = str(uuid.uuid4())[:8]
+
+    twin_data = {
+        "twin_id": twin_id,
+        "name": request.name,
+        "title": request.title,
+        "email": request.email,
+        "personality_model": personality_model,
+        "raw": request.model_dump(),
+        "created_at": datetime.now().isoformat(),
+    }
+
+    # Save locally for now (will move to DB/S3 in next step)
+    twins_dir = os.path.join(os.path.dirname(__file__), "twins")
+    os.makedirs(twins_dir, exist_ok=True)
+    with open(os.path.join(twins_dir, f"{twin_id}.json"), "w") as f:
+        json.dump(twin_data, f, indent=2)
+
+    return {"twin_id": twin_id, "personality_model": personality_model}
+
+
 if __name__ == "__main__":
     import uvicorn
 
