@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef } from 'react';
+import type { ReactNode, ChangeEvent } from 'react';
 import { ArrowLeft, ArrowRight, Check, Upload, Loader2 } from 'lucide-react';
 
 interface FormData {
@@ -71,7 +72,7 @@ const empty: FormData = {
 };
 
 function Field({ label, required, hint, children }: {
-  label: string; required?: boolean; hint?: string; children: React.ReactNode;
+  label: string; required?: boolean; hint?: string; children: ReactNode;
 }) {
   return (
     <div>
@@ -105,10 +106,10 @@ export default function CreatePage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const set = (field: keyof FormData) =>
-    (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) =>
+    (e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) =>
       setForm(prev => ({ ...prev, [field]: e.target.value }));
 
-  const handleLinkedInUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleLinkedInUpload = async (e: ChangeEvent<HTMLInputElement>) => {
     if (parsing) return;
     const file = e.target.files?.[0];
     if (!file) return;

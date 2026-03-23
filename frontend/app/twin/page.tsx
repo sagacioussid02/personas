@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect, Suspense } from 'react';
+import type { KeyboardEvent } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Send, User, ArrowLeft } from 'lucide-react';
 
@@ -88,7 +89,7 @@ function TwinChat() {
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   };
 
