@@ -66,7 +66,9 @@ jobs:
 
       - name: npm audit
         working-directory: frontend
-        run: npm audit --audit-level=high --json > ../npm-audit-report.json || true && npm audit --audit-level=high
+        run: |
+          npm audit --audit-level=high --json > ../npm-audit-report.json || true
+          npm audit --audit-level=high
 
       - name: Upload report
         if: always()

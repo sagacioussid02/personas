@@ -501,8 +501,25 @@ class CreateTwinRequest(BaseModel):
         "communicationStyle", "writingSamples", "blindSpots",
     )
     @classmethod
-    def strip_optional(cls, v: str) -> str:
-        return v.strip()
+    def strip_optional(cls, v: str, info) -> str:
+        v = v.strip()
+        limits = {
+            "email": 254,       # RFC 5321 max
+            "skills": 1000,
+            "experience": 5000,
+            "achievements": 2000,
+            "coreValues": 2000,
+            "decisionStyle": 3000,
+            "riskTolerance": 500,
+            "pastDecisions": 3000,
+            "communicationStyle": 2000,
+            "writingSamples": 1000,
+            "blindSpots": 2000,
+        }
+        limit = limits.get(info.field_name, 2000)
+        if len(v) > limit:
+            raise ValueError(f"{info.field_name} must be {limit} characters or fewer")
+        return v
 
 
 @app.get("/twin/{twin_id}")
