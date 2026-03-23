@@ -22,7 +22,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR=$(gh pr list --head "${{ github.ref_name }}" --base main --json number --jq '.[0].number')
+          PR=$(gh pr list --head "${{ github.ref_name }}" --base main --json number --jq '.[0].number // ""')
           echo "pr_number=$PR" >> $GITHUB_OUTPUT
 
       - name: Generate PR description

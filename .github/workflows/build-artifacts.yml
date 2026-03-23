@@ -56,10 +56,18 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Ensure NEXT_PUBLIC_API_URL is set
+        run: |
+          if [ -z "${{ vars.NEXT_PUBLIC_API_URL }}" ]; then
+            echo "ERROR: Repository variable NEXT_PUBLIC_API_URL is not set."
+            echo "Set it under Settings → Variables → Actions before building artifacts."
+            exit 1
+          fi
+
       - name: Build
         working-directory: frontend
         env:
-          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:8000' }}
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
         run: npm run build
 
       - name: Upload frontend artifact

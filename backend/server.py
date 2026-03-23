@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from pydantic import field_validator
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -9,8 +10,10 @@ import uuid
 from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
+from pathlib import Path
 from pypdf import PdfReader
 import io
+import re
 from context import prompt
 
 # Load environment variables
@@ -51,9 +54,79 @@ if USE_S3:
 TWINS_DIR = os.path.join(os.path.dirname(__file__), "twins")
 
 
+_TWIN_ID_RE = re.compile(r'^[a-f0-9]{8}$')
+
+# Expected keys for the personality model returned by /create-twin
+_PERSONALITY_MODEL_KEYS = {
+    "core_values", "decision_heuristics", "risk_profile",
+    "what_they_optimize_for", "what_they_avoid",
+    "communication_traits", "blind_spots",
+    "decision_framework", "personality_summary",
+}
+
+
+def _extract_json_object(text: str) -> dict:
+    """Extract the first complete JSON object using balanced-brace scan.
+    Handles nested objects correctly — greedy regex would over-capture."""
+    start = text.find('{')
+    if start == -1:
+        raise ValueError("No JSON object found in response")
+    depth, in_string, escape_next = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError("Unbalanced braces — could not extract JSON object")
+
+
+def _extract_json_array(text: str) -> list:
+    """Extract the first complete JSON array using balanced-bracket scan."""
+    start = text.find('[')
+    if start == -1:
+        raise ValueError("No JSON array found in response")
+    depth, in_string, escape_next = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError("Unbalanced brackets — could not extract JSON array")
+
+
 def load_twin(twin_id: str) -> Optional[dict]:
-    """Load a saved twin's data by ID"""
-    path = os.path.join(TWINS_DIR, f"{twin_id}.json")
+    """Load a saved twin's data by ID. Validates ID format and confines path to TWINS_DIR."""
+    if not _TWIN_ID_RE.match(twin_id):
+        raise HTTPException(status_code=400, detail="Invalid twin ID format")
+    path = os.path.realpath(os.path.join(TWINS_DIR, f"{twin_id}.json"))
+    if not path.startswith(os.path.realpath(TWINS_DIR) + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid twin ID")
     if os.path.exists(path):
         with open(path) as f:
             return json.load(f)
@@ -207,7 +280,7 @@ async def chat(request: ChatRequest):
                 raise HTTPException(status_code=404, detail=f"Twin '{request.twin_id}' not found")
             personality_model = twin_data.get("personality_model", {})
             # Attach raw fields so context builder can access them
-            personality_model["_raw"] = twin_data.get("raw", {})
+            personality_model["_context"] = twin_data.get("personality_model", {}).get("_context", {})
             twin_name = twin_data.get("name")
             twin_title = twin_data.get("title")
 
@@ -291,17 +364,12 @@ async def get_taglines():
         
         response_text = response["output"]["message"]["content"][0]["text"]
         
-        # Extract JSON array from response
-        import re
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if json_match:
-            taglines = json.loads(json_match.group())
-            # Update cache
+        try:
+            taglines = _extract_json_array(response_text)
             tagline_cache["taglines"] = taglines
             tagline_cache["timestamp"] = datetime.now()
             return {"taglines": taglines}
-        else:
-            # Fallback if JSON parsing fails
+        except (ValueError, json.JSONDecodeError):
             fallback = ["Talk to your AI twin", "Your digital self awaits", "AI collaboration unlocked"]
             tagline_cache["taglines"] = fallback
             tagline_cache["timestamp"] = datetime.now()
@@ -373,16 +441,13 @@ If a field cannot be determined, use an empty string. Return only the JSON, no o
         )
         response_text = response["output"]["message"]["content"][0]["text"]
 
-        import re
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if not json_match:
-            raise HTTPException(status_code=500, detail="Could not parse AI response")
+        try:
+            return _extract_json_object(response_text)
+        except (ValueError, json.JSONDecodeError):
+            raise HTTPException(status_code=500, detail="Could not parse AI response as JSON")
 
-        parsed = json.loads(json_match.group())
-        return parsed
-
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+    except HTTPException:
+        raise
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
 
@@ -402,6 +467,27 @@ class CreateTwinRequest(BaseModel):
     communicationStyle: str = ""
     writingSamples: str = ""
     blindSpots: str = ""
+
+    @field_validator("name", "title", "bio")
+    @classmethod
+    def strip_and_require(cls, v: str, info) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError(f"{info.field_name} must not be empty")
+        limits = {"name": 100, "title": 150, "bio": 2000}
+        limit = limits.get(info.field_name, 2000)
+        if len(v) > limit:
+            raise ValueError(f"{info.field_name} must be {limit} characters or fewer")
+        return v
+
+    @field_validator(
+        "email", "skills", "experience", "achievements",
+        "coreValues", "decisionStyle", "riskTolerance", "pastDecisions",
+        "communicationStyle", "writingSamples", "blindSpots",
+    )
+    @classmethod
+    def strip_optional(cls, v: str) -> str:
+        return v.strip()
 
 
 @app.get("/twin/{twin_id}")
@@ -491,35 +577,53 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
         )
         response_text = response["output"]["message"]["content"][0]["text"]
 
-        import re
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if not json_match:
+        try:
+            personality_model = _extract_json_object(response_text)
+        except (ValueError, json.JSONDecodeError):
             raise HTTPException(status_code=500, detail="Could not parse personality model from AI response")
 
-        personality_model = json.loads(json_match.group())
+        missing = _PERSONALITY_MODEL_KEYS - personality_model.keys()
+        if missing:
+            raise HTTPException(status_code=500, detail=f"Personality model missing expected keys: {missing}")
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+    except HTTPException:
+        raise
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
 
     twin_id = str(uuid.uuid4())[:8]
 
+    # Only persist what's needed at chat time — no email or raw form fields (PII).
+    # Embed the context fields the prompt builder needs directly in the personality model.
+    personality_model["_context"] = {
+        "bio": request.bio,
+        "skills": request.skills,
+        "experience": request.experience,
+        "achievements": request.achievements,
+        "communicationStyle": request.communicationStyle,
+    }
+
     twin_data = {
         "twin_id": twin_id,
         "name": request.name,
         "title": request.title,
-        "email": request.email,
         "personality_model": personality_model,
-        "raw": request.model_dump(),
         "created_at": datetime.now().isoformat(),
-        "chat_url": f"/twin/{twin_id}",
+        "chat_url": f"/twin?id={twin_id}",
     }
 
-    # Save locally for now (will move to DB/S3 in next step)
-    twins_dir = os.path.join(os.path.dirname(__file__), "twins")
-    os.makedirs(twins_dir, exist_ok=True)
-    with open(os.path.join(twins_dir, f"{twin_id}.json"), "w") as f:
+    os.makedirs(TWINS_DIR, exist_ok=True)
+
+    # Cap stored twins to avoid unbounded disk growth (default 1000, override via MAX_TWINS_FILES)
+    try:
+        max_twins = int(os.getenv("MAX_TWINS_FILES", "1000"))
+    except ValueError:
+        max_twins = 1000
+    existing = sorted(Path(TWINS_DIR).glob("*.json"), key=lambda p: p.stat().st_mtime)
+    for old_file in existing[: max(0, len(existing) - max_twins + 1)]:
+        old_file.unlink(missing_ok=True)
+
+    with open(os.path.join(TWINS_DIR, f"{twin_id}.json"), "w") as f:
         json.dump(twin_data, f, indent=2)
 
     return {"twin_id": twin_id, "personality_model": personality_model}

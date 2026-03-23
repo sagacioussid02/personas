@@ -117,7 +117,7 @@ def _build_decision_section(personality_model: Optional[dict], display_name: str
 
 
 def _build_from_personality_model(personality_model: dict, display_name: str, title: str) -> str:  # noqa: ARG001
-    raw = personality_model.get("_raw", {})
+    raw = personality_model.get("_context", {})
     lines = []
 
     if title:

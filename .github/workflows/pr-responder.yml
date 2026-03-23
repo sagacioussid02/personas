@@ -12,8 +12,12 @@ permissions:
 jobs:
   respond:
     name: Answer PR comment with Claude
-    # Only run on PR comments (not issue comments), not on bot comments
-    if: github.event.issue.pull_request && github.event.comment.user.login != 'github-actions[bot]'
+    # Only run on PR comments triggered by a trusted user issuing /claude <instruction>.
+    # Prevents external contributors from spending API quota or extracting diff content.
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/claude') &&
+      contains(fromJson('["sagacioussid02"]'), github.event.comment.user.login)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,14 +56,19 @@ jobs:
         id: claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          PR_TITLE: ${{ steps.meta.outputs.pr_title }}
+          PR_BRANCH: ${{ steps.meta.outputs.pr_branch }}
+          COMMENTER: ${{ github.event.comment.user.login }}
         run: |
           python3 << 'PYTHON'
           import anthropic, json, os
 
-          comment = """${{ github.event.comment.body }}"""
-          pr_title = """${{ steps.meta.outputs.pr_title }}"""
-          pr_branch = """${{ steps.meta.outputs.pr_branch }}"""
-          commenter = "${{ github.event.comment.user.login }}"
+          # Strip the /claude trigger prefix before sending to the model
+          comment = os.environ["COMMENT_BODY"].removeprefix("/claude").strip()
+          pr_title = os.environ["PR_TITLE"]
+          pr_branch = os.environ["PR_BRANCH"]
+          commenter = os.environ["COMMENTER"]
 
           with open("/tmp/pr-truncated.diff") as f:
               diff = f.read()
