@@ -52,7 +52,7 @@ function TwinChat() {
     if (!input.trim() || isLoading) return;
 
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: crypto.randomUUID(),
       role: 'user',
       content: input,
       timestamp: new Date(),
@@ -71,14 +71,14 @@ function TwinChat() {
       const data = await res.json();
       if (!sessionId) setSessionId(data.session_id);
       setMessages(prev => [...prev, {
-        id: (Date.now() + 1).toString(),
+        id: crypto.randomUUID(),
         role: 'assistant',
         content: data.response,
         timestamp: new Date(),
       }]);
     } catch {
       setMessages(prev => [...prev, {
-        id: (Date.now() + 1).toString(),
+        id: crypto.randomUUID(),
         role: 'assistant',
         content: 'Sorry, something went wrong. Please try again.',
         timestamp: new Date(),

@@ -76,9 +76,9 @@ function Field({ label, required, hint, children }: {
   return (
     <div>
       <label className="block text-sm font-medium text-gray-700 mb-1">
-        {label} {required && <span className="text-purple-500">*</span>}
+        <span>{label} {required && <span className="text-purple-500">*</span>}</span>
+        {children}
       </label>
-      {children}
       {hint && <p className="text-xs text-gray-400 mt-1">{hint}</p>}
     </div>
   );
@@ -242,7 +242,7 @@ export default function CreatePage() {
                 <Field label="Short Bio" required hint="Who you are, what you do, what drives you.">
                   <textarea value={form.bio} onChange={set('bio')} rows={4} placeholder="I'm a..." className={textareaClass} />
                 </Field>
-                <Field label="Email" hint="We'll send your twin link here.">
+                <Field label="Email" hint="Optional — email delivery not yet implemented.">
                   <input type="email" value={form.email} onChange={set('email')} placeholder="you@example.com" className={inputClass} />
                 </Field>
               </div>
