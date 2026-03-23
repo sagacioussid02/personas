@@ -53,7 +53,7 @@ if USE_S3:
 # Request/Response models
 # Local twins dir: use /tmp/twins in Lambda (package dir is read-only), local path otherwise
 _IN_LAMBDA = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
-TWINS_DIR = "/tmp/twins" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "twins")
+TWINS_DIR = "/tmp/twins" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "twins")  # nosec B108 — /tmp is the only writable path in Lambda; S3 is used when USE_S3=true
 TWINS_S3_PREFIX = "twins/"
 
 
