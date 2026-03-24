@@ -363,7 +363,7 @@ export default function CreatePage() {
                     </div>
                     {selectedArchetypeName && (
                       <p className="text-xs text-gray-500 mt-1">
-                        The twin&apos;s responses will be reviewed by a {selectedArchetypeName} personality agent.
+                        The {selectedArchetypeName} archetype will shape your twin&apos;s personality and communication style.
                       </p>
                     )}
                   </div>
