@@ -4,6 +4,7 @@ on:
   push:
     branches-ignore:
       - main
+      - SiddData
 
 permissions:
   contents: read

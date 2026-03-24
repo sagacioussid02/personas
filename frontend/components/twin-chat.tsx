@@ -32,7 +32,7 @@ export default function TwinChat({ twinId, twinName }: Props) {
     if (!input.trim() || isLoading) return;
 
     const userMessage: Message = {
-      id: Date.now().toString(),
+      id: crypto.randomUUID(),
       role: 'user',
       content: input,
       timestamp: new Date(),
@@ -43,10 +43,10 @@ export default function TwinChat({ twinId, twinName }: Props) {
     setIsLoading(true);
 
     try {
-      const res = await fetch(`${API}/twin/${twinId}/chat`, {
+      const res = await fetch(`${API}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input, session_id: sessionId || undefined }),
+        body: JSON.stringify({ message: input, session_id: sessionId || undefined, twin_id: twinId }),
       });
 
       if (!res.ok) throw new Error('Failed to send message');
@@ -56,12 +56,12 @@ export default function TwinChat({ twinId, twinName }: Props) {
 
       setMessages(prev => [
         ...prev,
-        { id: (Date.now() + 1).toString(), role: 'assistant', content: data.response, timestamp: new Date() },
+        { id: crypto.randomUUID(), role: 'assistant', content: data.response, timestamp: new Date() },
       ]);
     } catch {
       setMessages(prev => [
         ...prev,
-        { id: (Date.now() + 1).toString(), role: 'assistant', content: 'Sorry, I encountered an error. Please try again.', timestamp: new Date() },
+        { id: crypto.randomUUID(), role: 'assistant', content: 'Sorry, I encountered an error. Please try again.', timestamp: new Date() },
       ]);
     } finally {
       setIsLoading(false);

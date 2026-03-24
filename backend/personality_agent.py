@@ -10,8 +10,11 @@ from typing import Optional
 
 # Load archetypes once at module level
 _ARCHETYPES_PATH = Path(__file__).parent / "personalities" / "archetypes.json"
-with open(_ARCHETYPES_PATH, "r", encoding="utf-8") as f:
-    _ARCHETYPES: list[dict] = json.load(f)["archetypes"]
+try:
+    with open(_ARCHETYPES_PATH, "r", encoding="utf-8") as f:
+        _ARCHETYPES: list[dict] = json.load(f)["archetypes"]
+except FileNotFoundError:
+    _ARCHETYPES = []
 
 _ARCHETYPES_BY_ID: dict[str, dict] = {a["id"]: a for a in _ARCHETYPES}
 
@@ -46,29 +49,17 @@ def detect_archetype(title: str) -> Optional[dict]:
 
 
 def build_review_prompt(draft: str, archetype: dict, twin_context: str) -> str:
-    traits = "\n".join(f"- {t}" for t in archetype["communication_traits"])
+    traits = "; ".join(archetype["communication_traits"])
     return f"""You are a communication style reviewer for an AI digital twin.
-
-This twin represents a **{archetype["display_name"]}**. Here is how someone in this role communicates:
-
-{traits}
-
+This twin represents a {archetype["display_name"]}. Here is how someone in this role communicates: {traits}
 Their decision style: {archetype["decision_style"]}
-
 Brief context about this specific person:
 {twin_context}
-
----
-
 Draft response from the twin:
 {draft}
-
----
-
 Your task: {archetype["review_instructions"]}
-
 Return only the revised response. No preamble, no commentary, no meta-explanation.
-Do not introduce markdown formatting — no **bold**, no bullet points, no headers. Plain prose only."""
+Do not format the response as markdown. No bold text, no bullet lists, no section headers. Plain prose only."""
 
 
 def review_response(

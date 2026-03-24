@@ -43,6 +43,7 @@ BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.amazon.nova-2-lite-v1:0
 
 # Memory storage configuration
 USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
+PERSONALITY_REVIEW_ENABLED = os.getenv("PERSONALITY_REVIEW_ENABLED", "false").lower() == "true"
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 MEMORY_DIR = os.getenv("MEMORY_DIR", "../memory")
 
@@ -247,8 +248,8 @@ class CreateTwinRequest(BaseModel):
         if v is None:
             return ""
         v = v.strip()
-        if len(v) > 500:
-            raise ValueError("verbalQuirks must be 500 characters or fewer")
+        if len(v) > 1500:
+            raise ValueError("verbalQuirks must be 1500 characters or fewer")
         return v
 
 
@@ -421,12 +422,13 @@ async def chat(request: ChatRequest):
             response_style,
         )
 
-        # Personality review step
-        archetype_id = twin_data.get("archetype_id") if request.twin_id and twin_data else None
-        archetype = get_archetype(archetype_id) if archetype_id else None
-        if archetype:
-            twin_context = f"{twin_name or 'Professional'}, {twin_title or ''}. {twin_data.get('personality_model', {}).get('personality_summary', '')[:200]}"
-            assistant_response = review_response(assistant_response, archetype, twin_context, bedrock_client, BEDROCK_MODEL_ID)
+        # Personality review step (gated — enable via PERSONALITY_REVIEW_ENABLED=true)
+        if PERSONALITY_REVIEW_ENABLED:
+            archetype_id = twin_data.get("archetype_id") if request.twin_id and twin_data else None
+            archetype = get_archetype(archetype_id) if archetype_id else None
+            if archetype:
+                twin_context = f"{twin_name or 'Professional'}, {twin_title or ''}. {twin_data.get('personality_model', {}).get('personality_summary', '')[:200]}"
+                assistant_response = review_response(assistant_response, archetype, twin_context, bedrock_client, BEDROCK_MODEL_ID)
 
         # Update conversation history
         conversation.append(

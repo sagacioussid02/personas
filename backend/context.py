@@ -143,25 +143,25 @@ def _build_from_personality_model(personality_model: dict, title: str) -> str:
     lines = []
 
     if title:
-        lines.append(f"**Current Role:** {title}\n")
+        lines.append(f"Current Role: {title}\n")
 
     if raw.get("bio"):
-        lines.append(f"**Bio:** {raw['bio']}\n")
+        lines.append(f"Bio: {raw['bio']}\n")
 
     if raw.get("skills"):
-        lines.append(f"**Skills:** {raw['skills']}\n")
+        lines.append(f"Skills: {raw['skills']}\n")
 
     if raw.get("experience"):
-        lines.append(f"**Experience:**\n{raw['experience']}\n")
+        lines.append(f"Experience:\n{raw['experience']}\n")
 
     if raw.get("achievements"):
-        lines.append(f"**Achievements:**\n{raw['achievements']}\n")
+        lines.append(f"Achievements:\n{raw['achievements']}\n")
 
     if raw.get("communicationStyle"):
-        lines.append(f"**Communication Style:** {raw['communicationStyle']}\n")
+        lines.append(f"Communication Style: {raw['communicationStyle']}\n")
 
     if raw.get("verbalQuirks"):
-        lines.append(f"**Verbal quirks (use naturally in responses):**\n{raw['verbalQuirks']}\n")
+        lines.append(f"Verbal quirks (use naturally in responses):\n{raw['verbalQuirks']}\n")
 
     return "\n".join(lines)
 
