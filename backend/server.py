@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from pydantic import field_validator
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -6,12 +7,14 @@ from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any
 import json
 import uuid
+import re
 from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
+from pathlib import Path
 from pypdf import PdfReader
 import io
-from context import prompt, build_prompt
+from context import prompt
 from personality_agent import detect_archetype, get_archetype, get_all_archetypes, review_response
 
 # Load environment variables
@@ -31,7 +34,7 @@ app.add_middleware(
 
 # Initialize Bedrock client - see Q42 on https://edwarddonner.com/faq if the Region gives you problems
 bedrock_client = boto3.client(
-    service_name="bedrock-runtime", 
+    service_name="bedrock-runtime",
     region_name=os.getenv("DEFAULT_AWS_REGION", "us-east-1")
 )
 
@@ -42,18 +45,112 @@ BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.amazon.nova-2-lite-v1:0
 USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 MEMORY_DIR = os.getenv("MEMORY_DIR", "../memory")
-TWINS_DIR = os.path.join(os.path.dirname(__file__), "twins")
 
 # Initialize S3 client if needed
 if USE_S3:
+    if not S3_BUCKET:
+        raise RuntimeError("USE_S3=true but S3_BUCKET environment variable is not set")
     s3_client = boto3.client("s3")
+
+# Local twins dir: use /tmp/twins in Lambda (package dir is read-only), local path otherwise
+_IN_LAMBDA = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+TWINS_DIR = "/tmp/twins" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "twins")  # nosec B108 — /tmp is the only writable path in Lambda; S3 is used when USE_S3=true
+TWINS_S3_PREFIX = "twins/"
+
+_TWIN_ID_RE = re.compile(r'^[a-f0-9]{32}$')
+
+# Expected keys for the personality model returned by /create-twin
+_PERSONALITY_MODEL_KEYS = {
+    "core_values", "decision_heuristics", "risk_profile",
+    "what_they_optimize_for", "what_they_avoid",
+    "communication_traits", "blind_spots",
+    "decision_framework", "personality_summary",
+}
+
+
+def _extract_json_object(text: str) -> dict:
+    """Extract the first complete JSON object using balanced-brace scan.
+    Handles nested objects correctly — greedy regex would over-capture."""
+    start = text.find('{')
+    if start == -1:
+        raise ValueError("No JSON object found in response")
+    depth, in_string, escape_next = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError("Unbalanced braces — could not extract JSON object")
+
+
+def _extract_json_array(text: str) -> list:
+    """Extract the first complete JSON array using balanced-bracket scan."""
+    start = text.find('[')
+    if start == -1:
+        raise ValueError("No JSON array found in response")
+    depth, in_string, escape_next = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError("Unbalanced brackets — could not extract JSON array")
+
+
+def load_twin(twin_id: str) -> Optional[dict]:
+    """Load a saved twin's data by ID. Validates ID format and confines path to TWINS_DIR."""
+    if not _TWIN_ID_RE.match(twin_id):
+        raise HTTPException(status_code=400, detail="Invalid twin ID format")
+
+    if USE_S3:
+        try:
+            response = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{TWINS_S3_PREFIX}{twin_id}.json")
+            return json.loads(response["Body"].read().decode("utf-8"))
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                return None
+            raise
+
+    path = os.path.realpath(os.path.join(TWINS_DIR, f"{twin_id}.json"))
+    if not path.startswith(os.path.realpath(TWINS_DIR) + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid twin ID")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
 
 
 # Request/Response models
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
-    archetype_id: Optional[str] = None  # only used on first message of a session
+    twin_id: Optional[str] = None  # if set, chat with a user-created twin
 
 
 class ChatResponse(BaseModel):
@@ -71,24 +168,88 @@ class CreateTwinRequest(BaseModel):
     name: str
     title: str
     bio: str
-    skills: str
-    experience: str
-    achievements: Optional[str] = ""
-    communicationStyle: str
-    verbalQuirks: Optional[str] = ""
-    responseStyle: Optional[str] = "balanced"  # concise | balanced | detailed
-    email: Optional[str] = ""
+    email: str = ""
+    skills: str = ""
+    experience: str = ""
+    achievements: str = ""
+    coreValues: str = ""
+    decisionStyle: str = ""
+    riskTolerance: str = ""
+    pastDecisions: str = ""
+    communicationStyle: str = ""
+    writingSamples: str = ""
+    blindSpots: str = ""
     archetype_id: Optional[str] = None
+    responseStyle: Optional[str] = "balanced"
+    verbalQuirks: Optional[str] = ""
 
+    @field_validator("name", "title", "bio")
+    @classmethod
+    def strip_and_require(cls, v: str, info) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError(f"{info.field_name} must not be empty")
+        limits = {"name": 100, "title": 150, "bio": 2000}
+        limit = limits.get(info.field_name, 2000)
+        if len(v) > limit:
+            raise ValueError(f"{info.field_name} must be {limit} characters or fewer")
+        return v
 
-class TwinRecord(BaseModel):
-    twin_id: str
-    name: str
-    title: str
-    archetype_id: Optional[str]
-    archetype_display_name: Optional[str]
-    chat_url: str
-    raw: Dict[str, Any]
+    @field_validator(
+        "email", "skills", "experience", "achievements",
+        "coreValues", "decisionStyle", "riskTolerance", "pastDecisions",
+        "communicationStyle", "writingSamples", "blindSpots",
+    )
+    @classmethod
+    def strip_optional(cls, v: str, info) -> str:
+        v = v.strip()
+        limits = {
+            "email": 254,       # RFC 5321 max
+            "skills": 1000,
+            "experience": 5000,
+            "achievements": 2000,
+            "coreValues": 2000,
+            "decisionStyle": 3000,
+            "riskTolerance": 500,
+            "pastDecisions": 3000,
+            "communicationStyle": 2000,
+            "writingSamples": 1000,
+            "blindSpots": 2000,
+        }
+        limit = limits.get(info.field_name, 2000)
+        if len(v) > limit:
+            raise ValueError(f"{info.field_name} must be {limit} characters or fewer")
+        return v
+
+    @field_validator("archetype_id")
+    @classmethod
+    def strip_archetype_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if len(v) > 50:
+            raise ValueError("archetype_id must be 50 characters or fewer")
+        return v or None
+
+    @field_validator("responseStyle")
+    @classmethod
+    def strip_response_style(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return "balanced"
+        v = v.strip()
+        if len(v) > 20:
+            raise ValueError("responseStyle must be 20 characters or fewer")
+        return v or "balanced"
+
+    @field_validator("verbalQuirks")
+    @classmethod
+    def strip_verbal_quirks(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return ""
+        v = v.strip()
+        if len(v) > 500:
+            raise ValueError("verbalQuirks must be 500 characters or fewer")
+        return v
 
 
 # Memory management functions
@@ -96,102 +257,79 @@ def get_memory_path(session_id: str) -> str:
     return f"{session_id}.json"
 
 
-def load_session(session_id: str) -> Dict:
-    """Load session (messages + metadata) from storage. Returns {"messages": [], "archetype_id": None}."""
-    raw = None
+def load_conversation(session_id: str) -> List[Dict]:
+    """Load conversation history from storage"""
     if USE_S3:
         try:
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=get_memory_path(session_id))
-            raw = json.loads(response["Body"].read().decode("utf-8"))
+            return json.loads(response["Body"].read().decode("utf-8"))
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
-                pass
-            else:
-                raise
+                return []
+            raise
     else:
+        # Local file storage
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
-                raw = json.load(f)
-
-    if raw is None:
-        return {"messages": [], "archetype_id": None}
-    # Legacy: plain list of messages
-    if isinstance(raw, list):
-        return {"messages": raw, "archetype_id": None}
-    return raw
+                return json.load(f)
+        return []
 
 
-def load_conversation(session_id: str) -> List[Dict]:
-    """Backward-compatible: return just the messages list."""
-    return load_session(session_id)["messages"]
-
-
-def save_session(session_id: str, messages: List[Dict], archetype_id: Optional[str] = None):
-    """Save session with messages and metadata."""
-    data = {"messages": messages, "archetype_id": archetype_id}
+def save_conversation(session_id: str, messages: List[Dict]):
+    """Save conversation history to storage"""
     if USE_S3:
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=get_memory_path(session_id),
-            Body=json.dumps(data, indent=2),
+            Body=json.dumps(messages, indent=2),
             ContentType="application/json",
         )
     else:
+        # Local file storage
         os.makedirs(MEMORY_DIR, exist_ok=True)
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         with open(file_path, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(messages, f, indent=2)
 
 
-def save_conversation(session_id: str, messages: List[Dict]):
-    """Backward-compatible: save messages, preserving existing archetype_id."""
-    existing = load_session(session_id)
-    save_session(session_id, messages, existing.get("archetype_id"))
-
-
-# Twin storage helpers
-def load_twin(twin_id: str) -> Optional[Dict]:
-    path = os.path.join(TWINS_DIR, f"{twin_id}.json")
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return None
-
-
-def save_twin(twin_id: str, data: Dict):
-    os.makedirs(TWINS_DIR, exist_ok=True)
-    path = os.path.join(TWINS_DIR, f"{twin_id}.json")
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def call_bedrock(conversation: List[Dict], user_message: str) -> str:
+def call_bedrock(
+    conversation: List[Dict],
+    user_message: str,
+    personality_model: Optional[dict] = None,
+    twin_name: Optional[str] = None,
+    twin_title: Optional[str] = None,
+    response_style: str = "balanced",
+) -> str:
     """Call AWS Bedrock with conversation history"""
-    
+
     # Build messages in Bedrock format
     messages = []
-    
-    # Add system prompt as first user message
-    # Or there's a better way to do this - pass in system=[{"text": prompt()}] to the converse call below
+
+    system_prompt = prompt(
+        personality_model=personality_model,
+        twin_name=twin_name,
+        twin_title=twin_title,
+        response_style=response_style,
+    )
     messages.append({
-        "role": "user", 
-        "content": [{"text": f"System: {prompt()}"}]
+        "role": "user",
+        "content": [{"text": f"System: {system_prompt}"}]
     })
-    
+
     # Add conversation history (limit to last 25 exchanges)
     for msg in conversation[-50:]:
         messages.append({
             "role": msg["role"],
             "content": [{"text": msg["content"]}]
         })
-    
+
     # Add current user message
     messages.append({
         "role": "user",
         "content": [{"text": user_message}]
     })
-    
+
     try:
         # Call Bedrock using the converse API
         response = bedrock_client.converse(
@@ -203,14 +341,13 @@ def call_bedrock(conversation: List[Dict], user_message: str) -> str:
                 "topP": 0.9
             }
         )
-        
+
         # Extract the response text
         return response["output"]["message"]["content"][0]["text"]
-        
+
     except ClientError as e:
         error_code = e.response['Error']['Code']
         if error_code == 'ValidationException':
-            # Handle message format issues
             print(f"Bedrock validation error: {e}")
             raise HTTPException(status_code=400, detail="Invalid message format for Bedrock")
         elif error_code == 'AccessDeniedException':
@@ -234,41 +371,77 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {
-        "status": "healthy", 
+        "status": "healthy",
         "use_s3": USE_S3,
         "bedrock_model": BEDROCK_MODEL_ID
     }
 
 
+@app.get("/archetypes")
+async def list_archetypes():
+    """Return all available archetypes for the frontend dropdown."""
+    return {"archetypes": get_all_archetypes()}
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
+        # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
 
-        session = load_session(session_id)
-        conversation = session["messages"]
+        # Load conversation history
+        conversation = load_conversation(session_id)
 
-        # On first message, persist archetype_id from request
-        archetype_id = session.get("archetype_id") or request.archetype_id
+        # Load twin personality model if twin_id provided
+        personality_model = None
+        twin_name = None
+        twin_title = None
+        twin_data = None
+        if request.twin_id:
+            twin_data = load_twin(request.twin_id)
+            if not twin_data:
+                raise HTTPException(status_code=404, detail=f"Twin '{request.twin_id}' not found")
+            personality_model = twin_data.get("personality_model", {})
+            # Attach raw fields so context builder can access them
+            personality_model["_context"] = twin_data.get("personality_model", {}).get("_context", {})
+            twin_name = twin_data.get("name")
+            twin_title = twin_data.get("title")
 
-        draft = call_bedrock(conversation, request.message)
+        # Determine response_style from personality model context
+        response_style = "balanced"
+        if personality_model:
+            response_style = personality_model.get("_context", {}).get("responseStyle", "balanced")
+
+        assistant_response = call_bedrock(
+            conversation,
+            request.message,
+            personality_model,
+            twin_name,
+            twin_title,
+            response_style,
+        )
 
         # Personality review step
+        archetype_id = twin_data.get("archetype_id") if request.twin_id and twin_data else None
         archetype = get_archetype(archetype_id) if archetype_id else None
         if archetype:
-            twin_context = f"This is Sidd's AI twin — a digital twin for professional conversations."
-            assistant_response = review_response(draft, archetype, twin_context, bedrock_client, BEDROCK_MODEL_ID)
-        else:
-            assistant_response = draft
+            twin_context = f"{twin_name or 'Professional'}, {twin_title or ''}. {twin_data.get('personality_model', {}).get('personality_summary', '')[:200]}"
+            assistant_response = review_response(assistant_response, archetype, twin_context, bedrock_client, BEDROCK_MODEL_ID)
 
+        # Update conversation history
         conversation.append(
             {"role": "user", "content": request.message, "timestamp": datetime.now().isoformat()}
         )
         conversation.append(
-            {"role": "assistant", "content": assistant_response, "timestamp": datetime.now().isoformat()}
+            {
+                "role": "assistant",
+                "content": assistant_response,
+                "timestamp": datetime.now().isoformat(),
+            }
         )
 
-        save_session(session_id, conversation, archetype_id)
+        # Save conversation
+        save_conversation(session_id, conversation)
 
         return ChatResponse(response=assistant_response, session_id=session_id)
 
@@ -293,34 +466,35 @@ async def get_conversation(session_id: str):
 tagline_cache = {"taglines": None, "timestamp": None}
 TAGLINE_CACHE_TTL = 3600  # Cache for 1 hour
 
+
 @app.get("/taglines")
 async def get_taglines():
     """Generate humorous and attractive taglines dynamically using AI (cached)"""
     global tagline_cache
     from datetime import datetime, timedelta
-    
+
     # Check if cache is still valid
-    if (tagline_cache["taglines"] is not None and 
+    if (tagline_cache["taglines"] is not None and
         tagline_cache["timestamp"] is not None and
         datetime.now() - tagline_cache["timestamp"] < timedelta(seconds=TAGLINE_CACHE_TTL)):
         print("Returning cached taglines")
         return {"taglines": tagline_cache["taglines"]}
-    
+
     try:
         print("Generating new taglines from AI...")
-        prompt_text = """Generate exactly 10 short, humorous, witty, and attractive taglines for an AI Digital Twin product. 
+        prompt_text = """Generate exactly 10 short, humorous, witty, and attractive taglines for an AI Digital Twin product.
         Each tagline should be catchy, fun, and appeal to tech-savvy users. They should relate to AI, digital clones, productivity, or self-improvement.
         Keep each tagline to 2-5 words maximum.
         Format: Return only a JSON array of strings, nothing else.
         Example format: ["Coffee with this guy", "Resumes are old school", "Your digital brainpower unleashed"]"""
-        
+
         messages = [
             {
                 "role": "user",
                 "content": [{"text": prompt_text}]
             }
         ]
-        
+
         response = bedrock_client.converse(
             modelId=BEDROCK_MODEL_ID,
             messages=messages,
@@ -330,25 +504,20 @@ async def get_taglines():
                 "topP": 0.95
             }
         )
-        
+
         response_text = response["output"]["message"]["content"][0]["text"]
-        
-        # Extract JSON array from response
-        import re
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if json_match:
-            taglines = json.loads(json_match.group())
-            # Update cache
+
+        try:
+            taglines = _extract_json_array(response_text)
             tagline_cache["taglines"] = taglines
             tagline_cache["timestamp"] = datetime.now()
             return {"taglines": taglines}
-        else:
-            # Fallback if JSON parsing fails
+        except (ValueError, json.JSONDecodeError):
             fallback = ["Talk to your AI twin", "Your digital self awaits", "AI collaboration unlocked"]
             tagline_cache["taglines"] = fallback
             tagline_cache["timestamp"] = datetime.now()
             return {"taglines": fallback}
-            
+
     except Exception as e:
         print(f"Error generating taglines: {str(e)}")
         # Return fallback taglines on error
@@ -415,12 +584,10 @@ If a field cannot be determined, use an empty string. Return only the JSON, no o
         )
         response_text = response["output"]["message"]["content"][0]["text"]
 
-        import re
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if not json_match:
-            raise HTTPException(status_code=500, detail="Could not parse AI response")
-
-        parsed = json.loads(json_match.group())
+        try:
+            parsed = _extract_json_object(response_text)
+        except (ValueError, json.JSONDecodeError):
+            raise HTTPException(status_code=500, detail="Could not parse AI response as JSON")
 
         # Detect archetype from title
         archetype = detect_archetype(parsed.get("title", ""))
@@ -429,131 +596,167 @@ If a field cannot be determined, use an empty string. Return only the JSON, no o
 
         return parsed
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+    except HTTPException:
+        raise
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
 
 
-@app.get("/archetypes")
-async def list_archetypes():
-    """Return all available archetypes for the frontend dropdown."""
-    return {"archetypes": get_all_archetypes()}
-
-
-@app.post("/twins", response_model=TwinRecord)
-async def create_twin(request: CreateTwinRequest):
-    """
-    Save a new twin from the create-your-twin form.
-    Returns twin_id and chat_url so the frontend can redirect immediately.
-    """
-    twin_id = str(uuid.uuid4())[:8]
-
-    archetype = get_archetype(request.archetype_id) if request.archetype_id else None
-
-    twin_data = {
-        "twin_id": twin_id,
-        "name": request.name,
-        "title": request.title,
-        "email": request.email,
-        "archetype_id": archetype["id"] if archetype else None,
-        "archetype_display_name": archetype["display_name"] if archetype else None,
-        "chat_url": f"/twin?id={twin_id}",
-        "created_at": datetime.now().isoformat(),
-        "raw": {
-            "name": request.name,
-            "title": request.title,
-            "bio": request.bio,
-            "skills": request.skills,
-            "experience": request.experience,
-            "achievements": request.achievements,
-            "communicationStyle": request.communicationStyle,
-            "verbalQuirks": request.verbalQuirks,
-            "responseStyle": request.responseStyle,
-        },
+@app.get("/twin/{twin_id}")
+async def get_twin(twin_id: str):
+    """Fetch public profile data for a twin"""
+    twin_data = load_twin(twin_id)
+    if not twin_data:
+        raise HTTPException(status_code=404, detail="Twin not found")
+    return {
+        "twin_id": twin_data["twin_id"],
+        "name": twin_data["name"],
+        "title": twin_data.get("title", ""),
+        "personality_summary": twin_data.get("personality_model", {}).get("personality_summary", ""),
+        "core_values": twin_data.get("personality_model", {}).get("core_values", []),
+        "archetype_display_name": twin_data.get("archetype_display_name"),
+        "created_at": twin_data.get("created_at", ""),
     }
 
-    save_twin(twin_id, twin_data)
 
-    return TwinRecord(
-        twin_id=twin_id,
-        name=request.name,
-        title=request.title,
-        archetype_id=twin_data["archetype_id"],
-        archetype_display_name=twin_data["archetype_display_name"],
-        chat_url=twin_data["chat_url"],
-        raw=twin_data["raw"],
-    )
+@app.post("/create-twin")
+async def create_twin(request: CreateTwinRequest):
+    """Synthesize submitted profile data into a structured personality model via Bedrock"""
 
+    synthesis_prompt = f"""You are building a personality model for an AI twin. Your job is to deeply analyze everything provided and produce a structured JSON model that captures how this person THINKS and DECIDES — not just what they've done.
 
-@app.get("/twins/{twin_id}")
-async def get_twin(twin_id: str):
-    """Fetch a twin record by ID."""
-    twin = load_twin(twin_id)
-    if not twin:
-        raise HTTPException(status_code=404, detail="Twin not found")
-    return twin
+This model will be used to answer questions like "What would {request.name} do?" in real situations.
 
+=== PROFILE DATA ===
 
-@app.post("/twin/{twin_id}/chat", response_model=ChatResponse)
-async def twin_chat(twin_id: str, request: ChatRequest):
-    """
-    Chat endpoint for a specific twin (created via /twins).
-    Uses the twin's stored data and archetype for context and personality review.
-    """
-    twin = load_twin(twin_id)
-    if not twin:
-        raise HTTPException(status_code=404, detail="Twin not found")
+Name: {request.name}
+Title: {request.title}
+Bio: {request.bio}
 
-    session_id = request.session_id or str(uuid.uuid4())
-    session = load_session(session_id)
-    conversation = session["messages"]
+Skills: {request.skills}
 
-    archetype_id = twin.get("archetype_id")
-    twin_system_prompt = build_prompt(twin["raw"])
+Work Experience:
+{request.experience}
 
-    # Build messages using the twin's specific system prompt
-    messages = [
-        {"role": "user", "content": [{"text": f"System: {twin_system_prompt}"}]}
-    ]
-    for msg in conversation[-50:]:
-        messages.append({
-            "role": msg["role"],
-            "content": [{"text": msg["content"]}],
-        })
-    messages.append({"role": "user", "content": [{"text": request.message}]})
+Achievements:
+{request.achievements}
+
+Core Values:
+{request.coreValues}
+
+Decision-Making Style:
+{request.decisionStyle}
+
+Risk Tolerance: {request.riskTolerance}
+
+Past Decisions & Reasoning:
+{request.pastDecisions}
+
+Communication Style:
+{request.communicationStyle}
+
+Writing Samples/Links:
+{request.writingSamples}
+
+Blind Spots & Biases:
+{request.blindSpots}
+
+=== TASK ===
+
+Analyze all of the above and return ONLY a valid JSON object with this exact structure:
+
+{{
+  "core_values": ["value 1", "value 2", ...],
+  "decision_heuristics": [
+    "When facing X type of decision, they tend to Y",
+    ...
+  ],
+  "risk_profile": "one paragraph describing how they approach risk and uncertainty",
+  "what_they_optimize_for": ["thing 1", "thing 2", ...],
+  "what_they_avoid": ["thing 1", "thing 2", ...],
+  "communication_traits": ["trait 1", "trait 2", ...],
+  "blind_spots": ["blind spot 1", "blind spot 2", ...],
+  "decision_framework": "2-3 sentence summary of their overall decision-making philosophy",
+  "personality_summary": "3-4 sentence paragraph capturing the essence of who this person is and how they operate — written in second person as if talking to their twin"
+}}
+
+Be specific and concrete. Avoid generic statements. Infer from the data even when not explicit. Return only the JSON."""
 
     try:
         response = bedrock_client.converse(
             modelId=BEDROCK_MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.7, "topP": 0.9},
+            messages=[{"role": "user", "content": [{"text": synthesis_prompt}]}],
+            inferenceConfig={"maxTokens": 2000, "temperature": 0.3},
         )
-        draft = response["output"]["message"]["content"][0]["text"]
+        response_text = response["output"]["message"]["content"][0]["text"]
+
+        try:
+            personality_model = _extract_json_object(response_text)
+        except (ValueError, json.JSONDecodeError):
+            raise HTTPException(status_code=500, detail="Could not parse personality model from AI response")
+
+        missing = _PERSONALITY_MODEL_KEYS - personality_model.keys()
+        if missing:
+            raise HTTPException(status_code=500, detail=f"Personality model missing expected keys: {missing}")
+
+    except HTTPException:
+        raise
     except ClientError as e:
         raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
 
-    # Personality review step
-    archetype = get_archetype(archetype_id) if archetype_id else None
-    if archetype:
-        twin_context = f"{twin['name']}, {twin['title']}. {twin['raw'].get('bio', '')[:200]}"
-        assistant_response = review_response(draft, archetype, twin_context, bedrock_client, BEDROCK_MODEL_ID)
+    twin_id = uuid.uuid4().hex  # 32 hex chars (128-bit) — no truncation, no collision risk
+
+    # Embed the context fields the prompt builder needs directly in the personality model.
+    personality_model["_context"] = {
+        "bio": request.bio,
+        "skills": request.skills,
+        "experience": request.experience,
+        "achievements": request.achievements,
+        "communicationStyle": request.communicationStyle,
+        "verbalQuirks": request.verbalQuirks or "",
+        "responseStyle": request.responseStyle or "balanced",
+    }
+
+    # Resolve archetype
+    archetype_id = request.archetype_id or None
+    archetype_obj = get_archetype(archetype_id) if archetype_id else None
+    archetype_display_name = archetype_obj["display_name"] if archetype_obj else None
+
+    twin_data: Dict[str, Any] = {
+        "twin_id": twin_id,
+        "name": request.name,
+        "title": request.title,
+        "archetype_id": archetype_id,
+        "archetype_display_name": archetype_display_name,
+        "personality_model": personality_model,
+        "created_at": datetime.now().isoformat(),
+        "chat_url": f"/twin?id={twin_id}",
+    }
+
+    if USE_S3:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=f"{TWINS_S3_PREFIX}{twin_id}.json",
+            Body=json.dumps(twin_data, indent=2),
+            ContentType="application/json",
+        )
     else:
-        assistant_response = draft
+        # Local / Lambda /tmp fallback — not durable across Lambda cold starts
+        os.makedirs(TWINS_DIR, exist_ok=True)
+        try:
+            max_twins = int(os.getenv("MAX_TWINS_FILES", "1000"))
+        except ValueError:
+            max_twins = 1000
+        existing = sorted(Path(TWINS_DIR).glob("*.json"), key=lambda p: p.stat().st_mtime)
+        for old_file in existing[: max(0, len(existing) - max_twins + 1)]:
+            old_file.unlink(missing_ok=True)
+        with open(os.path.join(TWINS_DIR, f"{twin_id}.json"), "w") as f:
+            json.dump(twin_data, f, indent=2)
 
-    conversation.append(
-        {"role": "user", "content": request.message, "timestamp": datetime.now().isoformat()}
-    )
-    conversation.append(
-        {"role": "assistant", "content": assistant_response, "timestamp": datetime.now().isoformat()}
-    )
-
-    save_session(session_id, conversation, archetype_id)
-
-    return ChatResponse(response=assistant_response, session_id=session_id)
+    return {"twin_id": twin_id, "personality_model": personality_model}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)  # nosec B104 — local dev only, not used in Lambda

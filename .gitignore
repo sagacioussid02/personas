@@ -43,6 +43,7 @@ uv.lock
 # Terraform
 *.tfstate
 *.tfstate.*
+*-state.json
 .terraform/
 .terraform.lock.hcl
 terraform.tfstate.d/
@@ -81,3 +82,5 @@ Thumbs.db
 
 # AWS
 .aws/medium.md
+
+medium.md
