@@ -13,6 +13,11 @@ output "cloudfront_url" {
   value       = aws_cloudfront_distribution.main.domain_name
 }
 
+output "cloudfront_distribution_id" {
+  description = "CloudFront distribution ID"
+  value       = aws_cloudfront_distribution.main.id
+}
+
 output "custom_domain_url" {
   description = "Custom domain URL if configured"
   value       = var.use_custom_domain && var.root_domain != "" ? var.root_domain : ""

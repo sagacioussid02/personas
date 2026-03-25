@@ -38,6 +38,7 @@ API_URL=$(terraform output -raw api_gateway_url)
 CUSTOM_URL=$(terraform output -raw custom_domain_url 2>/dev/null || true)
 S3_BUCKET=$(terraform output -raw s3_frontend_bucket 2>/dev/null || true)
 CLOUDFRONT_URL=$(terraform output -raw cloudfront_url 2>/dev/null || true)
+CLOUDFRONT_DISTRIBUTION_ID=$(terraform output -raw cloudfront_distribution_id 2>/dev/null || true)
 
 cd ..
 
@@ -66,20 +67,15 @@ if [ "${DEPLOY_FRONTEND_S3:-false}" = "true" ]; then
     echo "☁️  Syncing frontend/out/ to s3://${S3_BUCKET}..."
     aws s3 sync frontend/out/ "s3://${S3_BUCKET}" --delete
 
-    if [ -n "$CLOUDFRONT_URL" ]; then
+    if [ -n "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
       # Invalidate CloudFront cache so the new build is served immediately
-      CF_DISTRIBUTION_ID=$(aws cloudfront list-distributions \
-        --query "DistributionList.Items[?DomainName=='${CLOUDFRONT_URL}'].Id | [0]" \
-        --output text 2>/dev/null || true)
-      if [ -n "$CF_DISTRIBUTION_ID" ] && [ "$CF_DISTRIBUTION_ID" != "None" ]; then
-        echo "🔄 Invalidating CloudFront distribution ${CF_DISTRIBUTION_ID}..."
-        aws cloudfront create-invalidation \
-          --distribution-id "$CF_DISTRIBUTION_ID" \
-          --paths "/*" > /dev/null
-      fi
+      echo "🔄 Invalidating CloudFront distribution ${CLOUDFRONT_DISTRIBUTION_ID}..."
+      aws cloudfront create-invalidation \
+        --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+        --paths "/*" > /dev/null
       echo "🌐 Frontend live at: https://${CLOUDFRONT_URL}"
     else
-      echo "ℹ️  CloudFront URL not available from Terraform outputs. Skipping CloudFront invalidation."
+      echo "ℹ️  CloudFront distribution ID not available from Terraform outputs. Skipping CloudFront invalidation."
     fi
   fi
 else
