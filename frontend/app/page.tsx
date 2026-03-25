@@ -1,6 +1,8 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import { useAuth, UserButton } from '@clerk/nextjs';
+import Link from 'next/link';
 import Twin from '@/components/twin';
 
 function StreamingTagline() {
@@ -71,8 +73,27 @@ function StreamingTagline() {
 }
 
 export default function Home() {
+  const { isSignedIn } = useAuth();
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-50 to-gray-100">
+      {/* Nav */}
+      <nav className="flex items-center justify-between px-6 py-4 max-w-4xl mx-auto">
+        <span className="font-semibold text-gray-700">AI Twin</span>
+        <div className="flex items-center gap-3">
+          {isSignedIn ? (
+            <>
+              <Link href="/dashboard" className="text-sm text-purple-600 hover:text-purple-800 font-medium">Dashboard</Link>
+              <UserButton />
+            </>
+          ) : (
+            <>
+              <Link href="/sign-in" className="text-sm text-gray-600 hover:text-gray-900">Sign in</Link>
+              <Link href="/sign-up" className="text-sm bg-purple-600 text-white px-4 py-1.5 rounded-lg hover:bg-purple-700">Get started</Link>
+            </>
+          )}
+        </div>
+      </nav>
+
       <div className="container mx-auto px-4 py-8">
         <div className="max-w-4xl mx-auto">
           <h1 className="text-4xl font-bold text-center text-gray-800 mb-2">
