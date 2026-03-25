@@ -1,0 +1,132 @@
+'use client';
+
+import { useUser, UserButton } from "@clerk/nextjs";
+import Link from "next/link";
+import { Plus, MessageSquare, ExternalLink } from "lucide-react";
+import { useEffect, useState } from "react";
+
+const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
+interface Twin {
+  twin_id: string;
+  name: string;
+  title: string;
+  archetype_display_name?: string;
+  created_at: string;
+  chat_url: string;
+}
+
+export default function DashboardPage() {
+  const { user } = useUser();
+  const [twins, setTwins] = useState<Twin[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function fetchTwins() {
+      try {
+        const token = await (window as any).Clerk?.session?.getToken();
+        const res = await fetch(`${API}/users/me/twins`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          setTwins(data.twins || []);
+        }
+      } catch {
+        // backend not yet connected — show empty state
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchTwins();
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Header */}
+      <header className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-purple-600 rounded-lg flex items-center justify-center">
+            <span className="text-white text-sm font-bold">T</span>
+          </div>
+          <span className="font-semibold text-gray-800">AI Twin</span>
+        </div>
+        <UserButton />
+      </header>
+
+      <main className="max-w-4xl mx-auto px-6 py-10">
+        {/* Welcome */}
+        <div className="mb-8">
+          <h1 className="text-2xl font-bold text-gray-900">
+            Welcome back{user?.firstName ? `, ${user.firstName}` : ""}
+          </h1>
+          <p className="text-gray-500 mt-1">Manage your AI twins</p>
+        </div>
+
+        {/* Twins grid */}
+        {loading ? (
+          <div className="text-gray-400 text-sm">Loading...</div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {/* Existing twins */}
+            {twins.map(twin => (
+              <div key={twin.twin_id} className="bg-white rounded-xl border border-gray-200 p-5 flex flex-col gap-3">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <h3 className="font-semibold text-gray-900">{twin.name}</h3>
+                    <p className="text-sm text-gray-500 mt-0.5">{twin.title}</p>
+                    {twin.archetype_display_name && (
+                      <span className="inline-block mt-1.5 text-xs text-purple-600 bg-purple-50 border border-purple-100 px-2 py-0.5 rounded-full">
+                        {twin.archetype_display_name}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex gap-2 mt-auto pt-2 border-t border-gray-100">
+                  <Link
+                    href={twin.chat_url}
+                    className="flex items-center gap-1.5 text-xs text-purple-600 hover:text-purple-800 font-medium"
+                  >
+                    <MessageSquare className="w-3.5 h-3.5" />
+                    Chat
+                  </Link>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(`${window.location.origin}${twin.chat_url}`)}
+                    className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-700 ml-auto"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    Copy link
+                  </button>
+                </div>
+              </div>
+            ))}
+
+            {/* Create new twin card */}
+            {twins.length < 2 && (
+              <Link
+                href="/create"
+                className="bg-white rounded-xl border-2 border-dashed border-gray-200 p-5 flex flex-col items-center justify-center gap-2 hover:border-purple-400 hover:bg-purple-50 transition-colors group"
+              >
+                <div className="w-10 h-10 rounded-full bg-gray-100 group-hover:bg-purple-100 flex items-center justify-center transition-colors">
+                  <Plus className="w-5 h-5 text-gray-400 group-hover:text-purple-600" />
+                </div>
+                <span className="text-sm font-medium text-gray-500 group-hover:text-purple-600">
+                  Create a new twin
+                </span>
+                <span className="text-xs text-gray-400">
+                  {twins.length}/2 twins used
+                </span>
+              </Link>
+            )}
+
+            {twins.length === 0 && (
+              <div className="col-span-2 text-center py-8 text-gray-400 text-sm">
+                You don&apos;t have any twins yet. Create your first one!
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
