@@ -1,6 +1,6 @@
 'use client';
 
-import { useUser, UserButton } from "@clerk/nextjs";
+import { useUser, useAuth, UserButton } from "@clerk/nextjs";
 import Link from "next/link";
 import { Plus, MessageSquare, ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -18,28 +18,41 @@ interface Twin {
 
 export default function DashboardPage() {
   const { user } = useUser();
+  const { getToken, isSignedIn, isLoaded } = useAuth();
   const [twins, setTwins] = useState<Twin[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (!isLoaded) return;
+    if (!isSignedIn) {
+      setLoading(false);
+      return;
+    }
+
     async function fetchTwins() {
       try {
-        const token = await (window as any).Clerk?.session?.getToken();
+        const token = await getToken();
+        if (!token) {
+          setError("Unable to retrieve auth token.");
+          return;
+        }
         const res = await fetch(`${API}/users/me/twins`, {
           headers: { Authorization: `Bearer ${token}` },
         });
-        if (res.ok) {
-          const data = await res.json();
-          setTwins(data.twins || []);
+        if (!res.ok) {
+          throw new Error(`Request failed: ${res.status} ${res.statusText}`);
         }
-      } catch {
-        // backend not yet connected — show empty state
+        const data = await res.json();
+        setTwins(data.twins || []);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load twins.");
       } finally {
         setLoading(false);
       }
     }
     fetchTwins();
-  }, []);
+  }, [isLoaded, isSignedIn, getToken]);
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -64,6 +77,11 @@ export default function DashboardPage() {
         </div>
 
         {/* Twins grid */}
+        {error && (
+          <div className="mb-4 text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
+            {error}
+          </div>
+        )}
         {loading ? (
           <div className="text-gray-400 text-sm">Loading...</div>
         ) : (
