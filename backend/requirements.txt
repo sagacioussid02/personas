@@ -3,5 +3,5 @@ uvicorn
 python-dotenv
 python-multipart
 boto3
-pypdf
+pypdf>=6.9.2
 mangum
