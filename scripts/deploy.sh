@@ -35,19 +35,18 @@ echo "🎯 Applying Terraform..."
 "${TF_APPLY_CMD[@]}"
 
 API_URL=$(terraform output -raw api_gateway_url)
-FRONTEND_BUCKET=$(terraform output -raw s3_frontend_bucket)
 CUSTOM_URL=$(terraform output -raw custom_domain_url 2>/dev/null || true)
 
-# Note: Frontend build and deployment is handled by CI/CD workflow
-# to ensure NEXT_PUBLIC_API_URL is set correctly at build time
+# Note: Frontend is deployed via Vercel (connected to the main branch).
+# The API URL must be configured as NEXT_PUBLIC_API_URL in the Vercel
+# project environment variables.
 
 cd ..
 
 # 3. Final messages
 echo -e "\n✅ Backend deployment complete!"
-echo "🌐 CloudFront URL : $(terraform -chdir=terraform output -raw cloudfront_url)"
 if [ -n "$CUSTOM_URL" ]; then
   echo "🔗 Custom domain  : $CUSTOM_URL"
 fi
 echo "📡 API Gateway    : $API_URL"
-echo "⏳ Frontend deployment handled by CI/CD workflow..."
+echo "🚀 Frontend deployed via Vercel — set NEXT_PUBLIC_API_URL=$API_URL in Vercel project settings."
