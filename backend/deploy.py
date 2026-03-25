@@ -42,13 +42,21 @@ def main():
 
     # Copy application files
     print("Copying application files...")
-    for file in ["server.py", "lambda_handler.py", "context.py", "resources.py"]:
+    for file in ["server.py", "lambda_handler.py", "context.py", "resources.py", "personality_agent.py"]:
         if os.path.exists(file):
             shutil.copy2(file, "lambda-package/")
     
     # Copy data directory
     if os.path.exists("data"):
         shutil.copytree("data", "lambda-package/data")
+
+    # Copy personalities directory (required by personality_agent.py)
+    if os.path.exists("personalities"):
+        shutil.copytree("personalities", "lambda-package/personalities")
+
+    # Copy twins directory (seed/example twins)
+    if os.path.exists("twins"):
+        shutil.copytree("twins", "lambda-package/twins")
 
     # Create zip
     print("Creating zip file...")
