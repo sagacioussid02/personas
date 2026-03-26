@@ -78,10 +78,10 @@ function TwinChat() {
         body: JSON.stringify({
           message: input,
           twin_id: id,
-          // Always send session_id when available so the backend can fall back
-          // to it if token validation fails (expired, JWKS misconfig, etc.),
-          // preserving within-page continuity. Backend ignores it when it
-          // successfully derives a stable authenticated session key.
+          // Always send session_id when available to maintain continuity for
+          // anonymous sessions. For authenticated users, the backend derives a
+          // stable session from their identity + twin_id and may reject the
+          // request if token validation fails rather than falling back to this.
           ...(sessionId ? { session_id: sessionId } : {}),
         }),
       });
