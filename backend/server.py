@@ -76,9 +76,14 @@ _bearer = HTTPBearer(auto_error=False)
 async def _fetch_jwks() -> dict:
     if not CLERK_JWKS_URL:
         raise HTTPException(status_code=500, detail="Auth not configured")
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(CLERK_JWKS_URL)
-        resp.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(CLERK_JWKS_URL)
+            resp.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="JWKS endpoint timeout") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="JWKS endpoint unavailable") from exc
     return resp.json()
 
 
@@ -213,22 +218,14 @@ def _s3_get_twin(key: str) -> Optional[dict]:
 def load_twin(twin_id: str) -> Optional[dict]:
     """Load a saved twin's data by ID. Validates ID format and confines path to TWINS_DIR.
 
-    S3 layout: new twins are stored at twins/{user_id}/{twin_id}.json.
-    Legacy twins (no user prefix) are still found at twins/{twin_id}.json.
+    S3 layout: flat key twins/{twin_id}.json for O(1) public lookup.
+    Per-user key twins/{user_id}/{twin_id}.json exists in parallel for listing.
     """
     if not _TWIN_ID_RE.match(twin_id):
         raise HTTPException(status_code=400, detail="Invalid twin ID format")
 
     if USE_S3:
-        # Search new per-user prefix layout first via a prefix listing
-        paginator = s3_client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=TWINS_S3_PREFIX, Delimiter="/"):
-            for prefix in page.get("CommonPrefixes", []):
-                key = f"{prefix['Prefix']}{twin_id}.json"
-                data = _s3_get_twin(key)
-                if data is not None:
-                    return data
-        # Fall back to legacy flat layout: twins/{twin_id}.json
+        # Direct flat-key lookup — O(1), safe for public endpoints
         return _s3_get_twin(f"{TWINS_S3_PREFIX}{twin_id}.json")
 
     path = os.path.realpath(os.path.join(TWINS_DIR, f"{twin_id}.json"))
@@ -882,10 +879,19 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
     }
 
     if USE_S3:
+        payload = json.dumps(twin_data, indent=2)
+        # Flat key for O(1) public lookup (load_twin, /twin/{id}, /chat)
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=f"{TWINS_S3_PREFIX}{twin_id}.json",
+            Body=payload,
+            ContentType="application/json",
+        )
+        # Per-user key for efficient user listing (list_my_twins)
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=f"{TWINS_S3_PREFIX}{user_id}/{twin_id}.json",
-            Body=json.dumps(twin_data, indent=2),
+            Body=payload,
             ContentType="application/json",
         )
     else:
