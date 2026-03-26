@@ -52,6 +52,16 @@ variable "root_domain" {
   default     = ""
 }
 
+variable "session_hmac_secret" {
+  description = "Server secret for deriving opaque chat session keys (HMAC-SHA256). Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+  type        = string
+  sensitive   = true
+  validation {
+    condition     = length(trimspace(var.session_hmac_secret)) > 0
+    error_message = "session_hmac_secret must be set; it protects conversation history from enumeration."
+  }
+}
+
 variable "clerk_jwks_url" {
   description = "Clerk JWKS URL for JWT verification, e.g. https://<your-clerk-domain>/.well-known/jwks.json"
   type        = string

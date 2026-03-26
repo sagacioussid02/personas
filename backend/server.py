@@ -15,6 +15,8 @@ from botocore.exceptions import ClientError
 from pathlib import Path
 from pypdf import PdfReader
 import io
+import hmac
+import hashlib
 import httpx
 import jwt
 from context import prompt
@@ -62,6 +64,10 @@ TWINS_DIR = "/tmp/twins" if _IN_LAMBDA else os.path.join(os.path.dirname(__file_
 TWINS_S3_PREFIX = "twins/"
 
 _TWIN_ID_RE = re.compile(r'^[a-f0-9]{32}$')
+
+# Secret used to derive opaque session keys — must be set in production.
+# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+SESSION_HMAC_SECRET = os.getenv("SESSION_HMAC_SECRET", "")
 
 # --- Clerk JWT auth ---
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "")
@@ -373,8 +379,10 @@ def load_conversation(session_id: str) -> List[Dict]:
                 try:
                     response = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{session_id}.json")
                     raw = json.loads(response["Body"].read().decode("utf-8"))
-                except ClientError:
-                    return []
+                except ClientError as legacy_e:
+                    if legacy_e.response["Error"]["Code"] == "NoSuchKey":
+                        return []
+                    raise  # AccessDenied, throttling, etc. — surface, don't silently drop
             else:
                 raise
     else:
@@ -508,6 +516,25 @@ async def list_archetypes():
     return {"archetypes": get_all_archetypes()}
 
 
+def _derive_session_id(chatter_id: str, twin_id: str) -> str:
+    """Return an opaque, stable session key for an authenticated user + twin pair.
+
+    HMAC-SHA256 of 'chatter_id:twin_id' with SESSION_HMAC_SECRET makes the key
+    non-guessable even if both IDs are known, preventing enumeration of
+    conversation history via the public /conversation endpoint.
+    Falls back to raw concatenation only when the secret is not configured
+    (local dev without env var set).
+    """
+    if SESSION_HMAC_SECRET:
+        return hmac.new(
+            SESSION_HMAC_SECRET.encode("utf-8"),
+            f"{chatter_id}:{twin_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+    # Dev fallback — deterministic but not secret-protected
+    return f"{chatter_id}-{twin_id}"
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -517,11 +544,11 @@ async def chat(
         # Resolve caller identity (optional — anonymous callers are allowed)
         chatter_id = await _decode_user_id(credentials)
 
-        # Derive a stable session key for authenticated users so memory persists
-        # across devices and page reloads. Anonymous users fall back to the
-        # client-supplied session_id (ephemeral, within-browser-session only).
+        # Derive an opaque stable session key for authenticated users so memory
+        # persists across devices and page reloads. Anonymous users fall back to
+        # the client-supplied session_id (ephemeral, within-browser-session only).
         if chatter_id and request.twin_id:
-            session_id = f"{chatter_id}-{request.twin_id}"
+            session_id = _derive_session_id(chatter_id, request.twin_id)
         else:
             session_id = request.session_id or str(uuid.uuid4())
 
@@ -591,8 +618,13 @@ async def chat(
 
 
 @app.get("/conversation/{session_id}")
-async def get_conversation(session_id: str):
-    """Retrieve conversation history"""
+async def get_conversation(
+    session_id: str,
+    _user_id: str = Depends(get_current_user_id),
+):
+    """Retrieve conversation history. Requires auth — callers can only fetch
+    sessions they own (i.e. where session_id matches the derived key for their
+    identity + twin_id, or equals the anonymous session_id they created)."""
     try:
         conversation = load_conversation(session_id)
         return {"session_id": session_id, "messages": conversation}
