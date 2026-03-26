@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import { Send, User } from 'lucide-react';
 
 interface Message {
@@ -18,6 +19,7 @@ interface Props {
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 function TwinChat({ twinId, twinName }: Props) {
+  const { getToken, isSignedIn } = useAuth();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -43,10 +45,18 @@ function TwinChat({ twinId, twinName }: Props) {
     setIsLoading(true);
 
     try {
+      const token = isSignedIn ? await getToken() : null;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
       const res = await fetch(`${API}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input, session_id: sessionId || undefined, twin_id: twinId }),
+        headers,
+        body: JSON.stringify({
+          message: input,
+          twin_id: twinId,
+          ...(token ? {} : { session_id: sessionId || undefined }),
+        }),
       });
 
       if (!res.ok) throw new Error('Failed to send message');

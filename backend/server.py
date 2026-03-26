@@ -105,11 +105,10 @@ def _find_key(jwks: dict, kid: str) -> Optional[dict]:
     return next((k for k in keys if k.get("kid") == kid), None)
 
 
-async def get_current_user_id(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
-) -> str:
+async def _decode_user_id(credentials: Optional[HTTPAuthorizationCredentials]) -> Optional[str]:
+    """Decode user_id from credentials. Returns None if missing or invalid (never raises)."""
     if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        return None
     token = credentials.credentials
     try:
         header = jwt.get_unverified_header(token)
@@ -118,12 +117,11 @@ async def get_current_user_id(
         jwks = await _get_jwks()
         key = _find_key(jwks, kid)
 
-        # kid not found — rotate cache once and retry before rejecting
         if key is None:
             jwks = await _get_jwks(force_refresh=True)
             key = _find_key(jwks, kid)
         if key is None:
-            raise HTTPException(status_code=401, detail="Unknown token key")
+            return None
 
         public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
         decode_options: dict = {}
@@ -138,13 +136,21 @@ async def get_current_user_id(
             options=decode_options,
         )
         user_id: str = payload.get("sub", "")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
+        return user_id or None
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, HTTPException):
+        return None
+
+
+async def get_current_user_id(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> str:
+    """Strict auth — raises 401 if token is missing or invalid. Use for protected endpoints."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user_id = await _decode_user_id(credentials)
+    if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
+    return user_id
 
 # Expected keys for the personality model returned by /create-twin
 _PERSONALITY_MODEL_KEYS = {
@@ -352,43 +358,64 @@ class CreateTwinRequest(BaseModel):
 
 # Memory management functions
 def get_memory_path(session_id: str) -> str:
-    return f"{session_id}.json"
+    return f"sessions/{session_id}.json"
 
 
 def load_conversation(session_id: str) -> List[Dict]:
-    """Load conversation history from storage"""
+    """Load conversation history from storage. Handles legacy list format and current dict format."""
     if USE_S3:
         try:
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=get_memory_path(session_id))
-            return json.loads(response["Body"].read().decode("utf-8"))
+            raw = json.loads(response["Body"].read().decode("utf-8"))
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
-                return []
-            raise
+                # Fallback: check legacy flat key (pre-sessions/ prefix)
+                try:
+                    response = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{session_id}.json")
+                    raw = json.loads(response["Body"].read().decode("utf-8"))
+                except ClientError:
+                    return []
+            else:
+                raise
     else:
-        # Local file storage
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
-                return json.load(f)
-        return []
+                raw = json.load(f)
+        else:
+            return []
+
+    # Support both legacy list format and current dict format
+    if isinstance(raw, list):
+        return raw
+    return raw.get("messages", [])
 
 
-def save_conversation(session_id: str, messages: List[Dict]):
-    """Save conversation history to storage"""
+def save_conversation(
+    session_id: str,
+    messages: List[Dict],
+    chatter_id: Optional[str] = None,
+    twin_owner_id: Optional[str] = None,
+):
+    """Save conversation history with owner metadata for future access-control migration."""
+    data: Any = {
+        "session_id": session_id,
+        "chatter_id": chatter_id,       # authenticated user who is chatting (None = anonymous)
+        "twin_owner_id": twin_owner_id,  # user_id of the twin's creator
+        "messages": messages,
+    }
     if USE_S3:
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=get_memory_path(session_id),
-            Body=json.dumps(messages, indent=2),
+            Body=json.dumps(data, indent=2),
             ContentType="application/json",
         )
     else:
-        # Local file storage
-        os.makedirs(MEMORY_DIR, exist_ok=True)
+        os.makedirs(os.path.join(MEMORY_DIR, "sessions"), exist_ok=True)
         file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
         with open(file_path, "w") as f:
-            json.dump(messages, f, indent=2)
+            json.dump(data, f, indent=2)
 
 
 def call_bedrock(
@@ -482,10 +509,21 @@ async def list_archetypes():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+):
     try:
-        # Generate session ID if not provided
-        session_id = request.session_id or str(uuid.uuid4())
+        # Resolve caller identity (optional — anonymous callers are allowed)
+        chatter_id = await _decode_user_id(credentials)
+
+        # Derive a stable session key for authenticated users so memory persists
+        # across devices and page reloads. Anonymous users fall back to the
+        # client-supplied session_id (ephemeral, within-browser-session only).
+        if chatter_id and request.twin_id:
+            session_id = f"{chatter_id}-{request.twin_id}"
+        else:
+            session_id = request.session_id or str(uuid.uuid4())
 
         # Load conversation history
         conversation = load_conversation(session_id)
@@ -539,8 +577,9 @@ async def chat(request: ChatRequest):
             }
         )
 
-        # Save conversation
-        save_conversation(session_id, conversation)
+        # Save conversation — include owner metadata for future access-control migration
+        twin_owner_id = twin_data.get("user_id") if twin_data else None
+        save_conversation(session_id, conversation, chatter_id=chatter_id, twin_owner_id=twin_owner_id)
 
         return ChatResponse(response=assistant_response, session_id=session_id)
 
