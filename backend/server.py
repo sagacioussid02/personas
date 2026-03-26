@@ -604,8 +604,29 @@ async def chat(
         else:
             session_id = request.session_id or str(uuid.uuid4())
 
-        # Load conversation history
-        conversation = load_conversation(session_id)
+        # Guard against session hijacking: if the stored record was created by
+        # an authenticated user, only that same user (or a caller with no stored
+        # chatter_id to compare against) may continue it.
+        existing_record = _load_raw_record(session_id)
+        stored_chatter_id = (
+            existing_record.get("chatter_id")
+            if isinstance(existing_record, dict)
+            else None
+        )
+        if stored_chatter_id is not None and stored_chatter_id != chatter_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: this session belongs to a different user",
+            )
+
+        # Load conversation history from the already-fetched record (avoids a
+        # second storage read).
+        if existing_record is None:
+            conversation: List[Dict] = []
+        elif isinstance(existing_record, list):
+            conversation = existing_record
+        else:
+            conversation = existing_record.get("messages", [])
 
         # Load twin personality model if twin_id provided
         personality_model = None
@@ -656,9 +677,12 @@ async def chat(
             }
         )
 
-        # Save conversation — include owner metadata for future access-control migration
+        # Save conversation — preserve an existing non-null chatter_id so that
+        # unauthenticated retries cannot "de-own" a session that was previously
+        # created by an authenticated caller.
         twin_owner_id = twin_data.get("user_id") if twin_data else None
-        save_conversation(session_id, conversation, chatter_id=chatter_id, twin_owner_id=twin_owner_id)
+        effective_chatter_id = chatter_id or stored_chatter_id
+        save_conversation(session_id, conversation, chatter_id=effective_chatter_id, twin_owner_id=twin_owner_id)
 
         return ChatResponse(response=assistant_response, session_id=session_id)
 

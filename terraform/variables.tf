@@ -57,8 +57,8 @@ variable "session_hmac_secret" {
   type        = string
   sensitive   = true
   validation {
-    condition     = length(trimspace(var.session_hmac_secret)) > 0
-    error_message = "session_hmac_secret must be set; it protects conversation history from enumeration."
+    condition     = length(trimspace(var.session_hmac_secret)) >= 64 && can(regex("^[0-9a-f]+$", trimspace(var.session_hmac_secret)))
+    error_message = "session_hmac_secret must be a hex-encoded secret of at least 32 bytes (64 hex characters). Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
   }
 }
 
