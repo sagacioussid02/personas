@@ -641,9 +641,13 @@ async def get_conversation(
     session_id: str,
     _user_id: str = Depends(get_current_user_id),
 ):
-    """Retrieve conversation history. Requires auth — callers can only fetch
-    sessions they own (i.e. where session_id matches the derived key for their
-    identity + twin_id, or equals the anonymous session_id they created)."""
+    """Retrieve conversation history for the given session_id.
+
+    This endpoint requires authentication via `get_current_user_id`. It does not
+    perform an explicit ownership check on `session_id` beyond requiring that the
+    caller knows a valid session identifier. Anonymous (unauthenticated) sessions
+    are not retrievable through this endpoint because authentication is mandatory.
+    """
     try:
         conversation = load_conversation(session_id)
         return {"session_id": session_id, "messages": conversation}
