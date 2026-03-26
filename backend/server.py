@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import field_validator
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,6 +15,8 @@ from botocore.exceptions import ClientError
 from pathlib import Path
 from pypdf import PdfReader
 import io
+import httpx
+import jwt
 from context import prompt
 from personality_agent import detect_archetype, get_archetype, get_all_archetypes, review_response
 
@@ -59,6 +62,89 @@ TWINS_DIR = "/tmp/twins" if _IN_LAMBDA else os.path.join(os.path.dirname(__file_
 TWINS_S3_PREFIX = "twins/"
 
 _TWIN_ID_RE = re.compile(r'^[a-f0-9]{32}$')
+
+# --- Clerk JWT auth ---
+CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "")
+# Derive issuer from JWKS URL: strip /.well-known/jwks.json
+CLERK_ISSUER = CLERK_JWKS_URL.removesuffix("/.well-known/jwks.json") if CLERK_JWKS_URL else ""
+# Optional: set CLERK_AUDIENCE if your Clerk app has a custom audience configured
+CLERK_AUDIENCE = os.getenv("CLERK_AUDIENCE", "") or None
+_jwks_cache: Optional[dict] = None
+_bearer = HTTPBearer(auto_error=False)
+
+
+async def _fetch_jwks() -> dict:
+    if not CLERK_JWKS_URL:
+        raise HTTPException(status_code=500, detail="Auth not configured")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(CLERK_JWKS_URL)
+            resp.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=503, detail="JWKS endpoint timeout") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=503, detail="JWKS endpoint unavailable") from exc
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Invalid JWKS response") from exc
+
+
+async def _get_jwks(force_refresh: bool = False) -> dict:
+    global _jwks_cache
+    if not force_refresh and _jwks_cache:
+        return _jwks_cache
+    _jwks_cache = await _fetch_jwks()
+    return _jwks_cache
+
+
+def _find_key(jwks: dict, kid: str) -> Optional[dict]:
+    keys = jwks.get("keys")
+    if not isinstance(keys, list):
+        raise HTTPException(status_code=503, detail="JWKS payload invalid")
+    return next((k for k in keys if k.get("kid") == kid), None)
+
+
+async def get_current_user_id(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> str:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = credentials.credentials
+    try:
+        header = jwt.get_unverified_header(token)
+        kid = header.get("kid", "")
+
+        jwks = await _get_jwks()
+        key = _find_key(jwks, kid)
+
+        # kid not found — rotate cache once and retry before rejecting
+        if key is None:
+            jwks = await _get_jwks(force_refresh=True)
+            key = _find_key(jwks, kid)
+        if key is None:
+            raise HTTPException(status_code=401, detail="Unknown token key")
+
+        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
+        decode_options: dict = {}
+        if not CLERK_AUDIENCE:
+            decode_options["verify_aud"] = False
+        payload = jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],
+            issuer=CLERK_ISSUER if CLERK_ISSUER else None,
+            audience=CLERK_AUDIENCE,
+            options=decode_options,
+        )
+        user_id: str = payload.get("sub", "")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 # Expected keys for the personality model returned by /create-twin
 _PERSONALITY_MODEL_KEYS = {
@@ -124,19 +210,29 @@ def _extract_json_array(text: str) -> list:
     raise ValueError("Unbalanced brackets — could not extract JSON array")
 
 
+def _s3_get_twin(key: str) -> Optional[dict]:
+    """Fetch and parse a twin JSON from S3 by key. Returns None on missing key."""
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(response["Body"].read().decode("utf-8"))
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchKey":
+            return None
+        raise
+
+
 def load_twin(twin_id: str) -> Optional[dict]:
-    """Load a saved twin's data by ID. Validates ID format and confines path to TWINS_DIR."""
+    """Load a saved twin's data by ID. Validates ID format and confines path to TWINS_DIR.
+
+    S3 layout: flat key twins/{twin_id}.json for O(1) public lookup.
+    Per-user key twins/{user_id}/{twin_id}.json exists in parallel for listing.
+    """
     if not _TWIN_ID_RE.match(twin_id):
         raise HTTPException(status_code=400, detail="Invalid twin ID format")
 
     if USE_S3:
-        try:
-            response = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{TWINS_S3_PREFIX}{twin_id}.json")
-            return json.loads(response["Body"].read().decode("utf-8"))
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                return None
-            raise
+        # Direct flat-key lookup — O(1), safe for public endpoints
+        return _s3_get_twin(f"{TWINS_S3_PREFIX}{twin_id}.json")
 
     path = os.path.realpath(os.path.join(TWINS_DIR, f"{twin_id}.json"))
     if not path.startswith(os.path.realpath(TWINS_DIR) + os.sep):
@@ -623,8 +719,56 @@ async def get_twin(twin_id: str):
     }
 
 
+@app.get("/users/me/twins")
+async def list_my_twins(user_id: str = Depends(get_current_user_id)):
+    """List all twins belonging to the authenticated user."""
+    twins = []
+    if USE_S3:
+        # Scoped prefix — only fetches this user's objects, not a full table scan
+        user_prefix = f"{TWINS_S3_PREFIX}{user_id}/"
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=user_prefix):
+            for obj in page.get("Contents", []):
+                try:
+                    resp = s3_client.get_object(Bucket=S3_BUCKET, Key=obj["Key"])
+                    data = json.loads(resp["Body"].read())
+                    # Safety guard — prefix already scopes to this user
+                    if data.get("user_id") == user_id:
+                        twins.append({
+                            "twin_id": data["twin_id"],
+                            "name": data["name"],
+                            "title": data.get("title", ""),
+                            "archetype_display_name": data.get("archetype_display_name"),
+                            "created_at": data.get("created_at", ""),
+                            "chat_url": data.get("chat_url", f"/twin?id={data['twin_id']}"),
+                        })
+                except Exception as e:
+                    print(f"Warning: could not read S3 object {obj['Key']}: {e}")
+                    continue
+    else:
+        twins_path = Path(TWINS_DIR)
+        if twins_path.exists():
+            for f in sorted(twins_path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    data = json.loads(f.read_text())
+                    if data.get("user_id") == user_id:
+                        twins.append({
+                            "twin_id": data["twin_id"],
+                            "name": data["name"],
+                            "title": data.get("title", ""),
+                            "archetype_display_name": data.get("archetype_display_name"),
+                            "created_at": data.get("created_at", ""),
+                            "chat_url": data.get("chat_url", f"/twin?id={data['twin_id']}"),
+                        })
+                except Exception as e:
+                    print(f"Warning: could not read twin file {f}: {e}")
+                    continue
+    twins.sort(key=lambda t: t["created_at"], reverse=True)
+    return {"twins": twins}
+
+
 @app.post("/create-twin")
-async def create_twin(request: CreateTwinRequest):
+async def create_twin(request: CreateTwinRequest, user_id: str = Depends(get_current_user_id)):
     """Synthesize submitted profile data into a structured personality model via Bedrock"""
 
     synthesis_prompt = f"""You are building a personality model for an AI twin. Your job is to deeply analyze everything provided and produce a structured JSON model that captures how this person THINKS and DECIDES — not just what they've done.
@@ -730,6 +874,7 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
 
     twin_data: Dict[str, Any] = {
         "twin_id": twin_id,
+        "user_id": user_id,
         "name": request.name,
         "title": request.title,
         "archetype_id": archetype_id,
@@ -740,10 +885,19 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
     }
 
     if USE_S3:
+        payload = json.dumps(twin_data, indent=2)
+        # Flat key for O(1) public lookup (load_twin, /twin/{id}, /chat)
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=f"{TWINS_S3_PREFIX}{twin_id}.json",
-            Body=json.dumps(twin_data, indent=2),
+            Body=payload,
+            ContentType="application/json",
+        )
+        # Per-user key for efficient user listing (list_my_twins)
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=f"{TWINS_S3_PREFIX}{user_id}/{twin_id}.json",
+            Body=payload,
             ContentType="application/json",
         )
     else:

@@ -67,12 +67,13 @@ jobs:
           # Set environment variables for the script
           export AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
           export DEFAULT_AWS_REGION=${{ secrets.DEFAULT_AWS_REGION }}
-          
+
           # Make script executable and run it
           chmod +x scripts/deploy.sh
           ./scripts/deploy.sh ${{ github.event.inputs.environment || 'dev' }}
         env:
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          TF_VAR_clerk_jwks_url: ${{ secrets.CLERK_JWKS_URL }}
           
       - name: Deployment Summary
         working-directory: ./terraform

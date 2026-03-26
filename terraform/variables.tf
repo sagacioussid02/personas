@@ -51,3 +51,12 @@ variable "root_domain" {
   type        = string
   default     = ""
 }
+
+variable "clerk_jwks_url" {
+  description = "Clerk JWKS URL for JWT verification, e.g. https://<your-clerk-domain>/.well-known/jwks.json"
+  type        = string
+  validation {
+    condition     = length(trimspace(var.clerk_jwks_url)) > 0
+    error_message = "clerk_jwks_url must be set to the Clerk JWKS URL; the backend requires CLERK_JWKS_URL for authenticated routes."
+  }
+}

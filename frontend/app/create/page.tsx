@@ -2,6 +2,8 @@
 
 import { useState, useRef, useEffect } from 'react';
 import type { ChangeEvent } from 'react';
+import { useAuth } from '@clerk/nextjs';
+import { useRouter } from 'next/navigation';
 import { ArrowLeft, ArrowRight, Check, Upload, Loader2, Sparkles, ChevronDown } from 'lucide-react';
 
 interface FormData {
@@ -116,6 +118,8 @@ interface PersonalityModel {
 }
 
 export default function CreatePage() {
+  const { getToken } = useAuth();
+  const router = useRouter();
   const [step, setStep] = useState(1);
   const [form, setForm] = useState<FormData>(empty);
   const [parsing, setParsing] = useState(false);
@@ -129,6 +133,15 @@ export default function CreatePage() {
   const [showArchetypeDropdown, setShowArchetypeDropdown] = useState(false);
   const [selectedQuirks, setSelectedQuirks] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const redirectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (redirectTimeoutRef.current !== null) {
+        clearTimeout(redirectTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const toggleQuirk = (quirk: string) =>
     setSelectedQuirks(prev => {
@@ -202,9 +215,17 @@ export default function CreatePage() {
     setSubmitting(true);
     setSubmitError('');
     try {
+      const token = await getToken();
+      if (!token) {
+        router.push('/sign-in');
+        return;
+      }
       const res = await fetch(`${API}/create-twin`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify({
           name: form.name,
           title: form.title,
@@ -235,6 +256,7 @@ export default function CreatePage() {
       const data = await res.json();
       setTwinResult(data);
       setStep(5);
+      redirectTimeoutRef.current = setTimeout(() => router.push('/dashboard'), 3000);
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : 'Something went wrong');
     } finally {

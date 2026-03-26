@@ -12,6 +12,21 @@ echo "📦 Building Lambda package..."
 (cd backend && uv run deploy.py)
 
 # 2. Terraform workspace & apply
+#
+# Required env vars for Terraform:
+#   TF_VAR_clerk_jwks_url  — Clerk JWKS URL (e.g. https://<your-clerk-domain>/.well-known/jwks.json)
+#                            Required: the backend JWT auth enforces this on authenticated routes.
+#                            Set it before running this script:
+#                              export TF_VAR_clerk_jwks_url="https://..."
+#                              ./scripts/deploy.sh prod
+#
+if [ -z "${TF_VAR_clerk_jwks_url:-}" ]; then
+  echo "❌ TF_VAR_clerk_jwks_url is not set. This variable is required for Clerk JWT authentication."
+  echo "   Set it before deploying:"
+  echo "     export TF_VAR_clerk_jwks_url=\"https://<your-clerk-domain>/.well-known/jwks.json\""
+  exit 1
+fi
+
 cd terraform
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 AWS_REGION=${DEFAULT_AWS_REGION:-us-east-2}
@@ -46,9 +61,9 @@ cd ..
 #
 # By default the frontend is deployed via Vercel (connected to the main branch).
 # To deploy to S3/CloudFront instead, set DEPLOY_FRONTEND_S3=true before running
-# this script.  Both the S3 bucket and CloudFront distribution are always
-# provisioned by Terraform, so switching between providers only requires
-# toggling the env var.
+# this script. The S3/CloudFront path assumes your Next.js build outputs static
+# assets to frontend/out/ (for example, by configuring next.config.ts or the
+# build command to produce a static export).
 #
 # Example:
 #   DEPLOY_FRONTEND_S3=true ./scripts/deploy.sh prod
@@ -68,7 +83,6 @@ if [ "${DEPLOY_FRONTEND_S3:-false}" = "true" ]; then
     aws s3 sync frontend/out/ "s3://${S3_BUCKET}" --delete
 
     if [ -n "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
-      # Invalidate CloudFront cache so the new build is served immediately
       echo "🔄 Invalidating CloudFront distribution ${CLOUDFRONT_DISTRIBUTION_ID}..."
       aws cloudfront create-invalidation \
         --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
