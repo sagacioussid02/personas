@@ -84,7 +84,10 @@ async def _fetch_jwks() -> dict:
         raise HTTPException(status_code=503, detail="JWKS endpoint timeout") from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail="JWKS endpoint unavailable") from exc
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=503, detail="Invalid JWKS response") from exc
 
 
 async def _get_jwks(force_refresh: bool = False) -> dict:
