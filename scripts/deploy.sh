@@ -12,6 +12,21 @@ echo "📦 Building Lambda package..."
 (cd backend && uv run deploy.py)
 
 # 2. Terraform workspace & apply
+#
+# Required env vars for Terraform:
+#   TF_VAR_clerk_jwks_url  — Clerk JWKS URL (e.g. https://<your-clerk-domain>/.well-known/jwks.json)
+#                            Required: the backend JWT auth enforces this on authenticated routes.
+#                            Set it before running this script:
+#                              export TF_VAR_clerk_jwks_url="https://..."
+#                              ./scripts/deploy.sh prod
+#
+if [ -z "${TF_VAR_clerk_jwks_url:-}" ]; then
+  echo "❌ TF_VAR_clerk_jwks_url is not set. This variable is required for Clerk JWT authentication."
+  echo "   Set it before deploying:"
+  echo "     export TF_VAR_clerk_jwks_url=\"https://<your-clerk-domain>/.well-known/jwks.json\""
+  exit 1
+fi
+
 cd terraform
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 AWS_REGION=${DEFAULT_AWS_REGION:-us-east-2}
