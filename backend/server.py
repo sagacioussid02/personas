@@ -99,7 +99,10 @@ async def _get_jwks(force_refresh: bool = False) -> dict:
 
 
 def _find_key(jwks: dict, kid: str) -> Optional[dict]:
-    return next((k for k in jwks["keys"] if k.get("kid") == kid), None)
+    keys = jwks.get("keys")
+    if not isinstance(keys, list):
+        raise HTTPException(status_code=503, detail="JWKS payload invalid")
+    return next((k for k in keys if k.get("kid") == kid), None)
 
 
 async def get_current_user_id(
