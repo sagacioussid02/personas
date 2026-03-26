@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import json
 import uuid
 import re
@@ -392,22 +392,26 @@ def get_memory_path(session_id: str) -> str:
     return f"sessions/{session_id}.json"
 
 
-def load_conversation(session_id: str) -> List[Dict]:
-    """Load conversation history from storage. Handles legacy list format and current dict format."""
+def _load_raw_record(session_id: str) -> Optional[Union[List[Dict], Dict[str, Any]]]:
+    """Load the raw conversation record from storage (S3 or local).
+
+    Returns the parsed JSON value (list or dict) if found, or None if the session
+    does not exist. Raises on storage errors (e.g. AccessDenied, throttling).
+    """
     _validate_session_id(session_id)
     if USE_S3:
         try:
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=get_memory_path(session_id))
-            raw = json.loads(response["Body"].read().decode("utf-8"))
+            return json.loads(response["Body"].read().decode("utf-8"))
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
                 # Fallback: check legacy flat key (pre-sessions/ prefix)
                 try:
                     response = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{session_id}.json")
-                    raw = json.loads(response["Body"].read().decode("utf-8"))
+                    return json.loads(response["Body"].read().decode("utf-8"))
                 except ClientError as legacy_e:
                     if legacy_e.response["Error"]["Code"] == "NoSuchKey":
-                        return []
+                        return None
                     raise  # AccessDenied, throttling, etc. — surface, don't silently drop
             else:
                 raise
@@ -418,19 +422,23 @@ def load_conversation(session_id: str) -> List[Dict]:
             raise HTTPException(status_code=400, detail="Invalid session ID format")
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
-                raw = json.load(f)
-        else:
-            # Fallback: check legacy flat path (pre-sessions/ prefix)
-            memory_dir_real = os.path.realpath(MEMORY_DIR)
-            legacy_path = os.path.realpath(os.path.join(MEMORY_DIR, f"{session_id}.json"))
-            if not legacy_path.startswith(memory_dir_real + os.sep):
-                raise HTTPException(status_code=400, detail="Invalid session ID format")
-            if os.path.exists(legacy_path):
-                with open(legacy_path, "r") as f:
-                    raw = json.load(f)
-            else:
-                return []
+                return json.load(f)
+        # Fallback: check legacy flat path (pre-sessions/ prefix)
+        memory_dir_real = os.path.realpath(MEMORY_DIR)
+        legacy_path = os.path.realpath(os.path.join(MEMORY_DIR, f"{session_id}.json"))
+        if not legacy_path.startswith(memory_dir_real + os.sep):
+            raise HTTPException(status_code=400, detail="Invalid session ID format")
+        if os.path.exists(legacy_path):
+            with open(legacy_path, "r") as f:
+                return json.load(f)
+        return None
 
+
+def load_conversation(session_id: str) -> List[Dict]:
+    """Load conversation history from storage. Handles legacy list format and current dict format."""
+    raw = _load_raw_record(session_id)
+    if raw is None:
+        return []
     # Support both legacy list format and current dict format
     if isinstance(raw, list):
         return raw
@@ -668,14 +676,30 @@ async def get_conversation(
 ):
     """Retrieve conversation history for the given session_id.
 
-    This endpoint requires authentication via `get_current_user_id`. It does not
-    perform an explicit ownership check on `session_id` beyond requiring that the
-    caller knows a valid session identifier. Anonymous (unauthenticated) sessions
-    are not retrievable through this endpoint because authentication is mandatory.
+    Requires authentication. Enforces ownership: only the authenticated user
+    whose ``chatter_id`` matches the stored record may retrieve the conversation.
+    Returns 404 for unknown sessions, sessions without ownership metadata, or
+    sessions owned by a different user.
     """
     try:
-        conversation = load_conversation(session_id)
-        return {"session_id": session_id, "messages": conversation}
+        raw = _load_raw_record(session_id)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Enforce ownership using stored chatter_id metadata.
+        if isinstance(raw, dict) and "chatter_id" in raw:
+            if raw["chatter_id"] != _user_id:
+                # Hide existence details from unauthorized callers.
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            messages = raw.get("messages", [])
+        else:
+            # Legacy list format or missing chatter_id — deny to avoid leaking data
+            # from conversations not clearly associated with this user.
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return {"session_id": session_id, "messages": messages}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
