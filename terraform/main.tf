@@ -184,15 +184,51 @@ resource "aws_apigatewayv2_route" "get_root" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
+resource "aws_apigatewayv2_route" "get_health" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /health"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_archetypes" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /archetypes"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
 resource "aws_apigatewayv2_route" "post_chat" {
   api_id    = aws_apigatewayv2_api.main.id
   route_key = "POST /chat"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
-resource "aws_apigatewayv2_route" "get_health" {
+resource "aws_apigatewayv2_route" "get_conversation" {
   api_id    = aws_apigatewayv2_api.main.id
-  route_key = "GET /health"
+  route_key = "GET /conversation/{session_id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_taglines" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /taglines"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "post_parse_linkedin" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /parse-linkedin"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_twin" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /twin/{twin_id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "post_create_twin" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /create-twin"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
