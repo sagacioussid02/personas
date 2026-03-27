@@ -1163,7 +1163,10 @@ class DebateAgent:
 # Maximum allowed number of history entries for /debate/turn.
 # Intentionally decoupled from DEBATE_ROUNDS / frontend NEXT_PUBLIC_DEBATE_ROUNDS
 # so config drift cannot cause mid-debate 422s. Can be overridden via env var.
-_MAX_HISTORY_ENTRIES = int(os.getenv("DEBATE_MAX_HISTORY_ENTRIES", "40"))
+try:
+    _MAX_HISTORY_ENTRIES = int(os.getenv("DEBATE_MAX_HISTORY_ENTRIES", "40"))
+except (TypeError, ValueError):
+    _MAX_HISTORY_ENTRIES = 40
 _MAX_TWIN_NAME_LEN = 100
 _MAX_HISTORY_TEXT_LEN = 2000
 
