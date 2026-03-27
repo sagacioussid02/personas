@@ -1169,11 +1169,15 @@ class DebateAgent:
 # Intentionally decoupled from DEBATE_ROUNDS / frontend NEXT_PUBLIC_DEBATE_ROUNDS
 # so config drift cannot cause mid-debate 422s. Can be overridden via env var.
 try:
-    _MAX_HISTORY_ENTRIES = int(os.getenv("DEBATE_MAX_HISTORY_ENTRIES", "40"))
+    _MAX_HISTORY_ENTRIES = int(os.getenv("DEBATE_MAX_HISTORY_ENTRIES", "20"))
 except (TypeError, ValueError):
-    _MAX_HISTORY_ENTRIES = 40
+    _MAX_HISTORY_ENTRIES = 20
 _MAX_TWIN_NAME_LEN = 100
-_MAX_HISTORY_TEXT_LEN = 2000
+# 1000 chars per entry: generous for 3-5 sentences (~300-500 chars typical).
+_MAX_HISTORY_TEXT_LEN = 1000
+# Total character budget for history injected into the prompt.
+# Oldest entries are dropped server-side if the budget is exceeded.
+_MAX_HISTORY_TOTAL_CHARS = 8000
 
 
 class DebateHistoryEntry(BaseModel):
@@ -1281,10 +1285,17 @@ async def debate_turn(
             f"Open with your perspective. Speak in your natural voice. 3-5 sentences."
         )
     else:
+        # Server-side truncation: drop oldest entries until total chars fit in budget.
+        history = list(request.history)
+        total_chars = sum(len(e.twin_name) + len(e.text) for e in history)
+        while len(history) > 1 and total_chars > _MAX_HISTORY_TOTAL_CHARS:
+            dropped = history.pop(0)
+            total_chars -= len(dropped.twin_name) + len(dropped.text)
+
         history_lines = "\n".join(
-            f'{_esc(e.twin_name)}: "{_esc(e.text)}"' for e in request.history
+            f'{_esc(e.twin_name)}: "{_esc(e.text)}"' for e in history
         )
-        last = request.history[-1]
+        last = history[-1]
         turn_prompt = (
             f'You are in a live debate on the topic: "{_esc(request.topic)}".\n\n'
             f"Debate so far:\n{history_lines}\n\n"
