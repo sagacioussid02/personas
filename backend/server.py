@@ -1266,20 +1266,24 @@ async def debate_turn(
     agent = DebateAgent(twin_data)
 
     # Build the debate-context prompt from history
+    def _esc(s: str) -> str:
+        """JSON-escape a string so quotes/newlines don't break prompt structure."""
+        return json.dumps(s)[1:-1]
+
     if not request.history:
         turn_prompt = (
-            f'You are in a live debate on the topic: "{request.topic}". '
+            f'You are in a live debate on the topic: "{_esc(request.topic)}". '
             f"Open with your perspective. Speak in your natural voice. 3-5 sentences."
         )
     else:
         history_lines = "\n".join(
-            f'{e.twin_name}: "{e.text}"' for e in request.history
+            f'{_esc(e.twin_name)}: "{_esc(e.text)}"' for e in request.history
         )
         last = request.history[-1]
         turn_prompt = (
-            f'You are in a live debate on the topic: "{request.topic}".\n\n'
+            f'You are in a live debate on the topic: "{_esc(request.topic)}".\n\n'
             f"Debate so far:\n{history_lines}\n\n"
-            f'{last.twin_name} just said: "{last.text}"\n\n'
+            f'{_esc(last.twin_name)} just said: "{_esc(last.text)}"\n\n'
             f"Respond to their point. Stay in character. 3-5 sentences."
         )
 
