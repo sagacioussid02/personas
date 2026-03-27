@@ -51,7 +51,11 @@ export default function DebatePage() {
 
   // Load user's twins
   useEffect(() => {
-    if (!isLoaded || !isSignedIn) return;
+    if (!isLoaded) return;
+    if (!isSignedIn) {
+      setTwinsLoading(false);
+      return;
+    }
     async function fetchTwins() {
       try {
         const token = await getToken();

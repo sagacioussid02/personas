@@ -1095,7 +1095,9 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
 # ---------------------------------------------------------------------------
 
 # Each twin speaks this many times (total turns = DEBATE_ROUNDS * 2).
-DEBATE_ROUNDS = 3
+# Kept at 2 to stay within the API Gateway 30s hard timeout — 4 sequential
+# Bedrock calls at ~5-7s each ≈ 20-28s, leaving a safety margin.
+DEBATE_ROUNDS = 2
 
 
 class DebateAgent:
@@ -1122,7 +1124,7 @@ class DebateAgent:
         messages: List[Dict] = [
             {"role": "user", "content": [{"text": f"System: {self._system_prompt}"}]}
         ]
-        for msg in self._history[-10:]:  # cap at last 5 exchanges each way
+        for msg in self._history[-10:]:  # cap at last 10 messages (5 exchanges)
             messages.append({"role": msg["role"], "content": [{"text": msg["content"]}]})
         messages.append({"role": "user", "content": [{"text": user_turn}]})
         return messages
@@ -1246,8 +1248,11 @@ async def debate(
             last_text = response_b
 
     except ClientError as e:
-        print(f"Bedrock error in debate: {e}")
+        print(f"Bedrock ClientError in debate: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate debate response")
+    except Exception as e:
+        print(f"Unexpected error in debate: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during the debate")
 
     return {"topic": request.topic, "turns": turns}
 
