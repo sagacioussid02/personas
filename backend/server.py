@@ -1098,7 +1098,19 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
 # Kept at 2 to stay within the API Gateway 30s hard timeout — 4 sequential
 # Bedrock calls at ~5-7s each ≈ 20-28s, leaving a safety margin.
 # Must match the frontend's NEXT_PUBLIC_DEBATE_ROUNDS env var.
-DEBATE_ROUNDS = int(os.getenv("DEBATE_ROUNDS", "2"))
+_DEBATE_ROUNDS_DEFAULT = 2
+_DEBATE_ROUNDS_MIN = 1
+_DEBATE_ROUNDS_MAX = 4
+_debate_rounds_raw = os.getenv("DEBATE_ROUNDS", "").strip()
+try:
+    _debate_rounds_val = int(_debate_rounds_raw) if _debate_rounds_raw else _DEBATE_ROUNDS_DEFAULT
+except (TypeError, ValueError):
+    _debate_rounds_val = _DEBATE_ROUNDS_DEFAULT
+if _debate_rounds_val < _DEBATE_ROUNDS_MIN:
+    _debate_rounds_val = _DEBATE_ROUNDS_MIN
+elif _debate_rounds_val > _DEBATE_ROUNDS_MAX:
+    _debate_rounds_val = _DEBATE_ROUNDS_MAX
+DEBATE_ROUNDS = _debate_rounds_val
 
 
 class DebateAgent:
