@@ -1147,6 +1147,27 @@ class DebateAgent:
         return text
 
 
+class DebateHistoryEntry(BaseModel):
+    twin_name: str
+    text: str
+
+
+class DebateTurnRequest(BaseModel):
+    twin_id: str
+    topic: str
+    history: List[DebateHistoryEntry] = []  # full debate so far, oldest first
+
+    @field_validator("topic")
+    @classmethod
+    def topic_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("topic must not be empty")
+        if len(v) > 500:
+            raise ValueError("topic must be 500 characters or fewer")
+        return v
+
+
 class DebateRequest(BaseModel):
     twin_id_a: str
     twin_id_b: str
@@ -1173,6 +1194,51 @@ class DebateTurn(BaseModel):
 class DebateResponse(BaseModel):
     topic: str
     turns: List[DebateTurn]
+
+
+@app.post("/debate/turn")
+async def debate_turn(
+    request: DebateTurnRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Generate a single debate turn for one twin.
+
+    The frontend drives the debate loop: it calls this endpoint once per turn,
+    passing the full history so far. This makes each agent's response feel live
+    (typing indicator while waiting, typewriter animation on arrival) without
+    requiring Lambda response streaming.
+    """
+    twin_data = load_twin(request.twin_id)
+    if not twin_data or twin_data.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    agent = DebateAgent(twin_data)
+
+    # Build the debate-context prompt from history
+    if not request.history:
+        turn_prompt = (
+            f'You are in a live debate on the topic: "{request.topic}". '
+            f"Open with your perspective. Speak in your natural voice. 3-5 sentences."
+        )
+    else:
+        history_lines = "\n".join(
+            f'{e.twin_name}: "{e.text}"' for e in request.history
+        )
+        last = request.history[-1]
+        turn_prompt = (
+            f'You are in a live debate on the topic: "{request.topic}".\n\n'
+            f"Debate so far:\n{history_lines}\n\n"
+            f'{last.twin_name} just said: "{last.text}"\n\n'
+            f"Respond to their point. Stay in character. 3-5 sentences."
+        )
+
+    try:
+        text = await asyncio.to_thread(agent.respond, turn_prompt)
+    except ClientError as e:
+        print(f"Bedrock error in debate/turn: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate response")
+
+    return {"twin_id": agent.twin_id, "twin_name": agent.name, "text": text}
 
 
 @app.post("/chat/debate", response_model=DebateResponse)

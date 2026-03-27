@@ -1,11 +1,13 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth, useUser } from '@clerk/nextjs';
 import { useRouter } from 'next/navigation';
 import { Swords, ArrowLeft, Loader2 } from 'lucide-react';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const TOTAL_TURNS = 6; // 3 rounds × 2 agents
+const TYPEWRITER_MS = 18; // ms per character
 
 interface Twin {
   twin_id: string;
@@ -14,14 +16,19 @@ interface Twin {
   archetype_display_name?: string;
 }
 
-interface DebateTurn {
-  twin_id: string;
+interface HistoryEntry {
   twin_name: string;
-  turn_number: number;
   text: string;
 }
 
-type PageState = 'setup' | 'loading' | 'result';
+interface CompletedTurn {
+  twin_id: string;
+  twin_name: string;
+  text: string;
+  turnIndex: number;
+}
+
+type PageState = 'setup' | 'running' | 'done';
 
 export default function DebatePage() {
   const { getToken, isSignedIn, isLoaded } = useAuth();
@@ -39,9 +46,14 @@ export default function DebatePage() {
   const [pageState, setPageState] = useState<PageState>('setup');
   const [debateError, setDebateError] = useState('');
 
-  // Debate result — turns are revealed progressively
-  const [turns, setTurns] = useState<DebateTurn[]>([]);
-  const [visibleCount, setVisibleCount] = useState(0);
+  // Completed turns (fully animated)
+  const [completedTurns, setCompletedTurns] = useState<CompletedTurn[]>([]);
+  // Turn currently being typewriter-animated
+  const [animating, setAnimating] = useState<{ twin_id: string; twin_name: string; displayedText: string; turnIndex: number } | null>(null);
+  // Which side is waiting for the API response
+  const [typingFor, setTypingFor] = useState<'A' | 'B' | null>(null);
+
+  const cancelledRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Redirect to sign-in if unauthenticated
@@ -75,64 +87,172 @@ export default function DebatePage() {
     fetchTwins();
   }, [isLoaded, isSignedIn, getToken]);
 
-  // Progressively reveal turns once debate result arrives
-  useEffect(() => {
-    if (turns.length === 0 || pageState !== 'result') return;
-    setVisibleCount(0);
-    let i = 0;
-    const interval = setInterval(() => {
-      i += 1;
-      setVisibleCount(i);
-      if (i >= turns.length) clearInterval(interval);
-    }, 1200);
-    return () => clearInterval(interval);
-  }, [turns, pageState]);
-
-  // Auto-scroll as turns appear
+  // Auto-scroll whenever turn state changes
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [visibleCount]);
+  }, [completedTurns.length, animating?.displayedText]);
 
   const twinA = twins.find(t => t.twin_id === twinIdA);
   const twinB = twins.find(t => t.twin_id === twinIdB);
   const canStart = twinIdA && twinIdB && twinIdA !== twinIdB && topic.trim();
 
+  // Returns a promise that resolves once all characters have been typed out
+  const animateText = useCallback(
+    (twin_id: string, twin_name: string, text: string, turnIndex: number): Promise<void> => {
+      return new Promise(resolve => {
+        setAnimating({ twin_id, twin_name, displayedText: '', turnIndex });
+        let i = 0;
+        const interval = setInterval(() => {
+          if (cancelledRef.current) {
+            clearInterval(interval);
+            resolve();
+            return;
+          }
+          i++;
+          setAnimating(prev =>
+            prev ? { ...prev, displayedText: text.slice(0, i) } : prev
+          );
+          if (i >= text.length) {
+            clearInterval(interval);
+            resolve();
+          }
+        }, TYPEWRITER_MS);
+      });
+    },
+    []
+  );
+
   async function startDebate() {
     if (!canStart) return;
-    setPageState('loading');
+    cancelledRef.current = false;
+    setPageState('running');
     setDebateError('');
-    setTurns([]);
-    setVisibleCount(0);
-    try {
-      const token = await getToken();
-      if (!token) { router.push('/sign-in'); return; }
-      const res = await fetch(`${API}/chat/debate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ twin_id_a: twinIdA, twin_id_b: twinIdB, topic: topic.trim() }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || 'Debate failed');
+    setCompletedTurns([]);
+    setAnimating(null);
+    setTypingFor(null);
+
+    const token = await getToken();
+    if (!token) { router.push('/sign-in'); return; }
+
+    const history: HistoryEntry[] = [];
+    const twinOrder = [twinIdA, twinIdB];
+
+    for (let i = 0; i < TOTAL_TURNS; i++) {
+      if (cancelledRef.current) break;
+
+      const currentTwinId = twinOrder[i % 2];
+      setTypingFor(i % 2 === 0 ? 'A' : 'B');
+
+      let data: { twin_id: string; twin_name: string; text: string };
+      try {
+        const res = await fetch(`${API}/debate/turn`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ twin_id: currentTwinId, topic: topic.trim(), history }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error((err as { detail?: string }).detail || 'Turn failed');
+        }
+        data = await res.json();
+      } catch (err) {
+        setDebateError(err instanceof Error ? err.message : 'Something went wrong');
+        setPageState('setup');
+        setTypingFor(null);
+        setAnimating(null);
+        return;
       }
-      const data = await res.json();
-      setTurns(data.turns || []);
-      setPageState('result');
-    } catch (err) {
-      setDebateError(err instanceof Error ? err.message : 'Something went wrong');
-      setPageState('setup');
+
+      if (cancelledRef.current) break;
+      setTypingFor(null);
+
+      await animateText(data.twin_id, data.twin_name, data.text, i);
+      if (cancelledRef.current) break;
+
+      setAnimating(null);
+      setCompletedTurns(prev => [
+        ...prev,
+        { twin_id: data.twin_id, twin_name: data.twin_name, text: data.text, turnIndex: i },
+      ]);
+      history.push({ twin_name: data.twin_name, text: data.text });
+    }
+
+    if (!cancelledRef.current) {
+      setPageState('done');
     }
   }
 
   function reset() {
+    cancelledRef.current = true;
     setPageState('setup');
-    setTurns([]);
-    setVisibleCount(0);
+    setCompletedTurns([]);
+    setAnimating(null);
+    setTypingFor(null);
     setDebateError('');
   }
 
   const initials = (name: string) =>
     name.split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase();
+
+  const isA = (twin_id: string) => twin_id === twinIdA;
+
+  function TurnBubble({ twin_id, twin_name, text, cursor = false }: {
+    twin_id: string; twin_name: string; text: string; cursor?: boolean;
+  }) {
+    const a = isA(twin_id);
+    return (
+      <div className={`flex gap-3 ${a ? 'justify-start' : 'justify-end'}`}>
+        {a && twinA && (
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
+            {initials(twinA.name)}
+          </div>
+        )}
+        <div className={`max-w-[72%] rounded-xl px-4 py-3 ${
+          a
+            ? 'bg-white border border-gray-200 text-gray-800'
+            : 'bg-gradient-to-br from-rose-500 to-orange-500 text-white'
+        }`}>
+          <p className={`text-xs font-medium mb-1 ${a ? 'text-purple-600' : 'text-rose-100'}`}>
+            {twin_name}
+          </p>
+          <p className="text-sm leading-relaxed">
+            {text}
+            {cursor && <span className="inline-block w-0.5 h-4 bg-current ml-0.5 animate-pulse align-text-bottom" />}
+          </p>
+        </div>
+        {!a && twinB && (
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rose-500 to-orange-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
+            {initials(twinB.name)}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  function TypingIndicator({ side }: { side: 'A' | 'B' }) {
+    const a = side === 'A';
+    return (
+      <div className={`flex gap-3 ${a ? 'justify-start' : 'justify-end'}`}>
+        {a && twinA && (
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
+            {initials(twinA.name)}
+          </div>
+        )}
+        <div className="bg-white border border-gray-200 rounded-xl px-4 py-3">
+          <div className="flex space-x-1.5 items-center h-4">
+            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+          </div>
+        </div>
+        {!a && twinB && (
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rose-500 to-orange-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
+            {initials(twinB.name)}
+          </div>
+        )}
+      </div>
+    );
+  }
 
   if (!isLoaded || twinsLoading) {
     return (
@@ -141,6 +261,8 @@ export default function DebatePage() {
       </main>
     );
   }
+
+  const isActive = pageState === 'running' || pageState === 'done';
 
   return (
     <main className="min-h-screen bg-gray-50">
@@ -179,18 +301,16 @@ export default function DebatePage() {
           </div>
         ) : (
           <>
-            {/* Setup form */}
-            {pageState !== 'loading' && (
+            {/* Setup form — always visible except during active debate */}
+            {pageState === 'setup' && (
               <div className="bg-white rounded-xl border border-gray-200 p-6 mb-6">
                 <div className="grid grid-cols-2 gap-4 mb-5">
-                  {/* Twin A */}
                   <div>
                     <label className="block text-xs font-medium text-gray-500 mb-1.5">Twin A</label>
                     <select
                       value={twinIdA}
                       onChange={e => setTwinIdA(e.target.value)}
-                      disabled={pageState === 'result'}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500"
                     >
                       <option value="">Select twin…</option>
                       {twins.filter(t => t.twin_id !== twinIdB).map(t => (
@@ -198,15 +318,12 @@ export default function DebatePage() {
                       ))}
                     </select>
                   </div>
-
-                  {/* Twin B */}
                   <div>
                     <label className="block text-xs font-medium text-gray-500 mb-1.5">Twin B</label>
                     <select
                       value={twinIdB}
                       onChange={e => setTwinIdB(e.target.value)}
-                      disabled={pageState === 'result'}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500"
                     >
                       <option value="">Select twin…</option>
                       {twins.filter(t => t.twin_id !== twinIdA).map(t => (
@@ -216,16 +333,14 @@ export default function DebatePage() {
                   </div>
                 </div>
 
-                {/* Topic */}
                 <div className="mb-5">
                   <label className="block text-xs font-medium text-gray-500 mb-1.5">Debate topic</label>
                   <input
                     type="text"
                     value={topic}
                     onChange={e => setTopic(e.target.value)}
-                    disabled={pageState === 'result'}
                     placeholder="e.g. 'Is remote work better than in-office?'"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500"
                     onKeyDown={e => e.key === 'Enter' && startDebate()}
                   />
                 </div>
@@ -234,38 +349,18 @@ export default function DebatePage() {
                   <p className="text-sm text-red-500 mb-3">{debateError}</p>
                 )}
 
-                {pageState === 'setup' ? (
-                  <button
-                    onClick={startDebate}
-                    disabled={!canStart}
-                    className="w-full py-2.5 bg-purple-600 text-white text-sm font-medium rounded-lg hover:bg-purple-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                  >
-                    Start Debate
-                  </button>
-                ) : (
-                  <button
-                    onClick={reset}
-                    className="w-full py-2.5 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200 transition-colors"
-                  >
-                    Start over
-                  </button>
-                )}
+                <button
+                  onClick={startDebate}
+                  disabled={!canStart}
+                  className="w-full py-2.5 bg-purple-600 text-white text-sm font-medium rounded-lg hover:bg-purple-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                >
+                  Start Debate
+                </button>
               </div>
             )}
 
-            {/* Loading state */}
-            {pageState === 'loading' && (
-              <div className="text-center py-16">
-                <Loader2 className="w-8 h-8 animate-spin text-purple-500 mx-auto mb-4" />
-                <p className="text-gray-600 font-medium">
-                  {twinA?.name} and {twinB?.name} are debating…
-                </p>
-                <p className="text-sm text-gray-400 mt-1">This usually takes 20–30 seconds</p>
-              </div>
-            )}
-
-            {/* Debate result */}
-            {pageState === 'result' && twinA && twinB && (
+            {/* Live debate area */}
+            {isActive && twinA && twinB && (
               <div>
                 {/* Combatants banner */}
                 <div className="flex items-center justify-between mb-6 px-1">
@@ -297,67 +392,49 @@ export default function DebatePage() {
                   </span>
                 </div>
 
-                {/* Turns */}
+                {/* Turn feed */}
                 <div className="space-y-4">
-                  {turns.slice(0, visibleCount).map(turn => {
-                    const isA = turn.twin_id === twinIdA;
-                    return (
-                      <div key={turn.turn_number}
-                        className={`flex gap-3 ${isA ? 'justify-start' : 'justify-end'} animate-fade-in`}>
-                        {isA && (
-                          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
-                            {initials(twinA.name)}
-                          </div>
-                        )}
-                        <div className={`max-w-[72%] rounded-xl px-4 py-3 ${
-                          isA
-                            ? 'bg-white border border-gray-200 text-gray-800'
-                            : 'bg-gradient-to-br from-rose-500 to-orange-500 text-white'
-                        }`}>
-                          <p className={`text-xs font-medium mb-1 ${isA ? 'text-purple-600' : 'text-rose-100'}`}>
-                            {turn.twin_name}
-                          </p>
-                          <p className="text-sm leading-relaxed">{turn.text}</p>
-                        </div>
-                        {!isA && (
-                          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rose-500 to-orange-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
-                            {initials(twinB.name)}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                  {completedTurns.map(turn => (
+                    <TurnBubble
+                      key={turn.turnIndex}
+                      twin_id={turn.twin_id}
+                      twin_name={turn.twin_name}
+                      text={turn.text}
+                    />
+                  ))}
 
-                  {/* Typing indicator while more turns are pending */}
-                  {visibleCount < turns.length && (
-                    <div className={`flex gap-3 ${visibleCount % 2 === 0 ? 'justify-start' : 'justify-end'}`}>
-                      {visibleCount % 2 === 0 && (
-                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
-                          {initials(twinA.name)}
-                        </div>
-                      )}
-                      <div className="bg-white border border-gray-200 rounded-xl px-4 py-3">
-                        <div className="flex space-x-1.5">
-                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" />
-                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-100" />
-                          <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce delay-200" />
-                        </div>
-                      </div>
-                      {visibleCount % 2 !== 0 && (
-                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-rose-500 to-orange-500 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
-                          {initials(twinB.name)}
-                        </div>
-                      )}
-                    </div>
+                  {/* Typewriter bubble */}
+                  {animating && (
+                    <TurnBubble
+                      twin_id={animating.twin_id}
+                      twin_name={animating.twin_name}
+                      text={animating.displayedText}
+                      cursor
+                    />
                   )}
+
+                  {/* Waiting-for-API dots */}
+                  {typingFor && <TypingIndicator side={typingFor} />}
                 </div>
 
-                {/* Done — start over */}
-                {visibleCount >= turns.length && (
+                {pageState === 'done' && (
                   <div className="text-center mt-8">
-                    <button onClick={reset}
-                      className="px-6 py-2.5 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200 transition-colors">
+                    <button
+                      onClick={reset}
+                      className="px-6 py-2.5 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200 transition-colors"
+                    >
                       Start a new debate
+                    </button>
+                  </div>
+                )}
+
+                {pageState === 'running' && (
+                  <div className="text-center mt-6">
+                    <button
+                      onClick={reset}
+                      className="text-xs text-gray-400 hover:text-gray-600 underline"
+                    >
+                      Cancel
                     </button>
                   </div>
                 )}
@@ -368,7 +445,6 @@ export default function DebatePage() {
           </>
         )}
 
-        {/* Link from dashboard footer */}
         <p className="text-center text-xs text-gray-400 mt-10">
           Signed in as {user?.firstName || user?.emailAddresses[0]?.emailAddress}
         </p>
