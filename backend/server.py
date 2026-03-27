@@ -1222,7 +1222,13 @@ class DebateResponse(BaseModel):
     turns: List[DebateTurn]
 
 
-@app.post("/debate/turn")
+class DebateTurnResponse(BaseModel):
+    twin_id: str
+    twin_name: str
+    text: str
+
+
+@app.post("/debate/turn", response_model=DebateTurnResponse)
 async def debate_turn(
     request: DebateTurnRequest,
     user_id: str = Depends(get_current_user_id),
