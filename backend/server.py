@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import field_validator
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any, Union
@@ -1094,10 +1094,33 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
 # Persona vs Persona debate
 # ---------------------------------------------------------------------------
 
-# Each twin speaks this many times (total turns = DEBATE_ROUNDS * 2).
-# Kept at 2 to stay within the API Gateway 30s hard timeout — 4 sequential
-# Bedrock calls at ~5-7s each ≈ 20-28s, leaving a safety margin.
-DEBATE_ROUNDS = 2
+# Number of rounds for the batched /chat/debate endpoint only.
+# Each twin speaks once per round (total turns = DEBATE_ROUNDS * 2).
+# Default kept at 2 to stay safely within the API Gateway 30s hard timeout —
+# 4 sequential Bedrock calls at ~5-7s each ≈ 20-28s, leaving a safety margin.
+# Set DEBATE_ROUNDS=3 via env var to enable 3 rounds (6 calls, ~24-30s — slim margin).
+# Default kept at 3 to match the frontend NEXT_PUBLIC_DEBATE_ROUNDS default
+# (3 rounds, 6 total Bedrock calls). This can bring total latency close to
+# the API Gateway 30s hard timeout (6 calls at ~5-7s each ≈ 30-42s).
+# If you observe timeouts, lower DEBATE_ROUNDS to 2 via env var to stay more
+# safely within the timeout (4 calls, ~20-28s total).
+# NOTE: This does NOT govern /debate/turn (turn-by-turn). That endpoint handles
+# a single turn per request; the number of turns is driven entirely by the
+# frontend's NEXT_PUBLIC_DEBATE_ROUNDS env var (default 3). Both env vars
+# should be set to the same value to keep the two debate modes consistent.
+_DEBATE_ROUNDS_DEFAULT = 3
+_DEBATE_ROUNDS_MIN = 1
+_DEBATE_ROUNDS_MAX = 3
+_debate_rounds_raw = os.getenv("DEBATE_ROUNDS", "").strip()
+try:
+    _debate_rounds_val = int(_debate_rounds_raw) if _debate_rounds_raw else _DEBATE_ROUNDS_DEFAULT
+except (TypeError, ValueError):
+    _debate_rounds_val = _DEBATE_ROUNDS_DEFAULT
+if _debate_rounds_val < _DEBATE_ROUNDS_MIN:
+    _debate_rounds_val = _DEBATE_ROUNDS_MIN
+elif _debate_rounds_val > _DEBATE_ROUNDS_MAX:
+    _debate_rounds_val = _DEBATE_ROUNDS_MAX
+DEBATE_ROUNDS = _debate_rounds_val
 
 
 class DebateAgent:
@@ -1147,6 +1170,65 @@ class DebateAgent:
         return text
 
 
+# Maximum allowed number of history entries for /debate/turn.
+# Intentionally decoupled from DEBATE_ROUNDS / frontend NEXT_PUBLIC_DEBATE_ROUNDS
+# so config drift cannot cause mid-debate 422s. Can be overridden via env var.
+try:
+    _MAX_HISTORY_ENTRIES = int(os.getenv("DEBATE_MAX_HISTORY_ENTRIES", "20"))
+except (TypeError, ValueError):
+    _MAX_HISTORY_ENTRIES = 20
+if _MAX_HISTORY_ENTRIES < 1:
+    _MAX_HISTORY_ENTRIES = 1
+_MAX_TWIN_NAME_LEN = 100
+# 1000 chars per entry: generous for 3-5 sentences (~300-500 chars typical).
+_MAX_HISTORY_TEXT_LEN = 1000
+# Total character budget for history injected into the prompt.
+# Oldest entries are dropped server-side if the budget is exceeded.
+_MAX_HISTORY_TOTAL_CHARS = 8000
+
+
+class DebateHistoryEntry(BaseModel):
+    twin_name: str
+    text: str
+
+    @field_validator("twin_name")
+    @classmethod
+    def twin_name_length(cls, v: str) -> str:
+        if len(v) > _MAX_TWIN_NAME_LEN:
+            raise ValueError(f"twin_name must be {_MAX_TWIN_NAME_LEN} characters or fewer")
+        return v
+
+    @field_validator("text")
+    @classmethod
+    def text_length(cls, v: str) -> str:
+        if len(v) > _MAX_HISTORY_TEXT_LEN:
+            raise ValueError(f"history text must be {_MAX_HISTORY_TEXT_LEN} characters or fewer")
+        return v
+
+
+class DebateTurnRequest(BaseModel):
+    twin_id: str
+    topic: str
+    history: List[DebateHistoryEntry] = Field(default_factory=list)  # full debate so far, oldest first
+
+    @field_validator("history")
+    @classmethod
+    def history_max_entries(cls, v: List[DebateHistoryEntry]) -> List[DebateHistoryEntry]:
+        if len(v) > _MAX_HISTORY_ENTRIES:
+            raise ValueError(f"history must not exceed {_MAX_HISTORY_ENTRIES} entries")
+        return v
+
+    @field_validator("topic")
+    @classmethod
+    def topic_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("topic must not be empty")
+        if len(v) > 500:
+            raise ValueError("topic must be 500 characters or fewer")
+        return v
+
+
 class DebateRequest(BaseModel):
     twin_id_a: str
     twin_id_b: str
@@ -1173,6 +1255,71 @@ class DebateTurn(BaseModel):
 class DebateResponse(BaseModel):
     topic: str
     turns: List[DebateTurn]
+
+
+class DebateTurnResponse(BaseModel):
+    twin_id: str
+    twin_name: str
+    text: str
+
+
+@app.post("/debate/turn", response_model=DebateTurnResponse)
+async def debate_turn(
+    request: DebateTurnRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Generate a single debate turn for one twin.
+
+    The frontend drives the debate loop: it calls this endpoint once per turn,
+    passing the full history so far. This makes each agent's response feel live
+    (typing indicator while waiting, typewriter animation on arrival) without
+    requiring Lambda response streaming.
+    """
+    twin_data = load_twin(request.twin_id)
+    if not twin_data or twin_data.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    agent = DebateAgent(twin_data)
+
+    # Build the debate-context prompt from history
+    def _esc(s: str) -> str:
+        """JSON-escape a string so quotes/newlines don't break prompt structure."""
+        return json.dumps(s)[1:-1]
+
+    if not request.history:
+        turn_prompt = (
+            f'You are in a live debate on the topic: "{_esc(request.topic)}". '
+            f"Open with your perspective. Speak in your natural voice. 3-5 sentences."
+        )
+    else:
+        # Server-side truncation: drop oldest entries until total chars fit in budget.
+        history = list(request.history)
+        total_chars = sum(len(e.twin_name) + len(e.text) for e in history)
+        while len(history) > 1 and total_chars > _MAX_HISTORY_TOTAL_CHARS:
+            dropped = history.pop(0)
+            total_chars -= len(dropped.twin_name) + len(dropped.text)
+
+        history_lines = "\n".join(
+            f'{_esc(e.twin_name)}: "{_esc(e.text)}"' for e in history
+        )
+        last = history[-1]
+        turn_prompt = (
+            f'You are in a live debate on the topic: "{_esc(request.topic)}".\n\n'
+            f"Debate so far:\n{history_lines}\n\n"
+            f'{_esc(last.twin_name)} just said: "{_esc(last.text)}"\n\n'
+            f"Respond to their point. Stay in character. 3-5 sentences."
+        )
+
+    try:
+        text = await asyncio.to_thread(agent.respond, turn_prompt)
+    except ClientError as e:
+        print(f"Bedrock error in debate/turn: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate response")
+    except Exception as e:
+        print(f"Unexpected error in debate/turn: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate response")
+
+    return {"twin_id": agent.twin_id, "twin_name": agent.name, "text": text}
 
 
 @app.post("/chat/debate", response_model=DebateResponse)
