@@ -1097,7 +1097,8 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
 # Each twin speaks this many times (total turns = DEBATE_ROUNDS * 2).
 # Kept at 2 to stay within the API Gateway 30s hard timeout — 4 sequential
 # Bedrock calls at ~5-7s each ≈ 20-28s, leaving a safety margin.
-DEBATE_ROUNDS = 2
+# Must match the frontend's NEXT_PUBLIC_DEBATE_ROUNDS env var.
+DEBATE_ROUNDS = int(os.getenv("DEBATE_ROUNDS", "2"))
 
 
 class DebateAgent:
@@ -1147,7 +1148,9 @@ class DebateAgent:
         return text
 
 
-_MAX_HISTORY_ENTRIES = 12  # 2× DEBATE_ROUNDS * 2 agents, generous buffer
+# Derived from DEBATE_ROUNDS so the cap scales automatically when rounds are
+# reconfigured via env var (matching frontend NEXT_PUBLIC_DEBATE_ROUNDS).
+_MAX_HISTORY_ENTRIES = DEBATE_ROUNDS * 2 + 4  # all expected turns + small buffer
 _MAX_TWIN_NAME_LEN = 100
 _MAX_HISTORY_TEXT_LEN = 2000
 
