@@ -1094,11 +1094,15 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
 # Persona vs Persona debate
 # ---------------------------------------------------------------------------
 
-# Each twin speaks this many times (total turns = DEBATE_ROUNDS * 2).
-# Kept at 2 to stay within the API Gateway 30s hard timeout — 4 sequential
-# Bedrock calls at ~5-7s each ≈ 20-28s, leaving a safety margin.
-# Must match the frontend's NEXT_PUBLIC_DEBATE_ROUNDS env var.
-_DEBATE_ROUNDS_DEFAULT = 2
+# Number of rounds for the batched /chat/debate endpoint only.
+# Each twin speaks once per round (total turns = DEBATE_ROUNDS * 2).
+# Kept at 3 to stay within the API Gateway 30s hard timeout — 6 sequential
+# Bedrock calls at ~4-5s each ≈ 24-30s, leaving a slim safety margin.
+# NOTE: This does NOT govern /debate/turn (turn-by-turn). That endpoint handles
+# a single turn per request; the number of turns is driven entirely by the
+# frontend's NEXT_PUBLIC_DEBATE_ROUNDS env var (default 3). Both env vars
+# should be set to the same value to keep the two debate modes consistent.
+_DEBATE_ROUNDS_DEFAULT = 3
 _DEBATE_ROUNDS_MIN = 1
 _DEBATE_ROUNDS_MAX = 4
 _debate_rounds_raw = os.getenv("DEBATE_ROUNDS", "").strip()
