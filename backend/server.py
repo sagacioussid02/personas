@@ -1528,7 +1528,10 @@ async def onboard_message(
         # Seed with a minimal opener so the model produces the first question
         messages = [{"role": "user", "content": [{"text": "hi, let's start"}]}]
     else:
-        for item in request.history:
+        # Cap the amount of history sent to Bedrock to avoid unbounded prompts
+        max_history_turns = 50
+        history_to_use = request.history[-max_history_turns:]
+        for item in history_to_use:
             role = "user" if item.role == "user" else "assistant"
             messages.append({"role": role, "content": [{"text": item.content}]})
 
