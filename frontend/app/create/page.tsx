@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import { useRouter } from 'next/navigation';
 import { Send, Paperclip, Loader2, Check } from 'lucide-react';
@@ -75,9 +75,10 @@ export default function CreatePage() {
   useEffect(() => {
     let cancelled = false;
     async function init() {
+      let redirected = false;
       try {
         const token = await getToken();
-        if (!token) { router.push('/sign-in'); return; }
+        if (!token) { router.push('/sign-in'); redirected = true; return; }
         const res = await fetch(`${API}/onboard/message`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -97,7 +98,7 @@ export default function CreatePage() {
           content: "Hey! Let's build your AI twin. Before we dive in — got your LinkedIn PDF? I can read it and skip the professional background questions. Hit the 📎 below to attach, or just type skip to go from scratch.",
         }]);
       } finally {
-        if (!cancelled) setPhase('chat');
+        if (!cancelled && !redirected) setPhase('chat');
       }
     }
     init();
@@ -183,7 +184,7 @@ export default function CreatePage() {
     await callOnboard(newHistory, fieldsCollected, topicsCovered, linkedinParsed, token);
   }
 
-  async function handleLinkedIn(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleLinkedIn(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
     if (fileInputRef.current) fileInputRef.current.value = '';
