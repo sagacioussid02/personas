@@ -1237,6 +1237,9 @@ async def debate_turn(
     except ClientError as e:
         print(f"Bedrock error in debate/turn: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate response")
+    except Exception as e:
+        print(f"Unexpected error in debate/turn: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate response")
 
     return {"twin_id": agent.twin_id, "twin_name": agent.name, "text": text}
 
