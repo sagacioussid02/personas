@@ -141,7 +141,7 @@ export default function DebatePage() {
   );
 
   async function startDebate() {
-    if (!canStart) return;
+    if (!canStart || pageState !== 'setup') return;
     cancelledRef.current = false;
     const controller = new AbortController();
     abortControllerRef.current = controller;
