@@ -68,6 +68,11 @@ _TWIN_ID_RE = re.compile(r'^[a-f0-9]{32}$')
 # Secret used to derive opaque session keys — must be set in production.
 # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
 SESSION_HMAC_SECRET = os.getenv("SESSION_HMAC_SECRET", "")
+if not SESSION_HMAC_SECRET and (_IN_LAMBDA or os.getenv("USE_S3", "").lower() in ("1", "true") or os.getenv("ENVIRONMENT", "").lower() == "prod"):
+    raise RuntimeError(
+        "SESSION_HMAC_SECRET environment variable must be set in production. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
 
 # --- Clerk JWT auth ---
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "")
