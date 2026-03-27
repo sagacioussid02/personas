@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import field_validator
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any, Union
@@ -1155,7 +1155,7 @@ class DebateHistoryEntry(BaseModel):
 class DebateTurnRequest(BaseModel):
     twin_id: str
     topic: str
-    history: List[DebateHistoryEntry] = []  # full debate so far, oldest first
+    history: List[DebateHistoryEntry] = Field(default_factory=list)  # full debate so far, oldest first
 
     @field_validator("topic")
     @classmethod
