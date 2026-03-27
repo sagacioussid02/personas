@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 import json
 import uuid
 import re
@@ -15,6 +15,8 @@ from botocore.exceptions import ClientError
 from pathlib import Path
 from pypdf import PdfReader
 import io
+import hmac
+import hashlib
 import httpx
 import jwt
 from context import prompt
@@ -63,6 +65,15 @@ TWINS_S3_PREFIX = "twins/"
 
 _TWIN_ID_RE = re.compile(r'^[a-f0-9]{32}$')
 
+# Secret used to derive opaque session keys — must be set in production.
+# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+SESSION_HMAC_SECRET = os.getenv("SESSION_HMAC_SECRET", "")
+if not SESSION_HMAC_SECRET and (_IN_LAMBDA or os.getenv("USE_S3", "").lower() in ("1", "true") or os.getenv("ENVIRONMENT", "").lower() == "prod"):
+    raise RuntimeError(
+        "SESSION_HMAC_SECRET environment variable must be set in production. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+
 # --- Clerk JWT auth ---
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "")
 # Derive issuer from JWKS URL: strip /.well-known/jwks.json
@@ -105,11 +116,16 @@ def _find_key(jwks: dict, kid: str) -> Optional[dict]:
     return next((k for k in keys if k.get("kid") == kid), None)
 
 
-async def get_current_user_id(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
-) -> str:
+async def _decode_user_id(credentials: Optional[HTTPAuthorizationCredentials]) -> Optional[str]:
+    """Decode user_id from credentials.
+
+    Returns None for missing credentials or JWT validation failures (expired,
+    bad signature, unknown kid). Propagates 5xx HTTPExceptions from auth
+    infrastructure (JWKS fetch timeout, misconfigured CLERK_JWKS_URL, etc.) so
+    callers can surface them correctly rather than masking outages as 401s.
+    """
     if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        return None
     token = credentials.credentials
     try:
         header = jwt.get_unverified_header(token)
@@ -118,12 +134,11 @@ async def get_current_user_id(
         jwks = await _get_jwks()
         key = _find_key(jwks, kid)
 
-        # kid not found — rotate cache once and retry before rejecting
         if key is None:
             jwks = await _get_jwks(force_refresh=True)
             key = _find_key(jwks, kid)
         if key is None:
-            raise HTTPException(status_code=401, detail="Unknown token key")
+            return None
 
         public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
         decode_options: dict = {}
@@ -138,13 +153,28 @@ async def get_current_user_id(
             options=decode_options,
         )
         user_id: str = payload.get("sub", "")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user_id
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
+        return user_id or None
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        # Token is bad/expired — treat as anonymous, don't raise
+        return None
+    except HTTPException as exc:
+        if exc.status_code >= 500:
+            raise  # Auth infrastructure failure — propagate so it surfaces correctly
+        return None  # 4xx from auth layer — treat as invalid token
+
+
+async def get_current_user_id(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> str:
+    """Strict auth — raises 401 if token is missing or invalid. Use for protected endpoints.
+    5xx auth infrastructure errors (JWKS outage, misconfiguration) propagate as-is.
+    """
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user_id = await _decode_user_id(credentials)
+    if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
+    return user_id
 
 # Expected keys for the personality model returned by /create-twin
 _PERSONALITY_MODEL_KEYS = {
@@ -350,45 +380,106 @@ class CreateTwinRequest(BaseModel):
         return v
 
 
+# Valid session_id shapes:
+#   - UUID (any version) from str(uuid.uuid4()): xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+#     Note: the regex accepts any lowercase hex UUID, not only v4.
+#   - 64-char hex from HMAC-SHA256 / SHA-256 _derive_session_id
+_SESSION_ID_RE = re.compile(r'^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{64})$')
+
+
+def _validate_session_id(session_id: str) -> None:
+    """Raise 400 if session_id doesn't match the allowed format, preventing path traversal."""
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session ID format")
+
+
 # Memory management functions
 def get_memory_path(session_id: str) -> str:
-    return f"{session_id}.json"
+    return f"sessions/{session_id}.json"
 
 
-def load_conversation(session_id: str) -> List[Dict]:
-    """Load conversation history from storage"""
+def _load_raw_record(session_id: str) -> Optional[Union[List[Dict], Dict[str, Any]]]:
+    """Load the raw conversation record from storage (S3 or local).
+
+    Returns the parsed JSON value (list or dict) if found, or None if the session
+    does not exist. Raises on storage errors (e.g. AccessDenied, throttling).
+    """
+    _validate_session_id(session_id)
     if USE_S3:
         try:
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=get_memory_path(session_id))
             return json.loads(response["Body"].read().decode("utf-8"))
         except ClientError as e:
             if e.response["Error"]["Code"] == "NoSuchKey":
-                return []
-            raise
+                # Fallback: check legacy flat key (pre-sessions/ prefix)
+                try:
+                    response = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{session_id}.json")
+                    return json.loads(response["Body"].read().decode("utf-8"))
+                except ClientError as legacy_e:
+                    if legacy_e.response["Error"]["Code"] == "NoSuchKey":
+                        return None
+                    raise  # AccessDenied, throttling, etc. — surface, don't silently drop
+            else:
+                raise
     else:
-        # Local file storage
-        file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
+        sessions_dir = os.path.realpath(os.path.join(MEMORY_DIR, "sessions"))
+        file_path = os.path.realpath(os.path.join(sessions_dir, f"{session_id}.json"))
+        if not file_path.startswith(sessions_dir + os.sep):
+            raise HTTPException(status_code=400, detail="Invalid session ID format")
         if os.path.exists(file_path):
             with open(file_path, "r") as f:
                 return json.load(f)
+        # Fallback: check legacy flat path (pre-sessions/ prefix)
+        memory_dir_real = os.path.realpath(MEMORY_DIR)
+        legacy_path = os.path.realpath(os.path.join(MEMORY_DIR, f"{session_id}.json"))
+        if not legacy_path.startswith(memory_dir_real + os.sep):
+            raise HTTPException(status_code=400, detail="Invalid session ID format")
+        if os.path.exists(legacy_path):
+            with open(legacy_path, "r") as f:
+                return json.load(f)
+        return None
+
+
+def load_conversation(session_id: str) -> List[Dict]:
+    """Load conversation history from storage. Handles legacy list format and current dict format."""
+    raw = _load_raw_record(session_id)
+    if raw is None:
         return []
+    # Support both legacy list format and current dict format
+    if isinstance(raw, list):
+        return raw
+    return raw.get("messages", [])
 
 
-def save_conversation(session_id: str, messages: List[Dict]):
-    """Save conversation history to storage"""
+def save_conversation(
+    session_id: str,
+    messages: List[Dict],
+    chatter_id: Optional[str] = None,
+    twin_owner_id: Optional[str] = None,
+):
+    """Save conversation history with owner metadata for future access-control migration."""
+    _validate_session_id(session_id)
+    data: Any = {
+        "session_id": session_id,
+        "chatter_id": chatter_id,       # authenticated user who is chatting (None = anonymous)
+        "twin_owner_id": twin_owner_id,  # user_id of the twin's creator
+        "messages": messages,
+    }
     if USE_S3:
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=get_memory_path(session_id),
-            Body=json.dumps(messages, indent=2),
+            Body=json.dumps(data, indent=2),
             ContentType="application/json",
         )
     else:
-        # Local file storage
-        os.makedirs(MEMORY_DIR, exist_ok=True)
-        file_path = os.path.join(MEMORY_DIR, get_memory_path(session_id))
+        sessions_dir = os.path.realpath(os.path.join(MEMORY_DIR, "sessions"))
+        os.makedirs(sessions_dir, exist_ok=True)
+        file_path = os.path.realpath(os.path.join(sessions_dir, f"{session_id}.json"))
+        if not file_path.startswith(sessions_dir + os.sep):
+            raise HTTPException(status_code=400, detail="Invalid session ID format")
         with open(file_path, "w") as f:
-            json.dump(messages, f, indent=2)
+            json.dump(data, f, indent=2)
 
 
 def call_bedrock(
@@ -481,14 +572,67 @@ async def list_archetypes():
     return {"archetypes": get_all_archetypes()}
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    try:
-        # Generate session ID if not provided
-        session_id = request.session_id or str(uuid.uuid4())
+def _derive_session_id(chatter_id: str, twin_id: str) -> str:
+    """Return an opaque, stable session key for an authenticated user + twin pair.
 
-        # Load conversation history
-        conversation = load_conversation(session_id)
+    HMAC-SHA256 of 'chatter_id:twin_id' with SESSION_HMAC_SECRET makes the key
+    non-guessable even if both IDs are known. This keeps session identifiers
+    opaque for authenticated callers (e.g. when fetching /conversation/{session_id})
+    and avoids leaking information about underlying user or twin IDs.
+    Falls back to SHA-256 without a secret when SESSION_HMAC_SECRET is not set
+    (local development only) — preserves stability and format validity but not secrecy.
+    """
+    if SESSION_HMAC_SECRET:
+        return hmac.new(
+            SESSION_HMAC_SECRET.encode("utf-8"),
+            f"{chatter_id}:{twin_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+    # Dev fallback — no secret, but still produces a valid 64-char hex so the
+    # session_id passes format validation. Not safe for production (predictable).
+    return hashlib.sha256(f"{chatter_id}:{twin_id}".encode("utf-8")).hexdigest()
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+):
+    try:
+        # Resolve caller identity (optional — anonymous callers are allowed)
+        chatter_id = await _decode_user_id(credentials)
+
+        # Derive an opaque stable session key for authenticated users so memory
+        # persists across devices and page reloads. Anonymous users fall back to
+        # the client-supplied session_id (ephemeral, within-browser-session only).
+        if chatter_id and request.twin_id:
+            session_id = _derive_session_id(chatter_id, request.twin_id)
+        else:
+            session_id = request.session_id or str(uuid.uuid4())
+
+        # Guard against session hijacking: if the stored record was created by
+        # an authenticated user, only that same user (or a caller with no stored
+        # chatter_id to compare against) may continue it.
+        existing_record = _load_raw_record(session_id)
+        stored_chatter_id = (
+            existing_record.get("chatter_id")
+            if isinstance(existing_record, dict)
+            else None
+        )
+        if stored_chatter_id is not None and stored_chatter_id != chatter_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: this session belongs to a different user",
+            )
+
+        # Load conversation history from the already-fetched record (avoids a
+        # second storage read).
+        if existing_record is None:
+            conversation: List[Dict] = []
+        elif isinstance(existing_record, list):
+            conversation = existing_record
+        else:
+            conversation = existing_record.get("messages", [])
 
         # Load twin personality model if twin_id provided
         personality_model = None
@@ -539,8 +683,12 @@ async def chat(request: ChatRequest):
             }
         )
 
-        # Save conversation
-        save_conversation(session_id, conversation)
+        # Save conversation — preserve an existing non-null chatter_id so that
+        # unauthenticated retries cannot "de-own" a session that was previously
+        # created by an authenticated caller.
+        twin_owner_id = twin_data.get("user_id") if twin_data else None
+        effective_chatter_id = chatter_id or stored_chatter_id
+        save_conversation(session_id, conversation, chatter_id=effective_chatter_id, twin_owner_id=twin_owner_id)
 
         return ChatResponse(response=assistant_response, session_id=session_id)
 
@@ -552,11 +700,36 @@ async def chat(request: ChatRequest):
 
 
 @app.get("/conversation/{session_id}")
-async def get_conversation(session_id: str):
-    """Retrieve conversation history"""
+async def get_conversation(
+    session_id: str,
+    _user_id: str = Depends(get_current_user_id),
+):
+    """Retrieve conversation history for the given session_id.
+
+    Requires authentication. Enforces ownership: only the authenticated user
+    whose ``chatter_id`` matches the stored record may retrieve the conversation.
+    Returns 404 for unknown sessions, sessions without ownership metadata, or
+    sessions owned by a different user.
+    """
     try:
-        conversation = load_conversation(session_id)
-        return {"session_id": session_id, "messages": conversation}
+        raw = _load_raw_record(session_id)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Enforce ownership using stored chatter_id metadata.
+        if isinstance(raw, dict) and "chatter_id" in raw:
+            if raw["chatter_id"] != _user_id:
+                # Hide existence details from unauthorized callers.
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            messages = raw.get("messages", [])
+        else:
+            # Legacy list format or missing chatter_id — deny to avoid leaking data
+            # from conversations not clearly associated with this user.
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        return {"session_id": session_id, "messages": messages}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

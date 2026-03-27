@@ -27,6 +27,13 @@ if [ -z "${TF_VAR_clerk_jwks_url:-}" ]; then
   exit 1
 fi
 
+if [ -z "${TF_VAR_session_hmac_secret:-}" ]; then
+  echo "❌ TF_VAR_session_hmac_secret is not set. This variable is required to protect conversation session keys."
+  echo "   Generate and set it before deploying:"
+  echo "     export TF_VAR_session_hmac_secret=\"\$(python -c 'import secrets; print(secrets.token_hex(32))')\""
+  exit 1
+fi
+
 cd terraform
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 AWS_REGION=${DEFAULT_AWS_REGION:-us-east-2}

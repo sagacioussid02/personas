@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, Suspense } from 'react';
 import type { KeyboardEvent } from 'react';
 import { useSearchParams } from 'next/navigation';
+import { useAuth } from '@clerk/nextjs';
 import { Send, User, ArrowLeft } from 'lucide-react';
 
 interface Message {
@@ -26,12 +27,15 @@ const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 function TwinChat() {
   const searchParams = useSearchParams();
   const id = searchParams.get('id');
+  const { getToken, isSignedIn } = useAuth();
 
   const [profile, setProfile] = useState<TwinProfile | null>(null);
   const [profileError, setProfileError] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  // session_id is only used for anonymous users; authenticated users get a
+  // stable server-derived session keyed by their identity + twin_id.
   const [sessionId, setSessionId] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -64,14 +68,27 @@ function TwinChat() {
     setIsLoading(true);
 
     try {
+      const token = isSignedIn ? await getToken() : null;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
       const res = await fetch(`${API}/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: input, session_id: sessionId || undefined, twin_id: id }),
+        headers,
+        body: JSON.stringify({
+          message: input,
+          twin_id: id,
+          // For anonymous sessions, send session_id to maintain continuity.
+          // Authenticated users get a stable server-derived session keyed by
+          // their identity + twin_id, so omit the client session_id for them.
+          ...(!isSignedIn && sessionId ? { session_id: sessionId } : {}),
+        }),
       });
       if (!res.ok) throw new Error('Failed to send');
       const data = await res.json();
-      if (!sessionId) setSessionId(data.session_id);
+      // Only track session_id for anonymous users; authenticated sessions are
+      // fully managed server-side and don't need a client-held session_id.
+      if (!isSignedIn && !sessionId) setSessionId(data.session_id);
       setMessages(prev => [...prev, {
         id: crypto.randomUUID(),
         role: 'assistant',

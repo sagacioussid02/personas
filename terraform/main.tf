@@ -208,7 +208,8 @@ resource "aws_lambda_function" "api" {
       S3_BUCKET        = aws_s3_bucket.memory.id
       USE_S3           = "true"
       BEDROCK_MODEL_ID = var.bedrock_model_id
-      CLERK_JWKS_URL   = var.clerk_jwks_url
+      CLERK_JWKS_URL      = var.clerk_jwks_url
+      SESSION_HMAC_SECRET = var.session_hmac_secret
     }
   }
 
