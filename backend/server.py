@@ -1481,10 +1481,10 @@ class OnboardHistoryItem(BaseModel):
 
 
 class OnboardRequest(BaseModel):
-    history: List[OnboardHistoryItem] = []
+    history: List[OnboardHistoryItem] = Field(default_factory=list)
     linkedin_parsed: Optional[Dict[str, Any]] = None
     fields_collected: Optional[Dict[str, Any]] = None
-    topics_covered: List[str] = []
+    topics_covered: List[str] = Field(default_factory=list)
 
 
 _ALL_ONBOARD_TOPICS = ["IDENTITY", "PROFESSIONAL", "DECISIONS", "VALUES", "WORKING_STYLE", "VOICE"]
