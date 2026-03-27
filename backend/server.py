@@ -1147,15 +1147,41 @@ class DebateAgent:
         return text
 
 
+_MAX_HISTORY_ENTRIES = 12  # 2× DEBATE_ROUNDS * 2 agents, generous buffer
+_MAX_TWIN_NAME_LEN = 100
+_MAX_HISTORY_TEXT_LEN = 2000
+
+
 class DebateHistoryEntry(BaseModel):
     twin_name: str
     text: str
+
+    @field_validator("twin_name")
+    @classmethod
+    def twin_name_length(cls, v: str) -> str:
+        if len(v) > _MAX_TWIN_NAME_LEN:
+            raise ValueError(f"twin_name must be {_MAX_TWIN_NAME_LEN} characters or fewer")
+        return v
+
+    @field_validator("text")
+    @classmethod
+    def text_length(cls, v: str) -> str:
+        if len(v) > _MAX_HISTORY_TEXT_LEN:
+            raise ValueError(f"history text must be {_MAX_HISTORY_TEXT_LEN} characters or fewer")
+        return v
 
 
 class DebateTurnRequest(BaseModel):
     twin_id: str
     topic: str
     history: List[DebateHistoryEntry] = Field(default_factory=list)  # full debate so far, oldest first
+
+    @field_validator("history")
+    @classmethod
+    def history_max_entries(cls, v: List[DebateHistoryEntry]) -> List[DebateHistoryEntry]:
+        if len(v) > _MAX_HISTORY_ENTRIES:
+            raise ValueError(f"history must not exceed {_MAX_HISTORY_ENTRIES} entries")
+        return v
 
     @field_validator("topic")
     @classmethod
