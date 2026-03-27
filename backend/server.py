@@ -1139,7 +1139,7 @@ class DebateAgent:
         response = bedrock_client.converse(
             modelId=BEDROCK_MODEL_ID,
             messages=messages,
-            inferenceConfig={"maxTokens": 400, "temperature": 0.75, "topP": 0.9},
+            inferenceConfig={"maxTokens": 200, "temperature": 0.75, "topP": 0.9},
         )
         text: str = response["output"]["message"]["content"][0]["text"]
         self._history.append({"role": "user", "content": user_turn})
