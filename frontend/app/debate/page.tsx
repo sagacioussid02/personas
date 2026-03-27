@@ -148,7 +148,13 @@ export default function DebatePage() {
     setTypingFor(null);
 
     const token = await getToken();
-    if (!token) { router.push('/sign-in'); return; }
+    if (!token) {
+      setPageState('setup');
+      setTypingFor(null);
+      setAnimating(null);
+      router.push('/sign-in');
+      return;
+    }
 
     const history: HistoryEntry[] = [];
     const twinOrder = [twinIdA, twinIdB];
