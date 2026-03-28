@@ -3,13 +3,78 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import { useRouter } from 'next/navigation';
-import { Send, Paperclip, Loader2, Check } from 'lucide-react';
+import { Send, Paperclip, Loader2, Check, Lightbulb } from 'lucide-react';
 import Link from 'next/link';
+import AppNav from '@/components/app-nav';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 const ALL_TOPICS = ['IDENTITY', 'PROFESSIONAL', 'DECISIONS', 'VALUES', 'WORKING_STYLE', 'VOICE'];
-const MAX_USER_TURNS = 14; // safety ceiling — show manual button after this many user messages
+const MAX_USER_TURNS = 14;
+
+interface TopicGuidance {
+  label: string;
+  what: string;
+  sample: string;
+  tips: string[];
+}
+
+const TOPIC_GUIDANCE: Record<string, TopicGuidance> = {
+  IDENTITY: {
+    label: 'Who you are',
+    what: "Your name, role, and a one-line description of what you do.",
+    sample: "I'm Alex Rivera — Staff Engineer at Stripe. I build payment infrastructure and help developers ship faster.",
+    tips: [
+      "Keep it short — one or two sentences.",
+      "Mention your role and the domain you work in.",
+    ],
+  },
+  PROFESSIONAL: {
+    label: 'Career background',
+    what: "Your experience, key skills, and career highlights.",
+    sample: "12 years in backend systems. Currently leading a 15-person platform team at Stripe. Before that: Lyft (pricing engine) and IBM (Watson APIs). Strong in Go, distributed systems, and API design.",
+    tips: [
+      "You can upload your LinkedIn PDF to fill this in automatically.",
+      "Focus on what you've built and the scale you've worked at.",
+    ],
+  },
+  DECISIONS: {
+    label: 'How you decide',
+    what: "How you approach hard choices — your mental models, risk tolerance, and real examples.",
+    sample: "I write the decision out in one paragraph, as if explaining to a smart friend. If I can't do that clearly, I don't understand it yet. I passed on a VP role in 2021 — the money was great but the problem felt manufactured. I stayed put. The startup pivoted twice and laid off half the team six months later.",
+    tips: [
+      "Share a real past decision — even a small one.",
+      "Mention how you handle reversible vs. irreversible choices differently.",
+    ],
+  },
+  VALUES: {
+    label: 'What drives you',
+    what: "The principles you hold strongly and won't compromise on.",
+    sample: "Simplicity over cleverness — I'll delete 200 lines before I add 10. Disagree and commit — I voice concerns once, clearly, then fully back the decision. Skin in the game — I won't ask my team to do something I haven't done.",
+    tips: [
+      "List 2–4 specific values, not just labels like 'integrity'.",
+      "A good value includes a behavior — what you actually *do* because of it.",
+    ],
+  },
+  WORKING_STYLE: {
+    label: 'How you work',
+    what: "Your collaboration preferences, communication habits, and what you're like as a teammate.",
+    sample: "I'm async by default — prefer written docs over meetings. I over-explain in diagrams. I ask 'what problem are we solving?' a lot. I give blunt feedback but always explain the why. I do my best thinking in the morning and protect that time.",
+    tips: [
+      "Think about what teammates say about working with you.",
+      "Mention what conditions help you do your best work.",
+    ],
+  },
+  VOICE: {
+    label: 'Your communication style',
+    what: "How you talk and write — tone, quirks, and what makes your voice yours.",
+    sample: "Short sentences. No filler. I use 'the thing is...' a lot before making a point. I almost never use exclamation marks. I prefer bullet points over paragraphs when the stakes are high. I steelman opposing views before arguing back.",
+    tips: [
+      "Think about phrases you use often — or that others have pointed out.",
+      "Mention how formal or casual your default tone is.",
+    ],
+  },
+};
 
 interface Message {
   role: 'ai' | 'user' | 'status';
@@ -42,6 +107,35 @@ interface FieldUpdates {
 
 type Phase = 'loading' | 'chat' | 'creating' | 'done';
 
+function GuidancePanel({ topicsCovered }: { topicsCovered: string[] }) {
+  const activeTopic = ALL_TOPICS.find(t => !topicsCovered.includes(t)) || ALL_TOPICS[ALL_TOPICS.length - 1];
+  const guidance = TOPIC_GUIDANCE[activeTopic];
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl p-4 text-sm">
+      <div className="flex items-center gap-1.5 mb-3">
+        <Lightbulb className="w-3.5 h-3.5 text-purple-500 shrink-0" />
+        <span className="text-xs font-medium text-purple-600 uppercase tracking-wide">
+          {guidance.label}
+        </span>
+      </div>
+      <p className="text-gray-500 text-xs mb-3 leading-relaxed">{guidance.what}</p>
+      <div className="bg-gray-50 border border-gray-100 rounded-lg p-3 mb-3">
+        <p className="text-xs text-gray-400 font-medium mb-1">Example answer</p>
+        <p className="text-xs text-gray-700 leading-relaxed italic">&ldquo;{guidance.sample}&rdquo;</p>
+      </div>
+      <ul className="space-y-1">
+        {guidance.tips.map((tip, i) => (
+          <li key={i} className="text-xs text-gray-500 flex gap-1.5">
+            <span className="text-purple-400 shrink-0">·</span>
+            {tip}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export default function CreatePage() {
   const { getToken } = useAuth();
   const router = useRouter();
@@ -58,6 +152,7 @@ export default function CreatePage() {
   const [parsing, setParsing] = useState(false);
   const [createError, setCreateError] = useState('');
   const [userTurnCount, setUserTurnCount] = useState(0);
+  const [showInlineGuidance, setShowInlineGuidance] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -96,7 +191,6 @@ export default function CreatePage() {
         if (data.topics_covered) setTopicsCovered(data.topics_covered);
       } catch {
         if (cancelled) return;
-        // Fallback opening so the page is never blank
         setMessages([{
           role: 'ai',
           content: "Hey! Let's build your AI twin. Before we dive in — got your LinkedIn PDF? I can read it and skip the professional background questions. Hit the 📎 below to attach, or just type skip to go from scratch.",
@@ -109,7 +203,6 @@ export default function CreatePage() {
     return () => { cancelled = true; };
   }, [getToken, router]);
 
-  // Build a twin_payload from accumulated fields when the model doesn't return one
   function buildPayload(fields: FieldUpdates): Record<string, unknown> {
     return {
       name: fields.name || '',
@@ -162,11 +255,9 @@ export default function CreatePage() {
       setMessages(prev => [...prev, { role: 'ai', content: data.message }]);
       setApiHistory(prev => [...prev, { role: 'assistant', content: data.message }]);
 
-      // Trigger creation if: model says done, OR all 6 topics covered
       const shouldCreate = data.done || updatedTopics.length >= ALL_TOPICS.length;
       if (shouldCreate) {
         setPhase('creating');
-        // Use model-provided twin_payload if present, otherwise build from accumulated fields
         await submitTwin(data.twin_payload || buildPayload(updatedFields), token);
       }
     } catch {
@@ -248,7 +339,6 @@ export default function CreatePage() {
       setLinkedinParsed(data);
       setFieldsCollected(newFields);
 
-      // Remove status bubble
       setMessages(prev => prev.filter(m => m.role !== 'status'));
 
       const attachMsg = '📎 LinkedIn PDF attached';
@@ -272,24 +362,21 @@ export default function CreatePage() {
     await submitTwin(buildPayload(fieldsCollected), token);
   }
 
-  // Show the manual "Create twin" button once the user has shared enough
   const canCreateManually = phase === 'chat' && !sending &&
     (topicsCovered.length >= 4 || userTurnCount >= MAX_USER_TURNS);
 
-  return (
-    <main className="min-h-screen bg-gray-50 flex flex-col">
+  const activeTopic = ALL_TOPICS.find(t => !topicsCovered.includes(t));
 
-      {/* Top bar */}
-      <header className="bg-white border-b border-gray-200 px-5 py-3.5 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 bg-purple-600 rounded-lg flex items-center justify-center">
-            <span className="text-white text-xs font-bold">T</span>
-          </div>
-          <span className="font-semibold text-gray-800 text-sm">Create your twin</span>
-        </div>
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col">
+      <AppNav />
+
+      {/* Page title bar */}
+      <div className="bg-white border-b border-gray-100 px-5 py-2.5 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-3">
+          <span className="font-medium text-gray-700 text-sm">Create your twin</span>
           {/* Progress dots */}
-          {phase === 'chat' && topicsCovered.length > 0 && (
+          {phase === 'chat' && (
             <div className="flex items-center gap-1" title={`${topicsCovered.length} of ${ALL_TOPICS.length} topics covered`}>
               {ALL_TOPICS.map(t => (
                 <div
@@ -301,6 +388,18 @@ export default function CreatePage() {
               ))}
             </div>
           )}
+        </div>
+        <div className="flex items-center gap-3">
+          {/* Guidance toggle on mobile */}
+          {phase === 'chat' && activeTopic && (
+            <button
+              onClick={() => setShowInlineGuidance(v => !v)}
+              className="lg:hidden flex items-center gap-1 text-xs text-purple-600 hover:text-purple-800"
+            >
+              <Lightbulb className="w-3.5 h-3.5" />
+              Tips
+            </button>
+          )}
           <Link
             href="/create/form"
             className="text-xs text-gray-400 hover:text-purple-600 transition-colors"
@@ -308,187 +407,213 @@ export default function CreatePage() {
             Fill the form in detail instead →
           </Link>
         </div>
-      </header>
+      </div>
 
-      {/* Chat area */}
-      <div className="flex-1 overflow-y-auto px-4 py-6 max-w-2xl w-full mx-auto">
-        {phase === 'loading' && (
-          <div className="flex items-center justify-center h-32">
-            <Loader2 className="w-5 h-5 animate-spin text-purple-400" />
-          </div>
-        )}
+      {/* Main layout */}
+      <div className="flex-1 flex overflow-hidden">
 
-        <div className="space-y-4">
-          {messages.map((msg, i) => {
-            if (msg.role === 'status') {
-              return (
-                <div key={i} className="flex justify-center">
-                  <span className="text-xs text-gray-400 italic flex items-center gap-1.5">
-                    <Loader2 className="w-3 h-3 animate-spin" /> {msg.content}
-                  </span>
-                </div>
-              );
-            }
-            const isAi = msg.role === 'ai';
-            return (
-              <div key={i} className={`flex gap-3 ${isAi ? 'justify-start' : 'justify-end'}`}>
-                {isAi && (
+        {/* Chat column */}
+        <main className="flex-1 flex flex-col overflow-hidden">
+
+          {/* Chat area */}
+          <div className="flex-1 overflow-y-auto px-4 py-6 max-w-2xl w-full mx-auto lg:max-w-none">
+            {phase === 'loading' && (
+              <div className="flex items-center justify-center h-32">
+                <Loader2 className="w-5 h-5 animate-spin text-purple-400" />
+              </div>
+            )}
+
+            <div className="space-y-4 max-w-2xl mx-auto">
+              {(() => {
+                let lastAiIndex = -1;
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (messages[i].role === 'ai') { lastAiIndex = i; break; }
+                }
+                return messages.map((msg, i) => {
+                if (msg.role === 'status') {
+                  return (
+                    <div key={i} className="flex justify-center">
+                      <span className="text-xs text-gray-400 italic flex items-center gap-1.5">
+                        <Loader2 className="w-3 h-3 animate-spin" /> {msg.content}
+                      </span>
+                    </div>
+                  );
+                }
+                const isAi = msg.role === 'ai';
+                const isLastAi = isAi && i === lastAiIndex;
+                return (
+                  <div key={i}>
+                    <div className={`flex gap-3 ${isAi ? 'justify-start' : 'justify-end'}`}>
+                      {isAi && (
+                        <div className="w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
+                          T
+                        </div>
+                      )}
+                      <div className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
+                        isAi
+                          ? 'bg-white border border-gray-200 text-gray-800'
+                          : 'bg-purple-600 text-white'
+                      }`}>
+                        {msg.content}
+                      </div>
+                    </div>
+                    {/* Inline guidance on mobile — shown below the last AI message */}
+                    {isLastAi && showInlineGuidance && activeTopic && phase === 'chat' && (
+                      <div className="lg:hidden mt-3 ml-10">
+                        <GuidancePanel topicsCovered={topicsCovered} />
+                      </div>
+                    )}
+                  </div>
+                );
+              });
+              })()}
+
+              {/* AI typing indicator */}
+              {sending && (
+                <div className="flex gap-3 justify-start">
                   <div className="w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
                     T
                   </div>
-                )}
-                <div className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
-                  isAi
-                    ? 'bg-white border border-gray-200 text-gray-800'
-                    : 'bg-purple-600 text-white'
-                }`}>
-                  {msg.content}
+                  <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3">
+                    <div className="flex space-x-1.5 items-center h-4">
+                      <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                      <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                    </div>
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              )}
 
-          {/* AI typing indicator */}
-          {sending && (
-            <div className="flex gap-3 justify-start">
-              <div className="w-7 h-7 rounded-full bg-purple-600 flex items-center justify-center text-white text-xs font-bold shrink-0 mt-1">
-                T
-              </div>
-              <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3">
-                <div className="flex space-x-1.5 items-center h-4">
-                  <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+              {phase === 'creating' && (
+                <div className="flex justify-center py-4">
+                  <div className="flex items-center gap-2 text-sm text-gray-500 bg-white border border-gray-200 rounded-full px-4 py-2">
+                    <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
+                    Building your twin…
+                  </div>
                 </div>
-              </div>
+              )}
+
+              {phase === 'done' && (
+                <div className="flex justify-center py-4">
+                  <div className="flex items-center gap-2 text-sm text-purple-700 bg-purple-50 border border-purple-200 rounded-full px-4 py-2">
+                    <Check className="w-4 h-4" />
+                    Twin created! Redirecting to dashboard…
+                  </div>
+                </div>
+              )}
+
+              {createError && (
+                <div className="text-center text-sm text-red-500 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
+                  {createError} —{' '}
+                  <button
+                    onClick={() => setCreateError('')}
+                    className="underline hover:no-underline"
+                  >
+                    dismiss
+                  </button>
+                </div>
+              )}
             </div>
-          )}
 
-          {/* Creating state */}
-          {phase === 'creating' && (
-            <div className="flex justify-center py-4">
-              <div className="flex items-center gap-2 text-sm text-gray-500 bg-white border border-gray-200 rounded-full px-4 py-2">
-                <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
-                Building your twin…
-              </div>
-            </div>
-          )}
-
-          {/* Done state */}
-          {phase === 'done' && (
-            <div className="flex justify-center py-4">
-              <div className="flex items-center gap-2 text-sm text-purple-700 bg-purple-50 border border-purple-200 rounded-full px-4 py-2">
-                <Check className="w-4 h-4" />
-                Twin created! Redirecting to dashboard…
-              </div>
-            </div>
-          )}
-
-          {createError && (
-            <div className="text-center text-sm text-red-500 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
-              {createError} —{' '}
-              <button
-                onClick={() => setCreateError('')}
-                className="underline hover:no-underline"
-              >
-                dismiss
-              </button>
-            </div>
-          )}
-        </div>
-
-        <div ref={bottomRef} />
-      </div>
-
-      {/* Manual create button — appears when enough info has been shared */}
-      {canCreateManually && (
-        <div className="bg-white border-t border-purple-100 px-4 py-2 shrink-0">
-          <div className="max-w-2xl mx-auto flex items-center justify-between">
-            <p className="text-xs text-gray-400">
-              {topicsCovered.length >= ALL_TOPICS.length
-                ? "You've covered everything!"
-                : `${topicsCovered.length}/${ALL_TOPICS.length} topics covered — you can create now or keep going`}
-            </p>
-            <button
-              onClick={createManually}
-              className="text-xs font-medium px-3 py-1.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors"
-            >
-              Create my twin →
-            </button>
+            <div ref={bottomRef} />
           </div>
-        </div>
-      )}
 
-      {/* Input area */}
-      {(phase === 'chat' || phase === 'loading') && (
-        <div className="bg-white border-t border-gray-200 px-4 py-3 shrink-0">
-          <div className="max-w-2xl mx-auto flex items-end gap-2">
-
-            {/* LinkedIn attach button — hide after upload */}
-            {!linkedinParsed && (
-              <>
+          {/* Manual create banner */}
+          {canCreateManually && (
+            <div className="bg-white border-t border-purple-100 px-4 py-2 shrink-0">
+              <div className="max-w-2xl mx-auto flex items-center justify-between">
+                <p className="text-xs text-gray-400">
+                  {topicsCovered.length >= ALL_TOPICS.length
+                    ? "You've covered everything!"
+                    : `${topicsCovered.length}/${ALL_TOPICS.length} topics covered — you can create now or keep going`}
+                </p>
                 <button
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={parsing || sending}
-                  title="Attach LinkedIn PDF"
-                  className="mb-1 p-2 text-gray-400 hover:text-purple-600 disabled:opacity-40 transition-colors rounded-lg hover:bg-gray-100 shrink-0"
+                  onClick={createManually}
+                  className="text-xs font-medium px-3 py-1.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors"
                 >
-                  {parsing ? (
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                  ) : (
-                    <Paperclip className="w-5 h-5" />
-                  )}
+                  Create my twin →
                 </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".pdf"
-                  onChange={handleLinkedIn}
-                  className="hidden"
-                />
-              </>
-            )}
-
-            {/* Linked-in uploaded badge */}
-            {linkedinParsed && (
-              <div className="mb-1 flex items-center gap-1 text-xs text-purple-600 bg-purple-50 border border-purple-200 rounded-full px-2.5 py-1 shrink-0">
-                <Check className="w-3 h-3" /> LinkedIn
               </div>
-            )}
+            </div>
+          )}
 
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => {
-                if (
-                  e.key === 'Enter' &&
-                  !e.shiftKey &&
-                  !sending &&
-                  phase !== 'loading' &&
-                  !parsing &&
-                  input.trim()
-                ) {
-                  e.preventDefault();
-                  sendMessage();
-                }
-              }}
-              placeholder="Type your answer…"
-              rows={1}
-              disabled={sending || phase === 'loading' || parsing}
-              className="flex-1 resize-none px-4 py-2.5 border border-gray-300 rounded-xl text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 leading-relaxed"
-            />
+          {/* Input area */}
+          {(phase === 'chat' || phase === 'loading') && (
+            <div className="bg-white border-t border-gray-200 px-4 py-3 shrink-0">
+              <div className="max-w-2xl mx-auto flex items-end gap-2">
 
-            <button
-              onClick={sendMessage}
-              disabled={!input.trim() || sending || phase === 'loading' || parsing}
-              className="mb-1 p-2 bg-purple-600 text-white rounded-xl hover:bg-purple-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
-    </main>
+                {!linkedinParsed && (
+                  <>
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={parsing || sending}
+                      title="Attach LinkedIn PDF"
+                      className="mb-1 p-2 text-gray-400 hover:text-purple-600 disabled:opacity-40 transition-colors rounded-lg hover:bg-gray-100 shrink-0"
+                    >
+                      {parsing ? (
+                        <Loader2 className="w-5 h-5 animate-spin" />
+                      ) : (
+                        <Paperclip className="w-5 h-5" />
+                      )}
+                    </button>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".pdf"
+                      onChange={handleLinkedIn}
+                      className="hidden"
+                    />
+                  </>
+                )}
+
+                {linkedinParsed && (
+                  <div className="mb-1 flex items-center gap-1 text-xs text-purple-600 bg-purple-50 border border-purple-200 rounded-full px-2.5 py-1 shrink-0">
+                    <Check className="w-3 h-3" /> LinkedIn
+                  </div>
+                )}
+
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={e => {
+                    if (
+                      e.key === 'Enter' &&
+                      !e.shiftKey &&
+                      !sending &&
+                      phase !== 'loading' &&
+                      !parsing &&
+                      input.trim()
+                    ) {
+                      e.preventDefault();
+                      sendMessage();
+                    }
+                  }}
+                  placeholder="Type your answer…"
+                  rows={1}
+                  disabled={sending || phase === 'loading' || parsing}
+                  className="flex-1 resize-none px-4 py-2.5 border border-gray-300 rounded-xl text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 leading-relaxed"
+                />
+
+                <button
+                  onClick={sendMessage}
+                  disabled={!input.trim() || sending || phase === 'loading' || parsing}
+                  className="mb-1 p-2 bg-purple-600 text-white rounded-xl hover:bg-purple-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+        </main>
+
+        {/* Desktop guidance sidebar */}
+        {phase === 'chat' && activeTopic && (
+          <aside className="hidden lg:block w-72 xl:w-80 shrink-0 border-l border-gray-200 bg-gray-50 overflow-y-auto p-4">
+            <GuidancePanel topicsCovered={topicsCovered} />
+          </aside>
+        )}
+      </div>
+    </div>
   );
 }

@@ -4,7 +4,8 @@ import { useState, useRef, useEffect, Suspense } from 'react';
 import type { KeyboardEvent } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useAuth } from '@clerk/nextjs';
-import { Send, User, ArrowLeft } from 'lucide-react';
+import { Send, User } from 'lucide-react';
+import AppNav from '@/components/app-nav';
 
 interface Message {
   id: string;
@@ -139,14 +140,12 @@ function TwinChat() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-50 to-gray-100">
+      {isSignedIn && <AppNav />}
       <div className="container mx-auto px-4 py-8">
         <div className="max-w-4xl mx-auto">
 
           {/* Header */}
           <div className="mb-4">
-            <a href="/create" className="text-sm text-gray-400 hover:text-gray-600 flex items-center gap-1 mb-4">
-              <ArrowLeft className="w-4 h-4" /> Create your own
-            </a>
             <div className="flex items-start gap-4">
               <div className="w-14 h-14 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-white text-xl font-bold shrink-0">
                 {initials}
