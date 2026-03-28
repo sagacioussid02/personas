@@ -8,6 +8,9 @@ import Link from 'next/link';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+const ALL_TOPICS = ['IDENTITY', 'PROFESSIONAL', 'DECISIONS', 'VALUES', 'WORKING_STYLE', 'VOICE'];
+const MAX_USER_TURNS = 14; // safety ceiling — show manual button after this many user messages
+
 interface Message {
   role: 'ai' | 'user' | 'status';
   content: string;
@@ -54,6 +57,7 @@ export default function CreatePage() {
   const [sending, setSending] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [createError, setCreateError] = useState('');
+  const [userTurnCount, setUserTurnCount] = useState(0);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -105,6 +109,29 @@ export default function CreatePage() {
     return () => { cancelled = true; };
   }, [getToken, router]);
 
+  // Build a twin_payload from accumulated fields when the model doesn't return one
+  function buildPayload(fields: FieldUpdates): Record<string, unknown> {
+    return {
+      name: fields.name || '',
+      title: fields.title || '',
+      bio: fields.bio || '',
+      email: '',
+      skills: fields.skills || '',
+      experience: fields.experience || '',
+      achievements: fields.achievements || '',
+      coreValues: fields.coreValues || '',
+      decisionStyle: fields.decisionStyle || '',
+      riskTolerance: fields.riskTolerance || 'medium',
+      pastDecisions: fields.pastDecisions || '',
+      communicationStyle: fields.communicationStyle || '',
+      writingSamples: '',
+      blindSpots: fields.blindSpots || '',
+      verbalQuirks: fields.verbalQuirks || '',
+      responseStyle: fields.responseStyle || 'balanced',
+      archetype_id: fields.archetype_id ?? null,
+    };
+  }
+
   async function callOnboard(
     newApiHistory: ApiHistoryItem[],
     fields: FieldUpdates,
@@ -135,9 +162,12 @@ export default function CreatePage() {
       setMessages(prev => [...prev, { role: 'ai', content: data.message }]);
       setApiHistory(prev => [...prev, { role: 'assistant', content: data.message }]);
 
-      if (data.done && data.twin_payload) {
+      // Trigger creation if: model says done, OR all 6 topics covered
+      const shouldCreate = data.done || updatedTopics.length >= ALL_TOPICS.length;
+      if (shouldCreate) {
         setPhase('creating');
-        await submitTwin(data.twin_payload, token);
+        // Use model-provided twin_payload if present, otherwise build from accumulated fields
+        await submitTwin(data.twin_payload || buildPayload(updatedFields), token);
       }
     } catch {
       setMessages(prev => [...prev, {
@@ -175,6 +205,7 @@ export default function CreatePage() {
     if (!token) { router.push('/sign-in'); return; }
 
     setInput('');
+    setUserTurnCount(n => n + 1);
     const newMsg: Message = { role: 'user', content: text };
     const newApiItem: ApiHistoryItem = { role: 'user', content: text };
     setMessages(prev => [...prev, newMsg]);
@@ -234,6 +265,17 @@ export default function CreatePage() {
     }
   }
 
+  async function createManually() {
+    const token = await getToken();
+    if (!token) { router.push('/sign-in'); return; }
+    setPhase('creating');
+    await submitTwin(buildPayload(fieldsCollected), token);
+  }
+
+  // Show the manual "Create twin" button once the user has shared enough
+  const canCreateManually = phase === 'chat' && !sending &&
+    (topicsCovered.length >= 4 || userTurnCount >= MAX_USER_TURNS);
+
   return (
     <main className="min-h-screen bg-gray-50 flex flex-col">
 
@@ -245,12 +287,27 @@ export default function CreatePage() {
           </div>
           <span className="font-semibold text-gray-800 text-sm">Create your twin</span>
         </div>
-        <Link
-          href="/create/form"
-          className="text-xs text-gray-400 hover:text-purple-600 transition-colors"
-        >
-          Fill the form in detail instead →
-        </Link>
+        <div className="flex items-center gap-3">
+          {/* Progress dots */}
+          {phase === 'chat' && topicsCovered.length > 0 && (
+            <div className="flex items-center gap-1" title={`${topicsCovered.length} of ${ALL_TOPICS.length} topics covered`}>
+              {ALL_TOPICS.map(t => (
+                <div
+                  key={t}
+                  className={`w-1.5 h-1.5 rounded-full transition-colors ${
+                    topicsCovered.includes(t) ? 'bg-purple-500' : 'bg-gray-300'
+                  }`}
+                />
+              ))}
+            </div>
+          )}
+          <Link
+            href="/create/form"
+            className="text-xs text-gray-400 hover:text-purple-600 transition-colors"
+          >
+            Fill the form in detail instead →
+          </Link>
+        </div>
       </header>
 
       {/* Chat area */}
@@ -342,6 +399,25 @@ export default function CreatePage() {
 
         <div ref={bottomRef} />
       </div>
+
+      {/* Manual create button — appears when enough info has been shared */}
+      {canCreateManually && (
+        <div className="bg-white border-t border-purple-100 px-4 py-2 shrink-0">
+          <div className="max-w-2xl mx-auto flex items-center justify-between">
+            <p className="text-xs text-gray-400">
+              {topicsCovered.length >= ALL_TOPICS.length
+                ? "You've covered everything!"
+                : `${topicsCovered.length}/${ALL_TOPICS.length} topics covered — you can create now or keep going`}
+            </p>
+            <button
+              onClick={createManually}
+              className="text-xs font-medium px-3 py-1.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors"
+            >
+              Create my twin →
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Input area */}
       {(phase === 'chat' || phase === 'loading') && (
