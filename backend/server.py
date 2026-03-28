@@ -850,7 +850,8 @@ Extract the following fields and return ONLY a valid JSON object with these exac
 If a field cannot be determined, use an empty string. Return only the JSON, no other text."""
 
     try:
-        response = bedrock_client.converse(
+        response = await asyncio.to_thread(
+            bedrock_client.converse,
             modelId=BEDROCK_MODEL_ID,
             messages=[{"role": "user", "content": [{"text": extract_prompt}]}],
             inferenceConfig={"maxTokens": 1500, "temperature": 0.2},
@@ -859,7 +860,8 @@ If a field cannot be determined, use an empty string. Return only the JSON, no o
 
         try:
             parsed = _extract_json_object(response_text)
-        except (ValueError, json.JSONDecodeError):
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"JSON extraction failed in parse-linkedin: {exc}")
             raise HTTPException(status_code=500, detail="Could not parse AI response as JSON")
 
         # Detect archetype from title
@@ -872,7 +874,10 @@ If a field cannot be determined, use an empty string. Return only the JSON, no o
     except HTTPException:
         raise
     except ClientError as e:
-        print(f"Bedrock error in parse-linkedin: {str(e)}")
+        print(f"Bedrock ClientError in parse-linkedin: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process LinkedIn profile")
+    except Exception as e:
+        print(f"Unexpected error in parse-linkedin: {e}")
         raise HTTPException(status_code=500, detail="Failed to process LinkedIn profile")
 
 
@@ -1487,6 +1492,63 @@ class OnboardRequest(BaseModel):
     topics_covered: List[str] = Field(default_factory=list)
 
 
+class OnboardFieldUpdates(BaseModel):
+    """Validated field updates extracted from the model response."""
+
+    name: Optional[str] = None
+    title: Optional[str] = None
+    bio: Optional[str] = None
+    skills: Optional[str] = None
+    experience: Optional[str] = None
+    achievements: Optional[str] = None
+    coreValues: Optional[str] = None
+    decisionStyle: Optional[str] = None
+    riskTolerance: Optional[str] = None
+    pastDecisions: Optional[str] = None
+    communicationStyle: Optional[str] = None
+    blindSpots: Optional[str] = None
+    verbalQuirks: Optional[str] = None
+    responseStyle: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class OnboardResponse(BaseModel):
+    """Validated response returned by /onboard/message."""
+
+    message: str
+    field_updates: OnboardFieldUpdates = Field(default_factory=OnboardFieldUpdates)
+    topics_covered: List[str] = Field(default_factory=list)
+    done: bool = False
+    twin_payload: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "ignore"}
+
+    @field_validator("field_updates", mode="before")
+    @classmethod
+    def _coerce_field_updates(cls, v: Any) -> Any:
+        """Accept a dict or fall back to an empty OnboardFieldUpdates."""
+        if not isinstance(v, dict):
+            return {}
+        return v
+
+    @field_validator("topics_covered", mode="before")
+    @classmethod
+    def _coerce_topics_covered(cls, v: Any) -> Any:
+        """Accept a list of strings or fall back to an empty list."""
+        if not isinstance(v, list):
+            return []
+        return [item for item in v if isinstance(item, str)]
+
+    @field_validator("done", mode="before")
+    @classmethod
+    def _coerce_done(cls, v: Any) -> Any:
+        """Accept a bool; coerce any non-bool value to False."""
+        if isinstance(v, bool):
+            return v
+        return False
+
+
 _ALL_ONBOARD_TOPICS = ["IDENTITY", "PROFESSIONAL", "DECISIONS", "VALUES", "WORKING_STYLE", "VOICE"]
 
 
@@ -1529,10 +1591,16 @@ async def onboard_message(
         messages = [{"role": "user", "content": [{"text": "hi, let's start"}]}]
     else:
         # Cap the amount of history sent to Bedrock to avoid unbounded prompts
-        max_history_turns = 50
-        history_to_use = request.history[-max_history_turns:]
-        for item in history_to_use:
-            role = "user" if item.role == "user" else "assistant"
+        for item in request.history[-50:]:
+            if item.role == "user":
+                role = "user"
+            elif item.role == "assistant":
+                role = "assistant"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid role in history item: {item.role!r}. Allowed roles are 'user' and 'assistant'.",
+                )
             messages.append({"role": role, "content": [{"text": item.content}]})
 
     try:
@@ -1545,22 +1613,22 @@ async def onboard_message(
         )
         raw = response["output"]["message"]["content"][0]["text"].strip()
 
-        # Use robust JSON extraction to handle any leading/trailing text or code fences
+        # Use robust JSON extraction — handles code fences and leading/trailing text
         data = _extract_json_object(raw)
 
-       .if data is None:
-            # Mirror json.loads failure handling
-            raise json.JSONDecodeError("No JSON object found in model output", raw, 0)
-
         if not isinstance(data, dict) or "message" not in data:
-            # Parsed, but not in the expected onboarding JSON shape
             raise ValueError("Invalid onboarding JSON structure")
 
-        return data
-    except (json.JSONDecodeError, ValueError):
+        # Validate and coerce model output against a strict response model so that
+        # missing keys default safely and wrong types don't reach the frontend.
+        validated = OnboardResponse.model_validate(data)
+        return validated.model_dump(exclude_none=True)
+    except (ValueError, json.JSONDecodeError):
+        # Return raw text as message so the UI stays unblocked
         return {"message": raw, "field_updates": {}, "topics_covered": covered, "done": False}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        print(f"Unexpected error in /onboard/message: {exc}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
 
 
 if __name__ == "__main__":

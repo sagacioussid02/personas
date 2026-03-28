@@ -210,7 +210,10 @@ export default function CreatePage() {
         skills: data.skills, experience: data.experience, achievements: data.achievements,
         archetype_id: data.archetype_id ?? null,
       };
-      const newFields = { ...fieldsCollected, ...parsedFields };
+      const cleanedParsedFields = Object.fromEntries(
+        Object.entries(parsedFields).filter(([, value]) => value !== undefined)
+      ) as FieldUpdates;
+      const newFields = { ...fieldsCollected, ...cleanedParsedFields };
       setLinkedinParsed(data);
       setFieldsCollected(newFields);
 
@@ -382,20 +385,27 @@ export default function CreatePage() {
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) {
+                if (
+                  e.key === 'Enter' &&
+                  !e.shiftKey &&
+                  !sending &&
+                  phase !== 'loading' &&
+                  !parsing &&
+                  input.trim()
+                ) {
                   e.preventDefault();
                   sendMessage();
                 }
               }}
               placeholder="Type your answer…"
               rows={1}
-              disabled={sending || phase === 'loading'}
+              disabled={sending || phase === 'loading' || parsing}
               className="flex-1 resize-none px-4 py-2.5 border border-gray-300 rounded-xl text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50 leading-relaxed"
             />
 
             <button
               onClick={sendMessage}
-              disabled={!input.trim() || sending || phase === 'loading'}
+              disabled={!input.trim() || sending || phase === 'loading' || parsing}
               className="mb-1 p-2 bg-purple-600 text-white rounded-xl hover:bg-purple-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
             >
               <Send className="w-4 h-4" />
