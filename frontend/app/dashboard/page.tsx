@@ -1,8 +1,9 @@
 'use client';
 
-import { useUser, useAuth, UserButton } from "@clerk/nextjs";
+import { useUser, useAuth } from "@clerk/nextjs";
 import Link from "next/link";
-import { Plus, MessageSquare, ExternalLink, Swords } from "lucide-react";
+import { Plus, MessageSquare, ExternalLink } from "lucide-react";
+import AppNav from "@/components/app-nav";
 import { useEffect, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -56,23 +57,7 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <header className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-purple-600 rounded-lg flex items-center justify-center">
-            <span className="text-white text-sm font-bold">T</span>
-          </div>
-          <span className="font-semibold text-gray-800">AI Twin</span>
-        </div>
-        <div className="flex items-center gap-4">
-          <Link href="/debate"
-            className="flex items-center gap-1.5 text-sm text-purple-600 hover:text-purple-800 font-medium">
-            <Swords className="w-4 h-4" />
-            Debate
-          </Link>
-          <UserButton />
-        </div>
-      </header>
+      <AppNav />
 
       <main className="max-w-4xl mx-auto px-6 py-10">
         {/* Welcome */}

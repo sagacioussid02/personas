@@ -3,7 +3,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth, useUser } from '@clerk/nextjs';
 import { useRouter } from 'next/navigation';
-import { Swords, ArrowLeft, Loader2 } from 'lucide-react';
+import { Swords, Loader2 } from 'lucide-react';
+import AppNav from '@/components/app-nav';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 const DEBATE_ROUNDS = Number(process.env.NEXT_PUBLIC_DEBATE_ROUNDS ?? '3');
@@ -300,14 +301,11 @@ export default function DebatePage() {
 
   return (
     <main className="min-h-screen bg-gray-50">
+      <AppNav />
       <div className="max-w-3xl mx-auto px-4 py-10">
 
         {/* Header */}
         <div className="mb-8">
-          <button onClick={() => router.push('/dashboard')}
-            className="flex items-center gap-1 text-sm text-gray-400 hover:text-gray-600 mb-4">
-            <ArrowLeft className="w-4 h-4" /> Dashboard
-          </button>
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-purple-600 flex items-center justify-center">
               <Swords className="w-5 h-5 text-white" />

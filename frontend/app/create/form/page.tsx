@@ -4,7 +4,8 @@ import { useState, useRef, useEffect } from 'react';
 import type { ChangeEvent } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import { useRouter } from 'next/navigation';
-import { ArrowLeft, ArrowRight, Check, Upload, Loader2, Sparkles, ChevronDown } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Check, Upload, Loader2, Sparkles, ChevronDown, Lightbulb } from 'lucide-react';
+import AppNav from '@/components/app-nav';
 
 interface FormData {
   // Step 1 — Basic Info
@@ -132,6 +133,7 @@ export default function CreatePage() {
   const [archetypeAutoDetected, setArchetypeAutoDetected] = useState(false);
   const [showArchetypeDropdown, setShowArchetypeDropdown] = useState(false);
   const [selectedQuirks, setSelectedQuirks] = useState<Set<string>>(new Set());
+  const [showSample, setShowSample] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const redirectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -142,6 +144,9 @@ export default function CreatePage() {
       }
     };
   }, []);
+
+  // Reset sample visibility when step changes
+  useEffect(() => { setShowSample(false); }, [step]);
 
   const toggleQuirk = (quirk: string) =>
     setSelectedQuirks(prev => {
@@ -266,8 +271,23 @@ export default function CreatePage() {
 
   const selectedArchetypeName = archetypes.find(a => a.id === form.archetype_id)?.display_name;
 
+  const sampleKeys: (keyof typeof SAMPLES[0])[][] = [
+    ['name', 'title', 'bio'],
+    ['skills', 'experience', 'achievements'],
+    ['coreValues', 'decisionStyle', 'pastDecisions'],
+    ['communicationStyle', 'blindSpots'],
+  ];
+
+  const sampleLabels: Record<string, string> = {
+    name: 'Name', title: 'Title', bio: 'Bio',
+    skills: 'Skills', experience: 'Experience', achievements: 'Achievements',
+    coreValues: 'Core Values', decisionStyle: 'Decision Style', pastDecisions: 'Past Decision',
+    communicationStyle: 'Communication Style', blindSpots: 'Blind Spots',
+  };
+
   return (
     <main className="min-h-screen bg-gradient-to-br from-slate-50 to-gray-100">
+      <AppNav />
       <div className="container mx-auto px-4 py-12">
         <div className="max-w-2xl mx-auto">
 
@@ -311,8 +331,24 @@ export default function CreatePage() {
               <div className="space-y-5">
                 <div className="flex items-center justify-between">
                   <h2 className="text-xl font-semibold text-gray-800">Tell us about yourself</h2>
-                  <button onClick={() => setForm(p => ({ ...p, ...SAMPLES[0] }))} className="text-xs text-purple-500 hover:text-purple-700 underline">Fill sample</button>
+                  <button
+                    onClick={() => setShowSample(v => !v)}
+                    className="flex items-center gap-1 text-xs text-purple-500 hover:text-purple-700"
+                  >
+                    <Lightbulb className="w-3.5 h-3.5" />
+                    {showSample ? 'Hide example' : 'See example'}
+                  </button>
                 </div>
+                {showSample && (
+                  <div className="bg-purple-50 border border-purple-100 rounded-lg p-4 space-y-2">
+                    {(sampleKeys[0] as string[]).map(k => SAMPLES[0][k as keyof typeof SAMPLES[0]] ? (
+                      <div key={k}>
+                        <p className="text-xs font-medium text-purple-600 mb-0.5">{sampleLabels[k]}</p>
+                        <p className="text-xs text-gray-700 leading-relaxed">{SAMPLES[0][k as keyof typeof SAMPLES[0]] as string}</p>
+                      </div>
+                    ) : null)}
+                  </div>
+                )}
 
                 {/* LinkedIn PDF upload */}
                 <div className="border-2 border-dashed border-purple-200 rounded-lg p-4 bg-purple-50">
@@ -446,8 +482,24 @@ export default function CreatePage() {
               <div className="space-y-5">
                 <div className="flex items-center justify-between">
                   <h2 className="text-xl font-semibold text-gray-800">Skills &amp; Experience</h2>
-                  <button onClick={() => setForm(p => ({ ...p, ...SAMPLES[1] }))} className="text-xs text-purple-500 hover:text-purple-700 underline">Fill sample</button>
+                  <button
+                    onClick={() => setShowSample(v => !v)}
+                    className="flex items-center gap-1 text-xs text-purple-500 hover:text-purple-700"
+                  >
+                    <Lightbulb className="w-3.5 h-3.5" />
+                    {showSample ? 'Hide example' : 'See example'}
+                  </button>
                 </div>
+                {showSample && (
+                  <div className="bg-purple-50 border border-purple-100 rounded-lg p-4 space-y-2">
+                    {(sampleKeys[1] as string[]).map(k => SAMPLES[1][k as keyof typeof SAMPLES[1]] ? (
+                      <div key={k}>
+                        <p className="text-xs font-medium text-purple-600 mb-0.5">{sampleLabels[k]}</p>
+                        <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">{SAMPLES[1][k as keyof typeof SAMPLES[1]] as string}</p>
+                      </div>
+                    ) : null)}
+                  </div>
+                )}
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Key Skills *</label>
                   <p className="text-xs text-gray-400 mb-1">The more specific, the better your twin&apos;s domain knowledge.</p>
@@ -492,8 +544,24 @@ export default function CreatePage() {
                     <h2 className="text-xl font-semibold text-gray-800">Values &amp; Decision-Making</h2>
                     <p className="text-sm text-gray-500 mt-1">This is the core of your twin — how you think and what you stand for.</p>
                   </div>
-                  <button onClick={() => setForm(p => ({ ...p, ...SAMPLES[2] }))} className="text-xs text-purple-500 hover:text-purple-700 underline shrink-0 ml-4">Fill sample</button>
+                  <button
+                    onClick={() => setShowSample(v => !v)}
+                    className="flex items-center gap-1 text-xs text-purple-500 hover:text-purple-700 shrink-0 ml-4"
+                  >
+                    <Lightbulb className="w-3.5 h-3.5" />
+                    {showSample ? 'Hide example' : 'See example'}
+                  </button>
                 </div>
+                {showSample && (
+                  <div className="bg-purple-50 border border-purple-100 rounded-lg p-4 space-y-2">
+                    {(sampleKeys[2] as string[]).map(k => SAMPLES[2][k as keyof typeof SAMPLES[2]] ? (
+                      <div key={k}>
+                        <p className="text-xs font-medium text-purple-600 mb-0.5">{sampleLabels[k]}</p>
+                        <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">{SAMPLES[2][k as keyof typeof SAMPLES[2]] as string}</p>
+                      </div>
+                    ) : null)}
+                  </div>
+                )}
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Core Values *</label>
@@ -551,8 +619,24 @@ export default function CreatePage() {
                     <h2 className="text-xl font-semibold text-gray-800">Voice &amp; Style</h2>
                     <p className="text-sm text-gray-500 mt-1">How your twin sounds and where its blind spots are.</p>
                   </div>
-                  <button onClick={() => setForm(p => ({ ...p, ...SAMPLES[3] }))} className="text-xs text-purple-500 hover:text-purple-700 underline shrink-0 ml-4">Fill sample</button>
+                  <button
+                    onClick={() => setShowSample(v => !v)}
+                    className="flex items-center gap-1 text-xs text-purple-500 hover:text-purple-700 shrink-0 ml-4"
+                  >
+                    <Lightbulb className="w-3.5 h-3.5" />
+                    {showSample ? 'Hide example' : 'See example'}
+                  </button>
                 </div>
+                {showSample && (
+                  <div className="bg-purple-50 border border-purple-100 rounded-lg p-4 space-y-2">
+                    {(sampleKeys[3] as string[]).map(k => SAMPLES[3][k as keyof typeof SAMPLES[3]] ? (
+                      <div key={k}>
+                        <p className="text-xs font-medium text-purple-600 mb-0.5">{sampleLabels[k]}</p>
+                        <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">{SAMPLES[3][k as keyof typeof SAMPLES[3]] as string}</p>
+                      </div>
+                    ) : null)}
+                  </div>
+                )}
 
                 {/* Response style selector */}
                 <fieldset>
