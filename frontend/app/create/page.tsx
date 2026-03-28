@@ -396,6 +396,11 @@ export default function CreatePage() {
 
   const activeTopic = ALL_TOPICS.find(t => !topicsCovered.includes(t));
 
+  // Detect if the AI's last message has no question — need to nudge continuation
+  const lastAiMessage = [...messages].reverse().find(m => m.role === 'ai');
+  const aiStalled = phase === 'chat' && !sending &&
+    lastAiMessage && !lastAiMessage.content.includes('?') && activeTopic;
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
       <AppNav />
@@ -546,6 +551,28 @@ export default function CreatePage() {
 
             <div ref={bottomRef} />
           </div>
+
+          {/* Stall nudge — AI acknowledged without asking next question */}
+          {aiStalled && !canCreateManually && (
+            <div className="bg-amber-50 border-t border-amber-100 px-4 py-2 shrink-0">
+              <div className="max-w-2xl mx-auto flex items-center justify-between">
+                <p className="text-xs text-amber-700">Looks like the next question got lost — tap to continue.</p>
+                <button
+                  onClick={async () => {
+                    const token = await getToken();
+                    if (!token) return;
+                    const nudge: ApiHistoryItem = { role: 'user', content: 'Please continue with the next question.' };
+                    const newHistory = [...apiHistory, nudge];
+                    setApiHistory(newHistory);
+                    await callOnboard(newHistory, fieldsCollected, topicsCovered, linkedinParsed, token);
+                  }}
+                  className="text-xs font-medium px-3 py-1.5 bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors"
+                >
+                  Continue →
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Manual create banner */}
           {canCreateManually && (

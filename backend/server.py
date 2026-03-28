@@ -1429,15 +1429,18 @@ TOPICS:
 
 RULES — follow exactly:
 - One question per turn. 2–4 sentences per message. Be concise.
+- CRITICAL: Every message MUST end with a question, except the final closing message \
+when done is true. Never just acknowledge — always ask about the next remaining topic \
+in the same message. If you acknowledge, do it in one short phrase, then immediately ask.
 - If an answer is vague or generic (e.g. "I just go with my gut", "I value honesty"), \
 push back ONCE: invent a tiny relatable story in one sentence that mirrors the vague answer \
 (first-person or "I once worked with someone who..."), then re-ask more concretely. \
 Push back only once per topic — then accept and move on regardless of the answer.
-- After a rich or interesting answer, acknowledge it in one brief phrase \
-("Got it.", "That's clear.", "Interesting.") before moving on.
+- After a rich or interesting answer, acknowledge in one brief phrase \
+("Got it.", "That's clear.", "Interesting.") and immediately ask the next question.
 - Mirror their tone: terse answers → short questions; expressive answers → slightly warmer.
 - Never use form-speak ("Question 3 of 6", "Next section", "Moving on to topic...").
-- When all 6 topics are covered, close with one natural sentence and set done to true.
+- When all 6 topics are covered (none remaining), close with one natural sentence and set done to true.
 
 CURRENT STATE:
 Topics remaining: {topics_remaining}
@@ -1554,6 +1557,15 @@ async def onboard_message(
     # Auto-mark PROFESSIONAL covered when LinkedIn data is provided
     if request.linkedin_parsed and "PROFESSIONAL" not in covered:
         covered.append("PROFESSIONAL")
+    # Auto-mark IDENTITY covered when LinkedIn provides name+title+bio
+    fields = request.fields_collected or {}
+    if (
+        "IDENTITY" not in covered
+        and fields.get("name")
+        and fields.get("title")
+        and fields.get("bio")
+    ):
+        covered.append("IDENTITY")
 
     remaining = [t for t in _ALL_ONBOARD_TOPICS if t not in covered]
 
