@@ -1535,7 +1535,15 @@ async def onboard_message(
     else:
         # Cap the amount of history sent to Bedrock to avoid unbounded prompts
         for item in request.history[-50:]:
-            role = "user" if item.role == "user" else "assistant"
+            if item.role == "user":
+                role = "user"
+            elif item.role == "assistant":
+                role = "assistant"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid role in history item: {item.role!r}. Allowed roles are 'user' and 'assistant'.",
+                )
             messages.append({"role": role, "content": [{"text": item.content}]})
 
     try:
