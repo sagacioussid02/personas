@@ -210,7 +210,10 @@ export default function CreatePage() {
         skills: data.skills, experience: data.experience, achievements: data.achievements,
         archetype_id: data.archetype_id ?? null,
       };
-      const newFields = { ...fieldsCollected, ...parsedFields };
+      const cleanedParsedFields = Object.fromEntries(
+        Object.entries(parsedFields).filter(([, value]) => value !== undefined)
+      ) as FieldUpdates;
+      const newFields = { ...fieldsCollected, ...cleanedParsedFields };
       setLinkedinParsed(data);
       setFieldsCollected(newFields);
 
