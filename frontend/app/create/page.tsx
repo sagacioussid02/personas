@@ -565,7 +565,9 @@ export default function CreatePage() {
               <div className="max-w-2xl mx-auto flex items-center justify-between">
                 <p className="text-xs text-amber-700">Looks like the next question got lost — tap to continue.</p>
                 <button
+                  disabled={sending}
                   onClick={async () => {
+                    if (sending) return;
                     const token = await getToken();
                     if (!token) {
                       router.push('/sign-in');
@@ -576,7 +578,7 @@ export default function CreatePage() {
                     setApiHistory(newHistory);
                     await callOnboard(newHistory, fieldsCollected, topicsCovered, linkedinParsed, token);
                   }}
-                  className="text-xs font-medium px-3 py-1.5 bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors"
+                  className="text-xs font-medium px-3 py-1.5 bg-amber-500 text-white rounded-lg hover:bg-amber-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
                   Continue →
                 </button>

@@ -1653,25 +1653,36 @@ async def onboard_message(
         if os.getenv("DEBUG_LOG_ONBOARD_RAW") == "1":
             print(f"Onboard raw snippet (truncated): {raw[:200]!r}")
 
-        # Detect whether the LLM signalled completion even though the JSON was malformed.
-        # Pattern: LLM appends {"done": true} or {"done":true} as a trailing fragment.
-        fallback_done = ('"done": true' in raw or '"done":true' in raw)
-        fallback_topics = list(_ALL_ONBOARD_TOPICS) if fallback_done else covered
-
-        # Salvage a clean plain-text message — strip trailing JSON fragments.
+        # Salvage a clean plain-text message and detect the done signal.
+        # Strategy: look for a trailing JSON fragment (rfind '{' in the latter half
+        # of the text) and parse it with json.loads — only trust done:true when it
+        # appears as an actual top-level key in a parseable object, not anywhere in
+        # the raw string (which would produce false positives on quoted examples).
         done_msg = "Thanks — that's everything I need! Let me put your twin together."
         cont_msg = "Got it — let me keep going. Could you tell me a bit more?"
 
+        fallback_done = False
         fallback_message = raw
+
         if raw.strip().startswith("{") or raw.strip().startswith("```"):
-            fallback_message = done_msg if fallback_done else cont_msg
+            # Entire output looks like a (possibly malformed) JSON blob — can't
+            # salvage natural language, so use a canned message.
+            fallback_message = cont_msg
         else:
-            # Strip a trailing JSON fragment like  {"done": true}  from the sentence.
+            # Check for a trailing JSON fragment like  ...nice. {"done": true}
             last_brace = raw.rfind('{')
             if last_brace > len(raw) // 2:
+                try:
+                    fragment = json.loads(raw[last_brace:])
+                    if fragment.get("done") is True:
+                        fallback_done = True
+                except json.JSONDecodeError:
+                    pass
                 fallback_message = raw[:last_brace].strip()
             if not fallback_message:
                 fallback_message = done_msg if fallback_done else cont_msg
+
+        fallback_topics = list(_ALL_ONBOARD_TOPICS) if fallback_done else covered
 
         return {
             "message": fallback_message,
