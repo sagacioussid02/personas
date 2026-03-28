@@ -1677,7 +1677,7 @@ async def onboard_message(
             if last_brace > len(raw) // 2:
                 try:
                     fragment = json.loads(raw[last_brace:])
-                    if fragment.get("done") is True:
+                    if isinstance(fragment, dict) and fragment.get("done") is True:
                         fallback_done = True
                 except json.JSONDecodeError:
                     pass
