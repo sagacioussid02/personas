@@ -1543,7 +1543,7 @@ class OnboardResponse(BaseModel):
     @field_validator("done", mode="before")
     @classmethod
     def _coerce_done(cls, v: Any) -> Any:
-        """Accept a bool (or truthy value); default to False for non-bool types."""
+        """Accept a bool; coerce any non-bool value to False."""
         if isinstance(v, bool):
             return v
         return False
