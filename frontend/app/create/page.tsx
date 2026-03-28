@@ -576,6 +576,13 @@ export default function CreatePage() {
                     const nudge: ApiHistoryItem = { role: 'user', content: 'Please continue with the next question.' };
                     const newHistory = [...apiHistory, nudge];
                     setApiHistory(newHistory);
+
+                    // Keep UI transcript and turn counting in sync with backend history
+                    setMessages(prevMessages => [
+                      ...prevMessages,
+                      { role: 'user', content: nudge.content },
+                    ]);
+                    setUserTurnCount(prevCount => prevCount + 1);
                     await callOnboard(newHistory, fieldsCollected, topicsCovered, linkedinParsed, token);
                   }}
                   className="text-xs font-medium px-3 py-1.5 bg-amber-500 text-white rounded-lg hover:bg-amber-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
