@@ -186,12 +186,12 @@ _PERSONALITY_MODEL_KEYS = {
 }
 
 
-def _extract_json_object(text: str) -> dict:
-    """Extract the first complete JSON object that contains a 'message' key.
+def _extract_json_object(text: str, required_key: str | None = None) -> dict:
+    """Extract the first complete JSON object from *text*.
 
-    Scans every '{' position in turn so that a stray JSON fragment like
-    {"done": true} appended after natural-language text doesn't shadow the
-    real response object. Returns the first valid dict that has 'message'.
+    Scans every '{' position in turn so that a stray JSON fragment appended
+    after natural-language text doesn't shadow the real response object.
+    Returns the first valid dict (optionally containing *required_key*).
     """
     pos = 0
     last_error: Exception = ValueError("No JSON object found in response")
@@ -227,8 +227,9 @@ def _extract_json_object(text: str) -> dict:
             continue
         try:
             candidate = json.loads(text[start:end + 1])
-            if isinstance(candidate, dict) and "message" in candidate:
-                return candidate
+            if isinstance(candidate, dict):
+                if required_key is None or required_key in candidate:
+                    return candidate
         except json.JSONDecodeError as exc:
             last_error = exc
         pos = end + 1  # advance past this block and try the next '{'
@@ -1641,8 +1642,9 @@ async def onboard_message(
         )
         raw = response["output"]["message"]["content"][0]["text"].strip()
 
-        # Use robust JSON extraction — handles code fences and leading/trailing text
-        data = _extract_json_object(raw)
+        # Use robust JSON extraction — handles code fences and leading/trailing text.
+        # Pass required_key so stray {"done": true} fragments are skipped.
+        data = _extract_json_object(raw, required_key="message")
 
         if not isinstance(data, dict) or "message" not in data:
             raise ValueError("Invalid onboarding JSON structure")
