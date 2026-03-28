@@ -567,7 +567,10 @@ export default function CreatePage() {
                 <button
                   onClick={async () => {
                     const token = await getToken();
-                    if (!token) return;
+                    if (!token) {
+                      router.push('/sign-in');
+                      return;
+                    }
                     const nudge: ApiHistoryItem = { role: 'user', content: 'Please continue with the next question.' };
                     const newHistory = [...apiHistory, nudge];
                     setApiHistory(newHistory);
