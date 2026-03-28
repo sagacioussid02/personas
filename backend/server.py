@@ -1679,11 +1679,16 @@ async def onboard_message(
             if last_brace > len(raw) // 2:
                 try:
                     fragment = json.loads(raw[last_brace:])
-                    if isinstance(fragment, dict) and fragment.get("done") is True:
-                        fallback_done = True
+                    # Only treat this as a real trailer (and truncate) if it parses
+                    # and looks like the expected {"done": ...} object.
+                    if isinstance(fragment, dict) and "done" in fragment:
+                        if fragment.get("done") is True:
+                            fallback_done = True
+                        fallback_message = raw[:last_brace].strip()
                 except json.JSONDecodeError:
+                    # Leave fallback_message as the full raw text if the fragment
+                    # doesn't parse; don't truncate on malformed JSON.
                     pass
-                fallback_message = raw[:last_brace].strip()
             if not fallback_message:
                 fallback_message = done_msg if fallback_done else cont_msg
 
