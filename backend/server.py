@@ -1576,7 +1576,8 @@ async def onboard_message(
     # Auto-mark PROFESSIONAL covered when LinkedIn data is provided
     if request.linkedin_parsed and "PROFESSIONAL" not in covered:
         covered.append("PROFESSIONAL")
-    # Auto-mark IDENTITY covered when LinkedIn provides name+title+bio
+    # Auto-mark IDENTITY covered when name+title+bio are already collected
+    # (from LinkedIn, a previous turn, or any other source)
     fields = request.fields_collected or {}
     if (
         "IDENTITY" not in covered
