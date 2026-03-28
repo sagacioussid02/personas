@@ -1492,6 +1492,63 @@ class OnboardRequest(BaseModel):
     topics_covered: List[str] = Field(default_factory=list)
 
 
+class OnboardFieldUpdates(BaseModel):
+    """Validated field updates extracted from the model response."""
+
+    name: Optional[str] = None
+    title: Optional[str] = None
+    bio: Optional[str] = None
+    skills: Optional[str] = None
+    experience: Optional[str] = None
+    achievements: Optional[str] = None
+    coreValues: Optional[str] = None
+    decisionStyle: Optional[str] = None
+    riskTolerance: Optional[str] = None
+    pastDecisions: Optional[str] = None
+    communicationStyle: Optional[str] = None
+    blindSpots: Optional[str] = None
+    verbalQuirks: Optional[str] = None
+    responseStyle: Optional[str] = None
+
+    model_config = {"extra": "ignore"}
+
+
+class OnboardResponse(BaseModel):
+    """Validated response returned by /onboard/message."""
+
+    message: str
+    field_updates: OnboardFieldUpdates = Field(default_factory=OnboardFieldUpdates)
+    topics_covered: List[str] = Field(default_factory=list)
+    done: bool = False
+    twin_payload: Optional[Dict[str, Any]] = None
+
+    model_config = {"extra": "ignore"}
+
+    @field_validator("field_updates", mode="before")
+    @classmethod
+    def _coerce_field_updates(cls, v: Any) -> Any:
+        """Accept a dict or fall back to an empty OnboardFieldUpdates."""
+        if not isinstance(v, dict):
+            return {}
+        return v
+
+    @field_validator("topics_covered", mode="before")
+    @classmethod
+    def _coerce_topics_covered(cls, v: Any) -> Any:
+        """Accept a list of strings or fall back to an empty list."""
+        if not isinstance(v, list):
+            return []
+        return [item for item in v if isinstance(item, str)]
+
+    @field_validator("done", mode="before")
+    @classmethod
+    def _coerce_done(cls, v: Any) -> Any:
+        """Accept a bool (or truthy value); default to False for non-bool types."""
+        if isinstance(v, bool):
+            return v
+        return False
+
+
 _ALL_ONBOARD_TOPICS = ["IDENTITY", "PROFESSIONAL", "DECISIONS", "VALUES", "WORKING_STYLE", "VOICE"]
 
 
@@ -1562,12 +1619,16 @@ async def onboard_message(
         if not isinstance(data, dict) or "message" not in data:
             raise ValueError("Invalid onboarding JSON structure")
 
-        return data
+        # Validate and coerce model output against a strict response model so that
+        # missing keys default safely and wrong types don't reach the frontend.
+        validated = OnboardResponse.model_validate(data)
+        return validated.model_dump(exclude_none=False)
     except (ValueError, json.JSONDecodeError):
         # Return raw text as message so the UI stays unblocked
         return {"message": raw, "field_updates": {}, "topics_covered": covered, "done": False}
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        print(f"Unexpected error in /onboard/message: {exc}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
 
 
 if __name__ == "__main__":
