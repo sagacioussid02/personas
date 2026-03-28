@@ -1617,7 +1617,9 @@ async def onboard_message(
         validated = OnboardResponse.model_validate(data)
         return validated.model_dump(exclude_none=True)
     except (ValueError, json.JSONDecodeError) as exc:
-        print(f"Onboard JSON parse error: {exc!r} | raw[:200]={raw[:200]!r}")
+        print(f"Onboard JSON parse error: {exc!r}")
+        if os.getenv("DEBUG_LOG_ONBOARD_RAW") == "1":
+            print(f"Onboard raw snippet (truncated): {raw[:200]!r}")
         # Try to salvage a plain-text message from the raw output before falling back.
         # This prevents raw JSON blobs from leaking into the chat bubble.
         fallback_message = raw
