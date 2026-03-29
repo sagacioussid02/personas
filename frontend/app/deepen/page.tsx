@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, Suspense } from 'react';
 import type { KeyboardEvent } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { useAuth } from '@clerk/nextjs';
-import { Send, Sparkles } from 'lucide-react';
+import { Send, Sparkles, CheckCircle2 } from 'lucide-react';
 import AppNav from '@/components/app-nav';
 
 interface Message {
@@ -35,6 +35,7 @@ function DeepenChat() {
   const [topicsCovered, setTopicsCovered] = useState<string[]>([]);
   const [fieldsCollected, setFieldsCollected] = useState<Record<string, string>>({});
   const [done, setDone] = useState(false);
+  const [countdown, setCountdown] = useState(5);
   const [loadError, setLoadError] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const startedRef = useRef(false);
@@ -64,6 +65,14 @@ function DeepenChat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Auto-redirect countdown once interview is done
+  useEffect(() => {
+    if (!done) return;
+    if (countdown <= 0) { router.push('/dashboard'); return; }
+    const timer = setTimeout(() => setCountdown(c => c - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [done, countdown, router]);
 
   // Kick off the session automatically once we have auth — useRef guards against
   // the double-invoke that React Strict Mode causes in development.
@@ -249,16 +258,20 @@ function DeepenChat() {
             </div>
 
             {done ? (
-              <div className="border-t border-gray-100 p-4 bg-purple-50 rounded-b-xl text-center">
-                <p className="text-sm font-medium text-purple-700 mb-2">Twin updated</p>
-                <p className="text-xs text-gray-500 mb-3">
-                  {firstName}&apos;s reasoning has been sharpened with your new answers.
+              <div className="border-t border-gray-100 p-6 bg-purple-50 rounded-b-xl text-center">
+                <CheckCircle2 className="w-10 h-10 text-purple-500 mx-auto mb-3" />
+                <p className="text-base font-semibold text-purple-800 mb-1">Interview complete!</p>
+                <p className="text-sm text-gray-600 mb-1">
+                  Your answers look great. {firstName}&apos;s twin has been updated with deeper reasoning.
+                </p>
+                <p className="text-xs text-gray-400 mb-4">
+                  Redirecting to dashboard in {countdown}s…
                 </p>
                 <button
                   onClick={() => router.push('/dashboard')}
-                  className="px-4 py-2 bg-purple-600 text-white text-sm rounded-lg hover:bg-purple-700 transition-colors"
+                  className="px-5 py-2 bg-purple-600 text-white text-sm font-medium rounded-lg hover:bg-purple-700 transition-colors"
                 >
-                  Back to dashboard
+                  Go to dashboard now
                 </button>
               </div>
             ) : (
