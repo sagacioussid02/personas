@@ -3,6 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import field_validator
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import copy
 import os
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any, Union
@@ -330,7 +331,7 @@ def load_twin(twin_id: str) -> Optional[dict]:
         raise HTTPException(status_code=400, detail="Invalid twin ID format")
 
     if twin_id in _PUBLIC_PERSONAS:
-        return _PUBLIC_PERSONAS[twin_id]
+        return copy.deepcopy(_PUBLIC_PERSONAS[twin_id])
 
     if USE_S3:
         # Direct flat-key lookup — O(1), safe for public endpoints
