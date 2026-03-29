@@ -973,7 +973,13 @@ async def list_public_personas():
                 "personality_summary": p.get("personality_model", {}).get("personality_summary", ""),
                 "chat_url": f"/twin?id={p['twin_id']}",
             }
-            for p in _PUBLIC_PERSONAS.values()
+            for p in sorted(
+                _PUBLIC_PERSONAS.values(),
+                key=lambda persona: (
+                    str(persona.get("persona_id") or ""),
+                    str(persona.get("name") or ""),
+                ),
+            )
         ]
     }
 
