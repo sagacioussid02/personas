@@ -1977,6 +1977,18 @@ async def deepen_message(
             raise ValueError("Invalid deepen JSON structure")
 
         validated = DeepenResponse.model_validate(data)
+
+        # Ensure topics_covered remains cumulative across turns by unioning
+        # the topics from the request with the topics returned by the model,
+        # and ordering them according to the canonical _ALL_DEEPEN_TOPICS list.
+        request_topics = set(request.topics_covered or [])
+        model_topics = set(validated.topics_covered or [])
+        merged_topics_set = request_topics | model_topics
+        if merged_topics_set:
+            merged_topics_ordered: List[str] = [
+                topic for topic in _ALL_DEEPEN_TOPICS if topic in merged_topics_set
+            ]
+            validated.topics_covered = merged_topics_ordered
         result = validated.model_dump(exclude_none=True)
 
         # If done, merge new fields and re-synthesize synchronously before returning
