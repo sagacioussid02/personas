@@ -5,6 +5,7 @@ import type { KeyboardEvent } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useAuth } from '@clerk/nextjs';
 import { Send, User, Flag, Check } from 'lucide-react';
+import Link from 'next/link';
 import AppNav from '@/components/app-nav';
 
 interface Message {
@@ -37,12 +38,37 @@ function TwinChat() {
   const [isLoading, setIsLoading] = useState(false);
   // session_id is only used for anonymous users; authenticated users get a
   // stable server-derived session keyed by their identity + twin_id.
+  // Persisted in localStorage (keyed by twin_id) so the limit survives page reloads.
   const [sessionId, setSessionId] = useState('');
+
+  // Rehydrate (or create) the anonymous session_id from localStorage.
+  // This runs once when the twin_id is available so the same stable ID is
+  // always sent, preventing the limit from being reset on page reload.
+  useEffect(() => {
+    if (!id || isSignedIn) return;
+    const storageKey = `anon_session_${id}`;
+    try {
+      const stored = localStorage.getItem(storageKey);
+      if (stored) {
+        setSessionId(stored);
+      } else {
+        const newId = crypto.randomUUID();
+        localStorage.setItem(storageKey, newId);
+        setSessionId(newId);
+      }
+    } catch {
+      // localStorage unavailable (e.g. private browsing with strict settings):
+      // fall back to an in-memory UUID so the session still works for this visit.
+      setSessionId(crypto.randomUUID());
+    }
+  }, [id, isSignedIn]);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Correction state: which message is being corrected and user's text
   const [correcting, setCorrecting] = useState<{ messageId: string; text: string } | null>(null);
   const [correctionSaved, setCorrectionSaved] = useState<string | null>(null); // messageId of last saved
+  const [anonLimitReached, setAnonLimitReached] = useState(false);
   const [correctionError, setCorrectionError] = useState<string | null>(null); // messageId of last failed save
 
   useEffect(() => {
@@ -107,23 +133,52 @@ function TwinChat() {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (token) headers['Authorization'] = `Bearer ${token}`;
 
+      // For anonymous sessions, ensure we always have a stable session_id before
+      // the request, even if the rehydration useEffect hasn't resolved yet (race
+      // condition on first render).  Authenticated users don't need one.
+      let anonSid = sessionId;
+      if (!isSignedIn && !anonSid && id) {
+        const storageKey = `anon_session_${id}`;
+        try {
+          anonSid = localStorage.getItem(storageKey) || '';
+          if (!anonSid) {
+            anonSid = crypto.randomUUID();
+            localStorage.setItem(storageKey, anonSid);
+          }
+        } catch {
+          anonSid = crypto.randomUUID();
+        }
+        setSessionId(anonSid);
+      }
+
       const res = await fetch(`${API}/chat`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
           message: input,
           twin_id: id,
-          // For anonymous sessions, send session_id to maintain continuity.
-          // Authenticated users get a stable server-derived session keyed by
-          // their identity + twin_id, so omit the client session_id for them.
-          ...(!isSignedIn && sessionId ? { session_id: sessionId } : {}),
+          // For anonymous sessions, always send the localStorage-backed session_id
+          // so the server can track usage across page reloads. Authenticated users
+          // get a stable server-derived session keyed by their identity + twin_id.
+          ...(!isSignedIn && anonSid ? { session_id: anonSid } : {}),
         }),
       });
+      if (res.status === 402) {
+        setAnonLimitReached(true);
+        setMessages(prev => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: 'You have reached the free usage limit. Please sign in or upgrade to continue this conversation.',
+            timestamp: new Date(),
+          },
+        ]);
+        setIsLoading(false);
+        return;
+      }
       if (!res.ok) throw new Error('Failed to send');
       const data = await res.json();
-      // Only track session_id for anonymous users; authenticated sessions are
-      // fully managed server-side and don't need a client-held session_id.
-      if (!isSignedIn && !sessionId) setSessionId(data.session_id);
       setMessages(prev => [...prev, {
         id: crypto.randomUUID(),
         role: 'assistant',
@@ -151,7 +206,7 @@ function TwinChat() {
       <main className="min-h-screen bg-gradient-to-br from-slate-50 to-gray-100 flex items-center justify-center">
         <div className="text-center">
           <p className="text-gray-500 mb-4">{profileError}</p>
-          <a href="/create" className="text-purple-600 underline text-sm">Create your own twin</a>
+          <Link href="/create" className="text-purple-600 underline text-sm">Create your own persona</Link>
         </div>
       </main>
     );
@@ -346,31 +401,46 @@ function TwinChat() {
               <div ref={messagesEndRef} />
             </div>
 
-            <div className="border-t border-gray-100 p-4">
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={input}
-                  onChange={e => setInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder={`Ask ${firstName} anything...`}
-                  className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 text-gray-800 text-sm"
-                  disabled={isLoading}
-                />
-                <button
-                  onClick={sendMessage}
-                  disabled={!input.trim() || isLoading}
-                  className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                >
-                  <Send className="w-4 h-4" />
-                </button>
+            {anonLimitReached ? (
+              <div className="border-t border-gray-100 p-4 bg-gradient-to-r from-purple-50 to-indigo-50 rounded-b-xl text-center">
+                <p className="text-sm font-semibold text-purple-800 mb-1">You&apos;ve reached the free preview limit</p>
+                <p className="text-xs text-gray-500 mb-3">Sign up free to keep chatting with {firstName} and create your own persona.</p>
+                <div className="flex gap-2 justify-center">
+                  <Link href="/sign-up" className="px-4 py-1.5 bg-gradient-to-r from-purple-600 to-indigo-600 text-white text-sm rounded-lg hover:opacity-90 font-medium transition-opacity">
+                    Sign up free
+                  </Link>
+                  <Link href="/sign-in" className="px-4 py-1.5 border border-gray-300 text-gray-600 text-sm rounded-lg hover:bg-gray-50 transition-colors">
+                    Sign in
+                  </Link>
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="border-t border-gray-100 p-4">
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={input}
+                    onChange={e => setInput(e.target.value)}
+                    onKeyDown={handleKeyDown}
+                    placeholder={`Ask ${firstName} anything...`}
+                    className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 text-gray-800 text-sm"
+                    disabled={isLoading}
+                  />
+                  <button
+                    onClick={sendMessage}
+                    disabled={!input.trim() || isLoading}
+                    className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           <p className="text-center text-xs text-gray-400 mt-4">
             Want your own?{' '}
-            <a href="/create" className="text-purple-500 hover:text-purple-700 underline">Create your AI twin</a>
+            <Link href="/create" className="text-purple-500 hover:text-purple-700 underline">Create your persona</Link>
           </p>
         </div>
       </div>
