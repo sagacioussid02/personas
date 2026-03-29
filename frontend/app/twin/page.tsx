@@ -37,7 +37,31 @@ function TwinChat() {
   const [isLoading, setIsLoading] = useState(false);
   // session_id is only used for anonymous users; authenticated users get a
   // stable server-derived session keyed by their identity + twin_id.
+  // Persisted in localStorage (keyed by twin_id) so the limit survives page reloads.
   const [sessionId, setSessionId] = useState('');
+
+  // Rehydrate (or create) the anonymous session_id from localStorage.
+  // This runs once when the twin_id is available so the same stable ID is
+  // always sent, preventing the limit from being reset on page reload.
+  useEffect(() => {
+    if (!id || isSignedIn) return;
+    const storageKey = `anon_session_${id}`;
+    try {
+      const stored = localStorage.getItem(storageKey);
+      if (stored) {
+        setSessionId(stored);
+      } else {
+        const newId = crypto.randomUUID();
+        localStorage.setItem(storageKey, newId);
+        setSessionId(newId);
+      }
+    } catch {
+      // localStorage unavailable (e.g. private browsing with strict settings):
+      // fall back to an in-memory UUID so the session still works for this visit.
+      setSessionId(crypto.randomUUID());
+    }
+  }, [id, isSignedIn]);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Correction state: which message is being corrected and user's text
@@ -114,9 +138,9 @@ function TwinChat() {
         body: JSON.stringify({
           message: input,
           twin_id: id,
-          // For anonymous sessions, send session_id to maintain continuity.
-          // Authenticated users get a stable server-derived session keyed by
-          // their identity + twin_id, so omit the client session_id for them.
+          // For anonymous sessions, always send the localStorage-backed session_id
+          // so the server can track usage across page reloads. Authenticated users
+          // get a stable server-derived session keyed by their identity + twin_id.
           ...(!isSignedIn && sessionId ? { session_id: sessionId } : {}),
         }),
       });
@@ -136,9 +160,6 @@ function TwinChat() {
       }
       if (!res.ok) throw new Error('Failed to send');
       const data = await res.json();
-      // Only track session_id for anonymous users; authenticated sessions are
-      // fully managed server-side and don't need a client-held session_id.
-      if (!isSignedIn && !sessionId) setSessionId(data.session_id);
       setMessages(prev => [...prev, {
         id: crypto.randomUUID(),
         role: 'assistant',

@@ -718,6 +718,14 @@ async def chat(
             twin_data = load_twin(request.twin_id)
             # Enforce anonymous question limit on public personas
             if twin_data and twin_data.get("is_public") and not chatter_id:
+                # Require a client-supplied session_id so the limit can't be
+                # bypassed by omitting it (which would otherwise cause the
+                # server to generate a fresh UUID, resetting the counter).
+                if not request.session_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="session_id is required for anonymous public persona chat",
+                    )
                 anon_q_count = sum(1 for m in conversation if m.get("role") == "user")
                 if anon_q_count >= PUBLIC_PERSONA_ANON_LIMIT:
                     raise HTTPException(
