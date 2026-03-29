@@ -230,7 +230,7 @@ resource "aws_apigatewayv2_api" "main" {
   cors_configuration {
     allow_credentials = false
     allow_headers     = ["Content-Type", "Authorization", "X-Requested-With"]
-    allow_methods     = ["GET", "POST", "OPTIONS"]
+    allow_methods     = ["GET", "POST", "PATCH", "OPTIONS"]
     allow_origins = var.use_custom_domain ? [
       "https://${var.root_domain}",
       "https://www.${var.root_domain}"
@@ -493,4 +493,9 @@ resource "aws_route53_record" "alias_www_ipv6" {
     zone_id                = aws_cloudfront_distribution.main.hosted_zone_id
     evaluate_target_health = false
   }
+}
+resource "aws_apigatewayv2_route" "patch_twin_corrections" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "PATCH /twin/{twin_id}/corrections"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
