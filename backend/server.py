@@ -2042,6 +2042,7 @@ Return ONLY valid JSON with the same structure as the existing model. No markdow
         _save_twin(twin_id, user_id, twin_data)
     except Exception as exc:
         print(f"Deepen save failed: {exc}")
+        raise
 
 
 @app.post("/twin/{twin_id}/deepen/message")
