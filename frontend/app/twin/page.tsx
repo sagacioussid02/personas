@@ -256,6 +256,7 @@ function TwinChat() {
                               onClick={() => setCorrecting({ messageId: message.id, text: '' })}
                               className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 ml-2 flex-shrink-0"
                               title="That's not right"
+                              aria-label="That's not right"
                             >
                               <Flag className="w-3 h-3" />
                             </button>
