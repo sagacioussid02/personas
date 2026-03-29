@@ -73,7 +73,21 @@ _PUBLIC_PERSONAS_DIR = os.path.join(os.path.dirname(__file__), "public_personas"
 _PUBLIC_PERSONAS: dict[str, dict] = {}  # keyed by twin_id
 
 def _load_public_personas() -> None:
-    for f in Path(_PUBLIC_PERSONAS_DIR).glob("*.json"):
+    directory = Path(_PUBLIC_PERSONAS_DIR)
+    if not directory.exists():
+        print(
+            f"Warning: public personas directory '{_PUBLIC_PERSONAS_DIR}' not found; "
+            "the /public-personas endpoint will be empty. "
+            "If running in AWS Lambda, ensure 'public_personas/' is included in the deployment package."
+        )
+        return
+    if not directory.is_dir():
+        print(
+            f"Warning: public personas path '{_PUBLIC_PERSONAS_DIR}' exists but is not a directory; "
+            "skipping public persona loading."
+        )
+        return
+    for f in directory.glob("*.json"):
         try:
             data = json.loads(f.read_text())
             if not isinstance(data, dict):
