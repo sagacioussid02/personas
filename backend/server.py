@@ -1066,6 +1066,7 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
         "skills": request.skills,
         "experience": request.experience,
         "achievements": request.achievements,
+        "pastDecisions": request.pastDecisions,
         "communicationStyle": request.communicationStyle,
         "verbalQuirks": request.verbalQuirks or "",
         "responseStyle": request.responseStyle or "balanced",
