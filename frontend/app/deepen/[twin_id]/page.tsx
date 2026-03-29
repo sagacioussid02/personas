@@ -86,7 +86,6 @@ export default function DeepenPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
-          message: userText || undefined,
           history: newHistory.map(m => ({ role: m.role, content: m.content })),
           topics_covered: topicsCovered,
           fields_collected: fieldsCollected,
