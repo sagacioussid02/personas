@@ -100,14 +100,11 @@ export default function DashboardPage() {
                           {twin.archetype_display_name}
                         </span>
                       )}
-                      {twin.depth_score && (() => {
-                        const s = DEPTH_STYLES[twin.depth_score];
-                        return (
-                          <span className={`text-xs border px-2 py-0.5 rounded-full ${s.pill}`}>
-                            {s.label}
-                          </span>
-                        );
-                      })()}
+                      {twin.depth_score && DEPTH_STYLES[twin.depth_score] && (
+                        <span className={`text-xs border px-2 py-0.5 rounded-full ${DEPTH_STYLES[twin.depth_score].pill}`}>
+                          {DEPTH_STYLES[twin.depth_score].label}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>
