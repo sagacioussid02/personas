@@ -1740,6 +1740,11 @@ async def onboard_message(
                     detail=f"Invalid role in history item: {item.role!r}. Allowed roles are 'user' and 'assistant'.",
                 )
             messages.append({"role": role, "content": [{"text": item.content}]})
+        # Bedrock requires the conversation to start with a user turn.
+        # When history only contains the bot's opening question (assistant), prepend
+        # the synthetic opener so the first message is always from "user".
+        if messages and messages[0]["role"] != "user":
+            messages.insert(0, {"role": "user", "content": [{"text": "hi, let's start"}]})
 
     try:
         response = await asyncio.to_thread(
@@ -2006,6 +2011,11 @@ async def deepen_message(
             if item.role not in ("user", "assistant"):
                 raise HTTPException(status_code=400, detail=f"Invalid role: {item.role!r}")
             messages.append({"role": item.role, "content": [{"text": item.content}]})
+        # Bedrock requires the conversation to start with a user turn.
+        # When history only contains the bot's opening question (assistant), prepend
+        # the synthetic opener so the first message is always from "user".
+        if messages and messages[0]["role"] != "user":
+            messages.insert(0, {"role": "user", "content": [{"text": "hi, let's start"}]})
 
     try:
         response = await asyncio.to_thread(
