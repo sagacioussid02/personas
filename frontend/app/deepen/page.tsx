@@ -260,9 +260,15 @@ function DeepenChat() {
             {done ? (
               <div className="border-t border-gray-100 p-6 bg-purple-50 rounded-b-xl text-center">
                 <CheckCircle2 className="w-10 h-10 text-purple-500 mx-auto mb-3" />
-                <p className="text-base font-semibold text-purple-800 mb-1">Interview complete!</p>
+                <p className="text-base font-semibold text-purple-800 mb-2">Interview complete!</p>
+                <div className="flex items-center justify-center gap-2 mb-3">
+                  <span className="text-xs text-gray-400">Twin depth upgraded to</span>
+                  <span className="text-xs font-semibold bg-purple-100 text-purple-700 border border-purple-200 px-2 py-0.5 rounded-full">
+                    Deep
+                  </span>
+                </div>
                 <p className="text-sm text-gray-600 mb-1">
-                  Your answers look great. {firstName}&apos;s twin has been updated with deeper reasoning.
+                  {firstName}&apos;s answers are now saved and will make future chats sharper and higher fidelity.
                 </p>
                 <p className="text-xs text-gray-400 mb-4">
                   Redirecting to dashboard in {countdown}s…
