@@ -1829,7 +1829,6 @@ class DeepenFieldUpdates(BaseModel):
 
 
 class DeepenRequest(BaseModel):
-    message: Optional[str] = None
     history: List[DeepenHistoryItem] = Field(default_factory=list)
     topics_covered: List[str] = Field(default_factory=list)
     fields_collected: Optional[Dict[str, Any]] = None
