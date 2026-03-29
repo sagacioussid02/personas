@@ -2033,7 +2033,7 @@ async def deepen_message(
             "message": fallback_message,
             "field_updates": {},
             "topics_covered": covered,
-            "done": False,
+            "done": done_fallback,
         }
     except Exception as exc:
         print(f"Unexpected error in /twin/{{twin_id}}/deepen/message: {exc}")
