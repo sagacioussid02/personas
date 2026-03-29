@@ -268,7 +268,7 @@ function TwinChat() {
                           <p className={`text-xs ${message.role === 'user' ? 'text-slate-300' : 'text-gray-400'}`}>
                             {message.timestamp.toLocaleTimeString()}
                           </p>
-                          {message.role === 'assistant' && isSignedIn && !isCorrectingThis && !isSaved && !isError && (
+                          {message.role === 'assistant' && isSignedIn && !!prevUserMsg && !isCorrectingThis && !isSaved && !isError && (
                             <button
                               onClick={() => setCorrecting({ messageId: message.id, text: '' })}
                               className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 ml-2 flex-shrink-0"
