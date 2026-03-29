@@ -43,6 +43,7 @@ function TwinChat() {
   // Correction state: which message is being corrected and user's text
   const [correcting, setCorrecting] = useState<{ messageId: string; text: string } | null>(null);
   const [correctionSaved, setCorrectionSaved] = useState<string | null>(null); // messageId of last saved
+  const [correctionError, setCorrectionError] = useState<string | null>(null); // messageId of last failed save
 
   useEffect(() => {
     if (!id) { setProfileError('No twin ID provided.'); return; }
@@ -59,6 +60,8 @@ function TwinChat() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const CORRECTION_MAX_LEN = 500;
+
   const submitCorrection = async (question: string, wrongResponse: string) => {
     if (!correcting?.text.trim() || !id || !isSignedIn) return;
     const token = await getToken();
@@ -69,16 +72,18 @@ function TwinChat() {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
-          question,
-          wrong_response: wrongResponse,
-          correction: correcting.text.trim(),
+          question: question.slice(0, CORRECTION_MAX_LEN),
+          wrong_response: wrongResponse.slice(0, CORRECTION_MAX_LEN),
+          correction: correcting.text.trim().slice(0, CORRECTION_MAX_LEN),
         }),
       });
       if (!res.ok) throw new Error('save failed');
       setCorrectionSaved(savedId);
+      setCorrectionError(null);
       setTimeout(() => setCorrectionSaved(null), 3000);
     } catch {
-      // silently fail — not critical path
+      setCorrectionError(savedId);
+      setTimeout(() => setCorrectionError(null), 4000);
     } finally {
       setCorrecting(null);
     }
@@ -247,6 +252,7 @@ function TwinChat() {
                   : null;
                 const isCorrectingThis = correcting?.messageId === message.id;
                 const isSaved = correctionSaved === message.id;
+                const isError = correctionError === message.id;
 
                 return (
                   <div key={message.id} className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}>
@@ -262,7 +268,7 @@ function TwinChat() {
                           <p className={`text-xs ${message.role === 'user' ? 'text-slate-300' : 'text-gray-400'}`}>
                             {message.timestamp.toLocaleTimeString()}
                           </p>
-                          {message.role === 'assistant' && isSignedIn && !isCorrectingThis && !isSaved && (
+                          {message.role === 'assistant' && isSignedIn && !isCorrectingThis && !isSaved && !isError && (
                             <button
                               onClick={() => setCorrecting({ messageId: message.id, text: '' })}
                               className="opacity-0 group-hover:opacity-100 transition-opacity text-gray-300 hover:text-red-400 ml-2 flex-shrink-0"
@@ -275,6 +281,11 @@ function TwinChat() {
                           {isSaved && (
                             <span className="flex items-center gap-1 text-xs text-green-600 ml-2">
                               <Check className="w-3 h-3" /> Saved
+                            </span>
+                          )}
+                          {isError && (
+                            <span className="flex items-center gap-1 text-xs text-red-500 ml-2">
+                              Could not save correction
                             </span>
                           )}
                         </div>
