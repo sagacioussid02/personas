@@ -11,6 +11,7 @@ interface PublicPersona {
   title: string;
   tagline: string;
   era: string;
+  image_url?: string;
   chat_url: string;
 }
 
@@ -76,9 +77,9 @@ function StreamingTagline() {
   }, [taglineIndex, taglines]);
 
   return (
-    <span className="inline-block font-semibold text-lg">
-      {isLoading ? '✨ Loading...' : displayText}
-      <span className="animate-pulse">|</span>
+    <span className="inline-block font-semibold text-base text-gray-500">
+      {isLoading ? '' : displayText}
+      <span className="animate-pulse text-purple-400">|</span>
     </span>
   );
 }
@@ -109,7 +110,7 @@ export default function Home() {
         <div className="flex items-center gap-3">
           {isSignedIn ? (
             <>
-              <Link href="/dashboard" className="text-sm text-purple-600 hover:text-purple-800 font-medium">Dashboard</Link>
+              <Link href="/dashboard" className="text-sm bg-purple-600 hover:bg-purple-700 text-white px-4 py-1.5 rounded-lg font-medium transition-colors">Dashboard</Link>
               <UserButton />
             </>
           ) : (
@@ -124,13 +125,13 @@ export default function Home() {
       <div className="container mx-auto px-4 py-8">
         <div className="max-w-4xl mx-auto">
           <h1 className="text-4xl font-bold text-center text-gray-800 mb-2">
-            Sidd&apos;s AI Twin
+            What would Sidd do?
           </h1>
-          <div className="text-center text-gray-600 mb-8 h-6">
+          <div className="text-center mb-6 h-7">
             <StreamingTagline />
           </div>
 
-          <div className="h-[600px]">
+          <div className="h-[420px]">
             <Twin />
           </div>
 
@@ -148,8 +149,12 @@ export default function Home() {
                     className="group bg-white rounded-xl border border-gray-200 p-5 flex flex-col gap-2 hover:border-purple-300 hover:shadow-sm transition-all"
                   >
                     <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-full bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center text-white font-bold text-sm shrink-0">
-                        {p.name.split(' ').map(n => n[0]).join('').slice(0, 2)}
+                      <div className="w-12 h-12 rounded-full overflow-hidden bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center text-white font-bold text-sm shrink-0 border border-gray-100">
+                        {p.image_url ? (
+                          <img src={p.image_url} alt={p.name} className="w-full h-full object-cover" />
+                        ) : (
+                          p.name.split(' ').map(n => n[0]).join('').slice(0, 2)
+                        )}
                       </div>
                       <div className="min-w-0">
                         <p className="font-semibold text-gray-900 text-sm">{p.name}</p>

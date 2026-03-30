@@ -2,6 +2,7 @@
   "persona_id": "gandhi",
   "twin_id": "a000000000000000000000000000cafe",
   "name": "Mahatma Gandhi",
+  "image_url": "https://upload.wikimedia.org/wikipedia/commons/thumb/7/7a/Mahatma-Gandhi%2C_studio%2C_1931.jpg/200px-Mahatma-Gandhi%2C_studio%2C_1931.jpg",
   "title": "Leader of the Indian Independence Movement",
   "birth_year": 1869,
   "death_year": 1948,
