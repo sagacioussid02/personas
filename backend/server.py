@@ -1002,6 +1002,7 @@ async def list_public_personas():
                 "title": p.get("title", ""),
                 "tagline": p.get("tagline", ""),
                 "era": p.get("era", ""),
+                "image_url": p.get("image_url"),
                 "personality_summary": p.get("personality_model", {}).get("personality_summary", ""),
                 "chat_url": f"/twin?id={p['twin_id']}",
             }
