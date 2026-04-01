@@ -1,8 +1,8 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import { Send, User } from 'lucide-react';
-import Image from 'next/image';
 
 interface Message {
     id: string;
@@ -11,13 +11,10 @@ interface Message {
     timestamp: Date;
 }
 
-interface TwinProps {
-    isSignedIn?: boolean;
-}
-
 const AVATAR_URL = 'https://i.pravatar.cc/150?img=12&u=sidd';
 
-export default function Twin({ isSignedIn = false }: TwinProps) {
+export default function Twin() {
+    const { isSignedIn, getToken } = useAuth();
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
@@ -50,11 +47,13 @@ export default function Twin({ isSignedIn = false }: TwinProps) {
         setIsLoading(true);
 
         try {
+            const token = isSignedIn ? await getToken() : null;
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+
             const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/chat`, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
+                headers,
                 body: JSON.stringify({
                     message: input,
                     session_id: sessionId || undefined,
