@@ -18,6 +18,9 @@ export default function Twin() {
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [sessionId, setSessionId] = useState<string>('');
+    const MAX_ANON_EXCHANGES = 5;
+    const userMessageCount = messages.filter(m => m.role === 'user').length;
+    const limitReached = userMessageCount >= MAX_ANON_EXCHANGES;
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {
@@ -179,27 +182,48 @@ export default function Twin() {
                 <div ref={messagesEndRef} />
             </div>
 
-            {/* Input */}
-            <div className="border-t border-gray-200 p-4 bg-white rounded-b-lg">
-                <div className="flex gap-2">
-                    <input
-                        type="text"
-                        value={input}
-                        onChange={(e) => setInput(e.target.value)}
-                        onKeyDown={handleKeyPress}
-                        placeholder="Type your message..."
-                        className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-600 focus:border-transparent text-gray-800"
-                        disabled={isLoading}
-                    />
-                    <button
-                        onClick={sendMessage}
-                        disabled={!input.trim() || isLoading}
-                        className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                        <Send className="w-5 h-5" />
-                    </button>
+            {/* Input / sign-in wall */}
+            {limitReached ? (
+                <div className="border-t border-gray-200 p-5 bg-purple-50 rounded-b-lg text-center">
+                    <p className="text-sm font-semibold text-purple-800 mb-1">Want to keep chatting?</p>
+                    <p className="text-xs text-gray-500 mb-3">Sign up free to continue — no credit card needed.</p>
+                    <div className="flex gap-2 justify-center">
+                        <a href="/sign-up" className="px-4 py-1.5 bg-purple-600 text-white text-sm font-medium rounded-lg hover:bg-purple-700 transition-colors">
+                            Sign up free
+                        </a>
+                        <a href="/sign-in" className="px-4 py-1.5 border border-gray-300 text-gray-600 text-sm rounded-lg hover:bg-gray-50 transition-colors">
+                            Sign in
+                        </a>
+                    </div>
                 </div>
-            </div>
+            ) : (
+                <div className="border-t border-gray-200 p-4 bg-white rounded-b-lg">
+                    <div className="flex gap-2">
+                        <div className="flex-1 relative">
+                            <input
+                                type="text"
+                                value={input}
+                                onChange={(e) => setInput(e.target.value)}
+                                onKeyDown={handleKeyPress}
+                                placeholder="Type your message…"
+                                maxLength={100}
+                                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-600 focus:border-transparent text-gray-800"
+                                disabled={isLoading}
+                            />
+                            {input.length > 80 && (
+                                <span className="absolute right-3 bottom-2 text-xs text-gray-400">{input.length}/100</span>
+                            )}
+                        </div>
+                        <button
+                            onClick={sendMessage}
+                            disabled={!input.trim() || isLoading}
+                            className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                            <Send className="w-5 h-5" />
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
