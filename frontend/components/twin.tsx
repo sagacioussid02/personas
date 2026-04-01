@@ -11,16 +11,20 @@ interface Message {
     timestamp: Date;
 }
 
+interface TwinProps {
+    isSignedIn?: boolean;
+}
+
 const AVATAR_URL = 'https://i.pravatar.cc/150?img=12&u=sidd';
 
-export default function Twin() {
+export default function Twin({ isSignedIn = false }: TwinProps) {
     const [messages, setMessages] = useState<Message[]>([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [sessionId, setSessionId] = useState<string>('');
     const MAX_ANON_EXCHANGES = 5;
     const userMessageCount = messages.filter(m => m.role === 'user').length;
-    const limitReached = userMessageCount >= MAX_ANON_EXCHANGES;
+    const limitReached = !isSignedIn && userMessageCount >= MAX_ANON_EXCHANGES;
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const scrollToBottom = () => {

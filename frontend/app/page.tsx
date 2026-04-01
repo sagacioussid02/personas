@@ -132,7 +132,7 @@ export default function Home() {
           </div>
 
           <div className="h-[420px]">
-            <Twin />
+            <Twin isSignedIn={!!isSignedIn} />
           </div>
 
           {/* Famous personas */}
