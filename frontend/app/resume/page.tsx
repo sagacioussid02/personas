@@ -237,7 +237,7 @@ function ResumeBuilder() {
       const name = (fieldsCollected.name || 'resume').replace(/\s+/g, '_');
       a.download = `${name}_resume.docx`;
       a.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
       setGenerated(true);
     } catch {
       alert('Resume generation failed. Please try again.');
