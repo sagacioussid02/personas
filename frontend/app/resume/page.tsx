@@ -78,14 +78,9 @@ function ResumeBuilder() {
         if (!data) return;
         setTwinName(data.name || '');
         const pre: Record<string, string> = {};
-        const autoTopics: string[] = [];
         if (data.name) pre.name = data.name;
         if (data.title) pre.title = data.title;
-        if (data.skills) { pre.tech_stack = data.skills; autoTopics.push('TECH_STACK'); }
-        if (data.experience) { pre.career_history = data.experience; autoTopics.push('CAREER_HISTORY'); }
-        if (data.achievements) { pre.accomplishments = data.achievements; autoTopics.push('ACCOMPLISHMENTS'); }
         setFieldsCollected(pre);
-        setTopicsCovered(autoTopics);
       })
       .catch(() => {});
   }, [twin_id, isSignedIn]);
@@ -322,7 +317,7 @@ function ResumeBuilder() {
               {twinName && (
                 <div className="flex items-center gap-2 text-sm text-emerald-700 bg-emerald-50 border border-emerald-100 px-4 py-2.5 rounded-lg">
                   <Sparkles className="w-4 h-4 shrink-0" />
-                  Using <strong>{twinName}&apos;s</strong> data as a head start — some questions will be skipped.
+                  Using <strong>{twinName}&apos;s</strong> data as a head start.
                 </div>
               )}
 
@@ -330,8 +325,10 @@ function ResumeBuilder() {
                 <p className="text-sm font-medium text-gray-700">Optional: upload files to save time</p>
 
                 {/* LinkedIn upload */}
-                <div
-                  className="flex items-center justify-between border border-dashed border-gray-300 rounded-lg px-4 py-3 cursor-pointer hover:border-purple-400 hover:bg-purple-50 transition-colors"
+                <button
+                  type="button"
+                  aria-label="Upload LinkedIn PDF"
+                  className="w-full flex items-center justify-between border border-dashed border-gray-300 rounded-lg px-4 py-3 cursor-pointer hover:border-purple-400 hover:bg-purple-50 transition-colors"
                   onClick={() => linkedinRef.current?.click()}
                 >
                   <div className="flex items-center gap-3">
@@ -348,12 +345,14 @@ function ResumeBuilder() {
                   ) : (
                     <span className="text-xs text-gray-400">PDF only</span>
                   )}
-                </div>
+                </button>
                 <input ref={linkedinRef} type="file" accept=".pdf" className="hidden" onChange={handleLinkedinUpload} />
 
                 {/* JD upload */}
-                <div
-                  className="flex items-center justify-between border border-dashed border-gray-300 rounded-lg px-4 py-3 cursor-pointer hover:border-teal-400 hover:bg-teal-50 transition-colors"
+                <button
+                  type="button"
+                  aria-label="Upload job description PDF"
+                  className="w-full flex items-center justify-between border border-dashed border-gray-300 rounded-lg px-4 py-3 cursor-pointer hover:border-teal-400 hover:bg-teal-50 transition-colors"
                   onClick={() => jdRef.current?.click()}
                 >
                   <div className="flex items-center gap-3">
@@ -370,7 +369,7 @@ function ResumeBuilder() {
                   ) : (
                     <span className="text-xs text-gray-400">PDF only</span>
                   )}
-                </div>
+                </button>
                 <input ref={jdRef} type="file" accept=".pdf" className="hidden" onChange={handleJdUpload} />
                 {jdUploadError && (
                   <p className="text-xs text-red-600">{jdUploadError}</p>
@@ -457,6 +456,7 @@ function ResumeBuilder() {
                       disabled={sending}
                     />
                     <button
+                      aria-label="Send message"
                       onClick={handleSend}
                       disabled={!input.trim() || sending}
                       className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"

@@ -22,6 +22,7 @@ import hmac
 import hashlib
 import httpx
 import jwt
+from urllib.parse import quote
 from context import prompt
 from personality_agent import detect_archetype, get_archetype, get_all_archetypes, review_response
 
@@ -2858,13 +2859,17 @@ async def resume_generate(
         print(f"Error building resume docx: {exc}")
         raise HTTPException(status_code=500, detail="Failed to format resume document")
 
-    candidate_name = resume_data["contact"].get("name", "resume").replace(" ", "_")
-    filename = f"{candidate_name}_resume.docx"
+    raw_candidate_name = str(resume_data["contact"].get("name") or "resume")
+    safe_candidate_name = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_candidate_name).strip("._-")
+    if not safe_candidate_name:
+        safe_candidate_name = "resume"
+    filename = f"{safe_candidate_name}_resume.docx"
+    filename_star = quote(filename, safe="")
 
     return StreamingResponse(
         io.BytesIO(doc_bytes),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
+        headers={"Content-Disposition": f"attachment; filename=\"{filename}\"; filename*=UTF-8''{filename_star}"},
     )
 
 
