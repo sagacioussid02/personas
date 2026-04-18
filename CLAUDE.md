@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Frontend
 ```bash
 cd frontend
+cp .env.local.example .env.local   # Fill in NEXT_PUBLIC_API_URL and NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
 npm run dev        # Start dev server on localhost:3000
 npm run build      # Production build (static export to out/)
 npm run lint       # ESLint
@@ -22,8 +23,10 @@ npm run lint       # ESLint
 ### Backend
 ```bash
 cd backend
-uvicorn server:app --reload --host 0.0.0.0 --port 8000  # Dev server
+cp .env.example .env          # Fill in CLERK_JWKS_URL and SESSION_HMAC_SECRET at minimum
+uvicorn server:app --reload --host 0.0.0.0 --port 8000  # Dev server (API docs at /docs)
 python deploy.py   # Build Lambda deployment package (lambda-deployment.zip)
+# Generate SESSION_HMAC_SECRET: python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
 ### Infrastructure
@@ -44,9 +47,12 @@ Browser → CloudFront → API Gateway → Lambda (FastAPI/Mangum) → Bedrock +
 
 ### Key Files
 - `backend/server.py` — All API endpoints (~2200 lines), auth logic, session management
-- `backend/context.py` — System prompt construction for Bedrock calls
-- `backend/personality_agent.py` — Archetype detection and personality synthesis
+- `backend/lambda_handler.py` — Mangum wrapper that adapts FastAPI for Lambda
+- `backend/context.py` — System prompt construction for Bedrock calls; redacts PII from injected text
+- `backend/personality_agent.py` — Archetype detection and optional per-response tone review
 - `backend/resources.py` — Loads default twin data from `backend/data/`
+- `backend/public_personas/` — Static JSON files for built-in public personas; served without auth
+- `backend/personalities/archetypes.json` — Role archetypes used to nudge twin tone (e.g. "engineer", "executive")
 - `frontend/app/` — Next.js App Router pages
 - `frontend/components/twin.tsx` — Unauthenticated chat component
 - `frontend/components/twin-chat.tsx` — Authenticated chat for user-created twins
@@ -61,6 +67,11 @@ Browser → CloudFront → API Gateway → Lambda (FastAPI/Mangum) → Bedrock +
 - **Anonymous users:** UUID (supplied by client or generated)
 - **Authenticated users:** HMAC-SHA256(`user_id:twin_id`, `SESSION_HMAC_SECRET`) — opaque 64-char hex, stable across devices, prevents session hijacking
 - Valid formats enforced by regex: UUID v4 or `[0-9a-f]{64}`
+- Session records are stored as `{messages: [...], chatter_id: "..."}` (new format) or a bare `[...]` list (legacy); both are handled on read
+
+### Twin IDs
+- User-created twins use 32-char hex (`[a-f0-9]{32}`) — not UUID v4
+- Public personas use stable hard-coded IDs defined in `backend/public_personas/*.json`
 
 ### Data Layout (S3 or local filesystem)
 ```
@@ -71,8 +82,9 @@ sessions/{session_id}.json       # Conversation history
 
 ### Bedrock Integration
 - Default model: `global.amazon.nova-2-lite-v1:0`
-- Called via `boto3` `bedrock-runtime` client in `us-east-2`
+- Called via `boto3` `bedrock-runtime` client; region defaults to `us-east-1` (override via `DEFAULT_AWS_REGION`)
 - `USE_S3=false` uses local filesystem; `USE_S3=true` uses S3
+- `openai` is listed in dependencies but all LLM calls go through Bedrock — the package is vestigial
 
 ### Dependency Management
 `backend/requirements.txt` and `backend/pyproject.toml` must stay in sync — Lambda packaging uses `requirements.txt` but local dev uses `pyproject.toml` (uv).
@@ -92,7 +104,10 @@ sessions/{session_id}.json       # Conversation history
 | `USE_S3` | `true` = S3 storage, `false` = local filesystem |
 | `S3_BUCKET` | Bucket name for twins/sessions |
 | `BEDROCK_MODEL_ID` | Override default LLM |
+| `DEFAULT_AWS_REGION` | AWS region for Bedrock client (default: `us-east-1`) |
 | `CORS_ORIGINS` | Comma-separated allowed origins |
+| `PERSONALITY_REVIEW_ENABLED` | `true` enables per-response archetype tone review (off by default; adds latency) |
+| `MEMORY_DIR` | Local sessions directory when `USE_S3=false` (default: `../memory`) |
 
 **Frontend:**
 | Variable | Purpose |

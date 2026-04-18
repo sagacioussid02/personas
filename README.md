@@ -10,10 +10,10 @@ Think of it as a second brain that doesn't get tired, doesn't have meetings, and
 
 ## What it actually does
 
-1. **Chat with Sidd's twin** — try it on the homepage, no account needed (5 questions before we ask you to commit)
+1. **Chat with Sidd's twin** — try it on the homepage, no account needed (2 questions before we ask you to commit)
 2. **Create your own persona** — walk through a guided interview, optionally upload your LinkedIn PDF, and get an AI twin that reasons the way you do
 3. **Deepen it** — a follow-up interview digs into past decisions, non-negotiables, and times you changed your mind. This is the stuff that makes the difference between "generic chatbot" and "uncanny valley"
-4. **Chat with historical figures** — Gandhi and Charlie Chaplin are available. More coming. They're shockingly opinionated.
+4. **Chat with historical figures** — public personas are available, with more being added over time. They're shockingly opinionated.
 
 ---
 
@@ -72,7 +72,7 @@ Everything else has sensible defaults for local development.
 Browser
   │
   ├── Static frontend (Next.js)
-  │     Vercel in prod, localhost:3000 locally
+  │     S3 + CloudFront in prod, localhost:3000 locally
   │
   └── API calls ──► FastAPI (Python)
                       Lambda in prod, uvicorn locally
@@ -102,7 +102,7 @@ Browser
 │   ├── personality_agent.py  # Archetype detection
 │   ├── resources.py       # Loads the default twin's data files
 │   ├── data/              # Sidd's actual profile data (bio, skills, etc.)
-│   └── public_personas/   # Gandhi, Chaplin — loaded at startup
+│   └── public_personas/   # Public persona JSON files loaded at startup
 │
 ├── frontend/
 │   ├── app/               # Next.js App Router pages
@@ -122,9 +122,9 @@ Browser
 
 ## Deploying
 
-Push to `main`. GitHub Actions handles the rest — builds the Lambda package, runs Terraform, deploys the frontend to Vercel. See `.github/workflows/deploy.yml` if you want to know exactly what's happening (or what broke).
+Push to `main`. GitHub Actions handles the rest — builds the Lambda package, runs Terraform, and deploys the frontend to the AWS-hosted static site stack managed in this repo (S3 + CloudFront). See `.github/workflows/deploy.yml` if you want to know exactly what's happening (or what broke).
 
-The infra lives in AWS (Lambda + API Gateway + S3) with Vercel for the frontend. Terraform state is in S3 with a DynamoDB lock table, because losing infra state is the kind of thing that ruins Tuesdays.
+The infra lives in AWS (Lambda + API Gateway + S3 + CloudFront). Terraform state is in S3 with a DynamoDB lock table, because losing infra state is the kind of thing that ruins Tuesdays.
 
 ---
 
@@ -132,7 +132,7 @@ The infra lives in AWS (Lambda + API Gateway + S3) with Vercel for the frontend.
 
 This started as "what if my resume could talk back" and evolved into something more interesting: a platform for capturing how people actually reason, not just what they've done. Resumes list accomplishments. This tries to capture the mental model behind them.
 
-The historical personas (Gandhi, Chaplin) exist to prove the concept works for public figures — and because having Gandhi explain nonviolent resistance to you directly is genuinely a different experience than reading a Wikipedia summary.
+The historical personas (like Gandhi, Charlie Chaplin, and Buffett) exist to prove the concept works for public figures — and because having Gandhi explain nonviolent resistance to you directly is genuinely a different experience than reading a Wikipedia summary.
 
 ---
 
