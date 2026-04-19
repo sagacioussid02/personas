@@ -785,7 +785,7 @@ async def chat(
                     ),
                     timeout=3.0,
                 )
-            except (asyncio.TimeoutError, Exception):
+            except Exception:
                 pass
 
         orchestration = run_chat_orchestration(
