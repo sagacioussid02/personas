@@ -48,8 +48,8 @@ export default function PersonaAvatar({
       palette: PALETTES[hash % PALETTES.length],
       rotate: (hash % 18) - 9,
       bubbleA: 18 + (hash % 30),
-      bubbleB: 12 + ((hash >> 3) % 22),
-      waveOffset: 18 + ((hash >> 5) % 28),
+      bubbleB: 12 + ((hash >>> 3) % 22),
+      waveOffset: 18 + ((hash >>> 5) % 28),
     };
   }, [name, seed]);
 
