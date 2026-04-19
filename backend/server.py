@@ -768,11 +768,18 @@ async def chat(
             normalized_sources = _normalize_source_ids(ensure_sources(twin_data))
             twin_data["sources"] = normalized_sources
 
-        # Fire-and-forget email if user asks to connect with the creator
+        # Attempt the email notification with a short timeout so Lambda does not
+        # drop it when the request finishes, while keeping chat latency bounded.
         if _CONNECT_RE.search(request.message):
-            asyncio.create_task(_notify_connect_intent(
-                request.message, session_id, twin_name or "Sidd"
-            ))
+            try:
+                await asyncio.wait_for(
+                    _notify_connect_intent(
+                        request.message, session_id, twin_name or "Sidd"
+                    ),
+                    timeout=1.0,
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
 
         viewer_is_authenticated = chatter_id is not None
         orchestration = run_chat_orchestration(
