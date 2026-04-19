@@ -100,8 +100,16 @@ _ADMIN_EMAILS = [e.strip() for e in os.getenv("ADMIN_EMAILS", "").split(",") if 
 _ses_client = boto3.client("ses", region_name=os.getenv("DEFAULT_AWS_REGION", "us-east-1")) if _SES_FROM_EMAIL else None
 
 _CONNECT_RE = re.compile(
-    r'\b(connect|reach|contact|talk|speak|meet|email|message)\b.{0,50}'
-    r'\b(creator|owner|builder|maker|sidd|siddharth|you)\b',
+    r'\b('
+    r'(give|send|leave|share)\s+feedback\s+to\s+(you|us|sidd|the\s+creator|the\s+owner)|'
+    r'feedback\s+for\s+(you|your\s+team|this\s+app|the\s+site)|'
+    r'contact\s+(you|us|sidd|the\s+creator|the\s+owner)|'
+    r'reach\s+out|get\s+in\s+touch|'
+    r'how\s+(do\s+i|can\s+i|to)\s+(contact|reach|connect)|'
+    r'how\s+(do\s+i|can\s+i|to)\s+(send|give|share|leave)\s+feedback\s+to\s+(you|us|sidd|the\s+creator|the\s+owner)|'
+    r'connect\s+with\s+(you|sidd|the\s+creator)|'
+    r'talk\s+to\s+(you|sidd|the\s+real)'
+    r')\b',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -768,20 +776,24 @@ async def chat(
             normalized_sources = _normalize_source_ids(ensure_sources(twin_data))
             twin_data["sources"] = normalized_sources
 
-        # Attempt the email notification with a short timeout so Lambda does not
-        # drop it when the request finishes, while keeping chat latency bounded.
-        if _CONNECT_RE.search(request.message):
+        viewer_is_authenticated = chatter_id is not None
+
+        # Notify admin when a signed-in user asks to give feedback / contact the creator.
+        if viewer_is_authenticated and _CONNECT_RE.search(request.message):
+            notify_message = (
+                f"{request.message}\n\n"
+                f"Authenticated chatter_id: {chatter_id}"
+            )
             try:
                 await asyncio.wait_for(
                     _notify_connect_intent(
-                        request.message, session_id, twin_name or "Sidd"
+                        notify_message, session_id, twin_name or "Sidd"
                     ),
-                    timeout=1.0,
+                    timeout=3.0,
                 )
-            except (asyncio.TimeoutError, Exception):
+            except Exception:
                 pass
 
-        viewer_is_authenticated = chatter_id is not None
         orchestration = run_chat_orchestration(
             twin_data=twin_data,
             sources=normalized_sources,
