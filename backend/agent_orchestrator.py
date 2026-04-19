@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from agents.critic_agent import review_grounded_answer
-from agents.router_agent import route_message
+try:
+    from critic_agent import review_grounded_answer
+    from router_agent import route_message
+except ModuleNotFoundError:
+    from agents.critic_agent import review_grounded_answer
+    from agents.router_agent import route_message
 from agents.twin_response_agent import generate_twin_response
 from source_memory import ensure_sources, retrieve_relevant_sources
 
