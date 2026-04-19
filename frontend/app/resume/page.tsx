@@ -317,7 +317,7 @@ function ResumeBuilder() {
               {twinName && (
                 <div className="flex items-center gap-2 text-sm text-emerald-700 bg-emerald-50 border border-emerald-100 px-4 py-2.5 rounded-lg">
                   <Sparkles className="w-4 h-4 shrink-0" />
-                  Using <strong>{twinName}&apos;s</strong> data as a head start.
+                  Using <strong>{twinName}&apos;s</strong> data as a head start — your name and title are pre-filled.
                 </div>
               )}
 

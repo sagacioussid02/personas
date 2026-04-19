@@ -2861,10 +2861,11 @@ async def resume_generate(
 
     raw_candidate_name = str(resume_data["contact"].get("name") or "resume")
     safe_candidate_name = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_candidate_name).strip("._-")
+    safe_candidate_name = re.sub(r"_+", "_", safe_candidate_name)
     if not safe_candidate_name:
         safe_candidate_name = "resume"
     filename = f"{safe_candidate_name}_resume.docx"
-    filename_star = quote(filename, safe="")
+    filename_star = f"{quote(safe_candidate_name, safe='')}_resume.docx"
 
     return StreamingResponse(
         io.BytesIO(doc_bytes),
