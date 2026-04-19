@@ -5,8 +5,11 @@ from typing import Any, Dict, List
 from source_memory import classify_query
 
 
-def route_message(user_message: str, conversation: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
-    """Classify a user request and annotate routing flags for downstream agents."""
+def route_message(user_message: str, _conversation: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    """Classify a user request and annotate routing flags for downstream agents.
+
+    Conversation context is accepted for future routing logic but is not currently used.
+    """
     query_type = classify_query(user_message)
     lowered = user_message.lower()
 
