@@ -19,7 +19,7 @@ interface PublicPersona {
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 function PersonasLogo({ className = 'w-7 h-7' }: { className?: string }) {
-  return <img src="/personas-logo.svg" alt="Personas logo" className={className} />;
+  return <img src="/personas-logo.svg" alt="" aria-hidden="true" className={className} />;
 }
 
 function StreamingTagline() {
