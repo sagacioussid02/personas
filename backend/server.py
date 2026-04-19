@@ -23,18 +23,16 @@ import hashlib
 import httpx
 import jwt
 from urllib.parse import quote
+from agent_orchestrator import run_chat_orchestration
 from context import prompt
 from personality_agent import detect_archetype, get_archetype, get_all_archetypes, review_response
 from source_memory import (
     build_correction_source,
     build_deepen_sources,
-    build_grounding_summary,
     build_initial_sources,
-    classify_query,
     ensure_sources,
     format_retrieved_sources,
     merge_sources,
-    retrieve_relevant_sources,
 )
 
 # Load environment variables
@@ -812,24 +810,20 @@ async def chat(
             response_style = personality_model.get("_context", {}).get("responseStyle", response_style)
 
         corrections = twin_data.get("corrections") if twin_data else None
-        query_type = classify_query(request.message)
-        sources = ensure_sources(twin_data) if twin_data else []
         if twin_data:
-            sources = _normalize_source_ids(sources)
-            twin_data["sources"] = sources
-        retrieved_sources = retrieve_relevant_sources(request.message, sources) if twin_data else []
-        grounding_summary = build_grounding_summary(query_type, retrieved_sources) if twin_data else None
-        assistant_response = call_bedrock(
-            conversation,
-            request.message,
-            personality_model,
-            twin_name,
-            twin_title,
-            response_style,
+            twin_data["sources"] = _normalize_source_ids(ensure_sources(twin_data))
+        orchestration = run_chat_orchestration(
+            twin_data=twin_data,
+            user_message=request.message,
+            conversation=conversation,
+            responder=call_bedrock,
+            personality_model=personality_model,
+            twin_name=twin_name,
+            twin_title=twin_title,
+            response_style=response_style,
             corrections=corrections,
-            retrieved_sources=retrieved_sources,
-            query_type=query_type,
         )
+        assistant_response = orchestration["answer"]
 
         # Personality review step (gated — enable via PERSONALITY_REVIEW_ENABLED=true)
         if PERSONALITY_REVIEW_ENABLED:
@@ -870,12 +864,12 @@ async def chat(
             response=assistant_response,
             session_id=session_id,
             grounding=(
-                ChatGrounding(**grounding_summary)
-                if can_view_source_details and grounding_summary
+                ChatGrounding(**orchestration["grounding"])
+                if can_view_source_details and orchestration["grounding"]
                 else None
             ),
             sources=(
-                [ChatSource(**source) for source in retrieved_sources]
+                [ChatSource(**source) for source in orchestration["retrieved_sources"]]
                 if can_view_source_details
                 else []
             ),
