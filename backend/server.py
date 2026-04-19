@@ -2709,9 +2709,10 @@ async def resume_message(
         done_msg = "Perfect — I have enough to generate your resume now."
         cont_msg = "Got it — let me keep going. Could you tell me a bit more?"
 
-        fallback_done = set(_ALL_RESUME_TOPICS).issubset(set(covered))
+        covered_set = set(covered)
+        fallback_done = set(_ALL_RESUME_TOPICS).issubset(covered_set)
         fallback_message = raw if "raw" in locals() else cont_msg
-        merged_fallback_topics = set(covered)
+        merged_fallback_topics = set(covered_set)
 
         if "raw" in locals():
             try:
@@ -2725,8 +2726,8 @@ async def resume_message(
                     parsed_message = parsed.get("message")
                     if isinstance(parsed_message, str) and parsed_message.strip():
                         fallback_message = parsed_message.strip()
-            except (ValueError, json.JSONDecodeError):
-                pass
+            except (ValueError, json.JSONDecodeError) as parse_exc:
+                print(f"Resume interview fallback JSON parse error: {parse_exc!r}")
 
             if raw.strip().startswith("{") or raw.strip().startswith("```"):
                 if fallback_message == raw:
