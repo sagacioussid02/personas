@@ -282,8 +282,9 @@ def retrieve_relevant_sources(message: str, sources: List[Dict[str, Any]], limit
     if not query_tokens:
         return []
 
-    scored: List[Dict[str, Any]] = []
+    best_by_source: Dict[Any, Dict[str, Any]] = {}
     for source in sources:
+        source_id = source.get("source_id")
         for chunk in source.get("chunks", []):
             chunk_text = _normalize_text(chunk.get("text"))
             if not chunk_text:
@@ -297,19 +298,22 @@ def retrieve_relevant_sources(message: str, sources: List[Dict[str, Any]], limit
                 score += 2
             if source.get("confidence") == "high":
                 score += 1
-            scored.append(
-                {
-                    "source_id": source.get("source_id"),
-                    "source_type": source.get("source_type"),
-                    "title": source.get("title"),
-                    "snippet": chunk_text[:320],
-                    "confidence": source.get("confidence", "medium"),
-                    "tags": source.get("tags", []),
-                    "score": score,
-                    "matched_terms": sorted(overlap)[:6],
-                }
-            )
 
+            candidate = {
+                "source_id": source_id,
+                "source_type": source.get("source_type"),
+                "title": source.get("title"),
+                "snippet": chunk_text[:320],
+                "confidence": source.get("confidence", "medium"),
+                "tags": source.get("tags", []),
+                "score": score,
+                "matched_terms": sorted(overlap)[:6],
+            }
+            current_best = best_by_source.get(source_id)
+            if current_best is None or score > int(current_best["score"]):
+                best_by_source[source_id] = candidate
+
+    scored = list(best_by_source.values())
     scored.sort(key=lambda item: (-int(item["score"]), str(item["title"])))
     return scored[:limit]
 
