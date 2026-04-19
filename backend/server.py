@@ -2706,11 +2706,35 @@ async def resume_message(
 
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"Resume interview JSON parse error: {exc!r}")
+        done_msg = "Perfect — I have enough to generate your resume now."
+        cont_msg = "Got it — let me keep going. Could you tell me a bit more?"
+
+        fallback_done = False
+        fallback_message = raw if "raw" in locals() else cont_msg
+
+        if "raw" in locals():
+            if raw.strip().startswith("{") or raw.strip().startswith("```"):
+                fallback_message = cont_msg
+            else:
+                last_brace = raw.rfind('{')
+                if last_brace > len(raw) // 2:
+                    try:
+                        fragment = json.loads(raw[last_brace:])
+                        if isinstance(fragment, dict) and "done" in fragment:
+                            if fragment.get("done") is True:
+                                fallback_done = True
+                            fallback_message = raw[:last_brace].strip()
+                    except json.JSONDecodeError:
+                        pass
+                if not fallback_message:
+                    fallback_message = done_msg if fallback_done else cont_msg
+
+        fallback_topics = list(_ALL_RESUME_TOPICS) if fallback_done else covered
         return {
-            "message": "Got it — let me keep going. Could you tell me a bit more?",
+            "message": fallback_message,
             "field_updates": {},
-            "topics_covered": covered,
-            "done": False,
+            "topics_covered": fallback_topics,
+            "done": fallback_done,
         }
     except Exception as exc:
         print(f"Unexpected error in /resume/message: {exc}")
