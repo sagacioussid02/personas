@@ -101,12 +101,12 @@ _ses_client = boto3.client("ses", region_name=os.getenv("DEFAULT_AWS_REGION", "u
 
 _CONNECT_RE = re.compile(
     r'\b('
-    r'(give|send|leave|share)\s+feedback\s+to\s+(you|us|sidd|the\s+creator|the\s+owner)|'
+    r'(give|send|leave|share)(?!\s+me\b)(\s+\w+){0,3}\s+feedback|'
     r'feedback\s+for\s+(you|your\s+team|this\s+app|the\s+site)|'
     r'contact\s+(you|us|sidd|the\s+creator|the\s+owner)|'
     r'reach\s+out|get\s+in\s+touch|'
     r'how\s+(do\s+i|can\s+i|to)\s+(contact|reach|connect)|'
-    r'how\s+(do\s+i|can\s+i|to)\s+(send|give|share|leave)\s+feedback\s+to\s+(you|us|sidd|the\s+creator|the\s+owner)|'
+    r'how\s+(do\s+i|can\s+i|to)\s+(send|give|share|leave)(\s+\w+){0,3}\s+feedback|'
     r'connect\s+with\s+(you|sidd|the\s+creator)|'
     r'talk\s+to\s+(you|sidd|the\s+real)'
     r')\b',
