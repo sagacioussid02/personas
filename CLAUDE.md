@@ -90,7 +90,7 @@ sessions/{session_id}.json       # Conversation history
 `backend/requirements.txt` and `backend/pyproject.toml` must stay in sync — Lambda packaging uses `requirements.txt` but local dev uses `pyproject.toml` (uv).
 
 ### Anonymous feedback rate limiter
-`backend/server.py` keeps the anonymous-feedback rate-limiter state (per-IP rolling hour + per-session one-shot) in module-level memory, so it lives in the warm Lambda container and resets on cold start. Acceptable today because the SES daily quota is the hard ceiling and the only destination is `ADMIN_EMAILS`. If real abuse appears, move the limiter to DynamoDB or Redis.
+`backend/server.py` keeps the feedback-notification rate-limiter state (anonymous per-IP rolling 7 days, authenticated per-`chatter_id` rolling 7 days, plus per-session one-shot behavior) in module-level memory, so it lives in the warm Lambda container and resets on cold start. Acceptable today because the SES daily quota is the hard ceiling and the only destination is `ADMIN_EMAILS`. If real abuse appears, move the limiter to DynamoDB or Redis.
 
 ## Deployment
 - CI/CD deploys automatically on push to `main` via `.github/workflows/deploy.yml`
