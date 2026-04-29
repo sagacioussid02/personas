@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import field_validator
@@ -6,6 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import copy
 import os
+import time
+from collections import defaultdict, deque
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any, Union
 import json
@@ -112,6 +114,67 @@ _CONNECT_RE = re.compile(
     r')\b',
     re.IGNORECASE | re.DOTALL,
 )
+
+
+# ── Feedback notification rate limiting ───────────────────────────────────────
+# Both anonymous and authenticated callers are capped on a rolling 7-day window
+# to deter bot/DDoS abuse of the SES path. State lives in the warm Lambda
+# container; cold starts reset it. For stricter enforcement across horizontal
+# scale, move state to DynamoDB or Redis. SES daily quota is the hard ceiling.
+_FEEDBACK_NOTIFY_RATE_LIMIT = int(os.getenv("FEEDBACK_NOTIFY_RATE_LIMIT", "3"))
+_AUTH_FEEDBACK_NOTIFY_RATE_LIMIT = int(os.getenv("AUTH_FEEDBACK_NOTIFY_RATE_LIMIT", "5"))
+_NOTIFY_WINDOW_SECONDS = 7 * 24 * 3600.0  # 7 days
+_anon_notify_ip_history: dict[str, deque] = defaultdict(deque)
+_anon_notify_session_seen: set[str] = set()
+_auth_notify_user_history: dict[str, deque] = defaultdict(deque)
+
+
+def _client_ip(req: Request) -> str:
+    xff = req.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return req.client.host if req.client else "unknown"
+
+
+def _should_notify_anon(ip: str, session_id: str) -> bool:
+    """Return True iff an anonymous notification slot is available, consuming it.
+
+    Limits: per-session one-shot + per-IP rolling 7-day cap of
+    FEEDBACK_NOTIFY_RATE_LIMIT (default 3). Returns False without consuming
+    when the env flag is <= 0 or any cap is hit.
+    """
+    if _FEEDBACK_NOTIFY_RATE_LIMIT <= 0:
+        return False
+    if session_id in _anon_notify_session_seen:
+        return False
+    now = time.monotonic()
+    history = _anon_notify_ip_history[ip]
+    while history and now - history[0] > _NOTIFY_WINDOW_SECONDS:
+        history.popleft()
+    if len(history) >= _FEEDBACK_NOTIFY_RATE_LIMIT:
+        return False
+    history.append(now)
+    _anon_notify_session_seen.add(session_id)
+    return True
+
+
+def _should_notify_auth(chatter_id: str) -> bool:
+    """Return True iff an authenticated notification slot is available, consuming it.
+
+    Limit: per-chatter_id rolling 7-day cap of
+    AUTH_FEEDBACK_NOTIFY_RATE_LIMIT (default 5). Returns False without
+    consuming when the env flag is <= 0 or the cap is hit.
+    """
+    if _AUTH_FEEDBACK_NOTIFY_RATE_LIMIT <= 0:
+        return False
+    now = time.monotonic()
+    history = _auth_notify_user_history[chatter_id]
+    while history and now - history[0] > _NOTIFY_WINDOW_SECONDS:
+        history.popleft()
+    if len(history) >= _AUTH_FEEDBACK_NOTIFY_RATE_LIMIT:
+        return False
+    history.append(now)
+    return True
 
 
 async def _notify_connect_intent(user_message: str, session_id: str, twin_name: str) -> None:
@@ -695,6 +758,7 @@ def _derive_session_id(chatter_id: str, twin_id: str) -> str:
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
+    http_request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ):
     try:
@@ -778,21 +842,47 @@ async def chat(
 
         viewer_is_authenticated = chatter_id is not None
 
-        # Notify admin when a signed-in user asks to give feedback / contact the creator.
-        if viewer_is_authenticated and _CONNECT_RE.search(request.message):
-            notify_message = (
-                f"{request.message}\n\n"
-                f"Authenticated chatter_id: {chatter_id}"
-            )
-            try:
-                await asyncio.wait_for(
-                    _notify_connect_intent(
-                        notify_message, session_id, twin_name or "Sidd"
-                    ),
-                    timeout=3.0,
-                )
-            except Exception:
-                pass
+        # Notify admin when a user asks to give feedback / contact the creator.
+        # Both anonymous and authenticated callers are rate-limited (rolling
+        # 7-day windows; see FEEDBACK_NOTIFY_RATE_LIMIT and
+        # AUTH_FEEDBACK_NOTIFY_RATE_LIMIT). Suppressed notifications still
+        # return a normal chat response.
+        if _CONNECT_RE.search(request.message):
+            if viewer_is_authenticated:
+                should_notify = _should_notify_auth(chatter_id)
+                if not should_notify:
+                    print(
+                        f"[notify] Authenticated notification suppressed by rate limit "
+                        f"(chatter_id={chatter_id})"
+                    )
+            else:
+                ip = _client_ip(http_request)
+                should_notify = _should_notify_anon(ip, session_id)
+                if not should_notify:
+                    print(
+                        f"[notify] Anonymous notification suppressed by rate limit "
+                        f"(ip={ip}, session={session_id})"
+                    )
+            if should_notify:
+                if viewer_is_authenticated:
+                    notify_message = (
+                        f"{request.message}\n\n"
+                        f"Authenticated chatter_id: {chatter_id}"
+                    )
+                else:
+                    notify_message = (
+                        f"{request.message}\n\n"
+                        f"Anonymous session: {session_id}"
+                    )
+                try:
+                    await asyncio.wait_for(
+                        _notify_connect_intent(
+                            notify_message, session_id, twin_name or "Sidd"
+                        ),
+                        timeout=3.0,
+                    )
+                except Exception:
+                    pass
 
         orchestration = run_chat_orchestration(
             twin_data=twin_data,
