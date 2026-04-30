@@ -265,13 +265,28 @@ def _should_notify_auth(chatter_id: str) -> bool:
         return True
 
 
-async def _notify_connect_intent(user_message: str, session_id: str, twin_name: str) -> None:
+async def _notify_connect_intent(
+    user_message: str,
+    session_id: str,
+    twin_name: str,
+    intent_type: str = "connect",
+    intent_summary: str = "",
+) -> None:
     """Fire-and-forget SES email when a user asks to connect with the creator."""
     if not _ses_client or not _ADMIN_EMAILS:
         return
     try:
+        type_label = {
+            "feedback": "Feedback",
+            "compliment": "Compliment",
+            "complaint": "Complaint",
+            "review": "Review request",
+            "connect": "Connect request",
+        }.get(intent_type, "Connect request")
+        summary_line = f"Summary: {intent_summary}\n" if intent_summary else ""
         body = (
-            f"Someone wants to connect with the creator.\n\n"
+            f"{type_label} received via {twin_name}\n\n"
+            f"{summary_line}"
             f"Persona: {twin_name}\n"
             f"Session: {session_id}\n"
             f"Time: {datetime.utcnow().isoformat()}Z\n\n"
@@ -282,29 +297,31 @@ async def _notify_connect_intent(user_message: str, session_id: str, twin_name: 
             Source=_SES_FROM_EMAIL,
             Destination={"ToAddresses": _ADMIN_EMAILS},
             Message={
-                "Subject": {"Data": f"[Personas] Connect request via {twin_name}"},
+                "Subject": {"Data": f"[Personas] {type_label} via {twin_name}"},
                 "Body": {"Text": {"Data": body}},
             },
         )
-        print(f"[notify] Connect alert sent for session {session_id}")
+        print(f"[notify] Connect alert sent for session {session_id} (type={intent_type})")
     except Exception as exc:
         print(f"[notify] Failed to send connect alert: {exc}")
 
 
-# Intent classification model — cheapest/fastest; only needs YES/NO
+# Intent classification model — cheapest/fastest
 _INTENT_MODEL_ID = "amazon.nova-micro-v1:0"
 _INTENT_PROMPT = (
-    "Does the following message express an intent to give feedback, "
-    "leave a review, contact the creator, pass along a message, "
-    "or connect with the person behind this app? "
-    "Reply with only YES or NO.\n\nMessage: "
+    "Classify the following message. If the user is expressing intent to give feedback, "
+    "leave a review, share a compliment, lodge a complaint, contact or connect with "
+    "the creator, or pass along a message — reply in this exact format:\n"
+    "YES|<type>|<one-sentence summary>\n"
+    "where <type> is one of: feedback, compliment, complaint, review, connect\n"
+    "If none of the above, reply with only: NO\n\nMessage: "
 )
 
 
-async def _classify_feedback_intent(message: str) -> bool:
+async def _classify_feedback_intent(message: str) -> tuple[bool, str, str]:
     """
-    Returns True if the message expresses feedback/contact intent.
-    Uses a Bedrock Nova Micro classifier (temperature=0, maxTokens=5).
+    Returns (is_connect, intent_type, summary).
+    Uses a Bedrock Nova Micro classifier (temperature=0, maxTokens=30).
     Falls back to _CONNECT_RE if the Bedrock call fails.
     """
     try:
@@ -312,15 +329,21 @@ async def _classify_feedback_intent(message: str) -> bool:
             bedrock_client.converse,
             modelId=_INTENT_MODEL_ID,
             messages=[{"role": "user", "content": [{"text": _INTENT_PROMPT + message}]}],
-            inferenceConfig={"maxTokens": 5, "temperature": 0},
+            inferenceConfig={"maxTokens": 30, "temperature": 0},
         )
-        answer = response["output"]["message"]["content"][0]["text"].strip().upper()
-        result = answer.startswith("YES")
-        print(f"[intent] LLM classified message as {'CONNECT' if result else 'NORMAL'}")
-        return result
+        answer = response["output"]["message"]["content"][0]["text"].strip()
+        if answer.upper().startswith("YES"):
+            parts = answer.split("|", 2)
+            intent_type = parts[1].strip().lower() if len(parts) > 1 else "connect"
+            summary = parts[2].strip() if len(parts) > 2 else ""
+            print(f"[intent] LLM classified message as CONNECT (type={intent_type})")
+            return True, intent_type, summary
+        print("[intent] LLM classified message as NORMAL")
+        return False, "", ""
     except Exception as exc:
         print(f"[intent] LLM classification failed, falling back to regex: {exc}")
-        return bool(_CONNECT_RE.search(message))
+        is_connect = bool(_CONNECT_RE.search(message))
+        return is_connect, "connect" if is_connect else "", ""
 
 
 async def _send_notify_if_intent(
@@ -332,12 +355,14 @@ async def _send_notify_if_intent(
     user_email: Optional[str],
     ip: str,
     conversation: list,
+    is_connect: bool = False,
+    intent_type: str = "connect",
+    intent_summary: str = "",
 ) -> None:
     """
-    Background task: classify intent with LLM, then send SES notification if
-    feedback/contact intent is detected and rate limits allow.
+    Background task: send SES notification if feedback/contact intent was detected.
+    Classification is pre-computed (is_connect) so this only handles rate limiting + send.
     """
-    is_connect = await _classify_feedback_intent(message)
     if not is_connect:
         return
 
@@ -365,7 +390,7 @@ async def _send_notify_if_intent(
 
     try:
         await asyncio.wait_for(
-            _notify_connect_intent(notify_message, session_id, twin_name),
+            _notify_connect_intent(notify_message, session_id, twin_name, intent_type, intent_summary),
             timeout=5.0,
         )
     except Exception:
@@ -1024,9 +1049,42 @@ async def chat(
 
         viewer_is_authenticated = chatter_id is not None
 
-        # Notify admin when a user asks to give feedback / contact the creator.
-        # Classification runs in the background (zero latency to the chat response).
-        # Rate limiting and identity extraction happen inside _send_notify_if_intent.
+        # Run intent classification concurrently with chat orchestration.
+        # Nova Micro (~300 ms) finishes well before Nova Lite (~2 s), so there
+        # is no perceptible latency increase.
+        (is_connect, intent_type, intent_summary), orchestration = await asyncio.gather(
+            _classify_feedback_intent(request.message),
+            asyncio.to_thread(
+                run_chat_orchestration,
+                twin_data=twin_data,
+                sources=normalized_sources,
+                user_message=request.message,
+                conversation=conversation,
+                bedrock_client=bedrock_client,
+                model_id=BEDROCK_MODEL_ID,
+                personality_model=personality_model,
+                twin_name=twin_name,
+                twin_title=twin_title,
+                response_style=response_style,
+                corrections=corrections,
+                viewer_is_authenticated=viewer_is_authenticated,
+            ),
+        )
+        assistant_response = orchestration["answer"]
+
+        # If a feedback/connect intent was detected, acknowledge it in the response.
+        if is_connect:
+            ack_map = {
+                "feedback": "I've passed your feedback along to Sidd — he'll appreciate hearing it.",
+                "compliment": "I've shared your kind words with Sidd — that really means a lot.",
+                "complaint": "I've forwarded your concern to Sidd so he can look into it.",
+                "review": "I've let Sidd know you'd like to leave a review — thanks for taking the time.",
+                "connect": "I've let Sidd know you'd like to get in touch — he'll reach out.",
+            }
+            ack = ack_map.get(intent_type, ack_map["connect"])
+            assistant_response = f"{assistant_response}\n\n*{ack}*"
+
+        # Rate limiting and SES send happen in the background (classification already done).
         background_tasks.add_task(
             _send_notify_if_intent,
             message=request.message,
@@ -1036,24 +1094,11 @@ async def chat(
             chatter_id=chatter_id,
             user_email=user_email,
             ip=_client_ip(http_request),
-            conversation=list(conversation),  # snapshot so history mutations don't race
+            conversation=list(conversation),
+            is_connect=is_connect,
+            intent_type=intent_type,
+            intent_summary=intent_summary,
         )
-
-        orchestration = run_chat_orchestration(
-            twin_data=twin_data,
-            sources=normalized_sources,
-            user_message=request.message,
-            conversation=conversation,
-            bedrock_client=bedrock_client,
-            model_id=BEDROCK_MODEL_ID,
-            personality_model=personality_model,
-            twin_name=twin_name,
-            twin_title=twin_title,
-            response_style=response_style,
-            corrections=corrections,
-            viewer_is_authenticated=viewer_is_authenticated,
-        )
-        assistant_response = orchestration["answer"]
 
         # Personality review step (gated — enable via PERSONALITY_REVIEW_ENABLED=true)
         if PERSONALITY_REVIEW_ENABLED:
