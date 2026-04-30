@@ -106,7 +106,51 @@ export default function Home() {
   const marqueePersonas = publicPersonas.length > 0 ? [...publicPersonas, ...publicPersonas] : [];
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.18),_transparent_28%),radial-gradient(circle_at_top_right,_rgba(249,115,22,0.18),_transparent_24%),linear-gradient(180deg,_#f8fafc_0%,_#eef2ff_42%,_#f8fafc_100%)]">
+    <main className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(59,130,246,0.18),_transparent_28%),radial-gradient(circle_at_top_right,_rgba(249,115,22,0.18),_transparent_24%),linear-gradient(180deg,_#f8fafc_0%,_#eef2ff_42%,_#f8fafc_100%)] relative overflow-x-hidden">
+      {/* Crayon doodle background */}
+      <svg
+        aria-hidden="true"
+        className="pointer-events-none fixed inset-0 w-full h-full opacity-[0.055] animate-crayon-drift"
+        xmlns="http://www.w3.org/2000/svg"
+        style={{ zIndex: 0 }}
+      >
+        {/* wavy scribble lines */}
+        <path d="M-10 80 Q60 60 120 90 Q180 120 240 85 Q300 55 360 90 Q420 120 480 80 Q540 45 600 85 Q660 115 720 75 Q780 40 840 80 Q900 115 960 78 Q1020 45 1100 82" stroke="#7c3aed" strokeWidth="3.5" fill="none" strokeLinecap="round" />
+        <path d="M-10 200 Q80 175 160 210 Q240 240 320 198 Q400 160 480 205 Q560 245 640 195 Q720 150 800 198 Q880 240 960 192 Q1040 150 1100 200" stroke="#f97316" strokeWidth="3" fill="none" strokeLinecap="round" />
+        <path d="M-10 330 Q70 305 150 340 Q230 370 310 328 Q390 288 470 332 Q550 372 630 325 Q710 282 790 330 Q870 372 950 322 Q1030 278 1100 330" stroke="#0ea5e9" strokeWidth="3" fill="none" strokeLinecap="round" />
+        <path d="M-10 460 Q90 435 180 465 Q270 495 360 455 Q450 415 540 460 Q630 500 720 452 Q810 408 900 455 Q990 498 1100 452" stroke="#10b981" strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        <path d="M-10 590 Q100 560 200 595 Q300 628 400 585 Q500 545 600 590 Q700 632 800 582 Q900 538 1100 585" stroke="#f43f5e" strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        <path d="M-10 720 Q110 690 220 722 Q330 755 440 712 Q550 672 660 718 Q770 758 880 710 Q990 665 1100 715" stroke="#a855f7" strokeWidth="3" fill="none" strokeLinecap="round" />
+        <path d="M-10 850 Q90 820 190 855 Q290 888 390 845 Q490 805 590 848 Q690 888 790 842 Q890 800 1100 848" stroke="#f59e0b" strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        {/* stars */}
+        <text x="68" y="148" fontSize="22" fill="#f97316" style={{fontFamily:'sans-serif'}}>★</text>
+        <text x="310" y="42" fontSize="16" fill="#7c3aed" style={{fontFamily:'sans-serif'}}>★</text>
+        <text x="540" y="270" fontSize="20" fill="#0ea5e9" style={{fontFamily:'sans-serif'}}>★</text>
+        <text x="820" y="130" fontSize="18" fill="#10b981" style={{fontFamily:'sans-serif'}}>★</text>
+        <text x="970" y="410" fontSize="22" fill="#f43f5e" style={{fontFamily:'sans-serif'}}>★</text>
+        <text x="190" y="500" fontSize="16" fill="#a855f7" style={{fontFamily:'sans-serif'}}>★</text>
+        <text x="700" y="640" fontSize="20" fill="#f59e0b" style={{fontFamily:'sans-serif'}}>★</text>
+        <text x="420" y="780" fontSize="18" fill="#0ea5e9" style={{fontFamily:'sans-serif'}}>★</text>
+        {/* small circles / dots */}
+        <circle cx="140" cy="310" r="7" fill="none" stroke="#f97316" strokeWidth="2.5" />
+        <circle cx="460" cy="145" r="9" fill="none" stroke="#7c3aed" strokeWidth="2.5" />
+        <circle cx="750" cy="380" r="7" fill="none" stroke="#10b981" strokeWidth="2.5" />
+        <circle cx="930" cy="240" r="10" fill="none" stroke="#0ea5e9" strokeWidth="2.5" />
+        <circle cx="280" cy="660" r="8" fill="none" stroke="#f43f5e" strokeWidth="2.5" />
+        <circle cx="620" cy="510" r="6" fill="none" stroke="#a855f7" strokeWidth="2.5" />
+        <circle cx="1050" cy="570" r="9" fill="none" stroke="#f59e0b" strokeWidth="2.5" />
+        {/* loose spirals / loops */}
+        <path d="M50 420 Q65 405 80 420 Q95 435 80 450 Q60 465 45 445 Q32 425 55 410 Q78 397 92 418" stroke="#7c3aed" strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        <path d="M870 680 Q885 665 900 680 Q915 695 900 710 Q880 725 865 705 Q852 685 875 670 Q898 657 912 678" stroke="#f97316" strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        <path d="M340 250 Q355 235 370 250 Q385 265 370 280 Q350 295 335 275 Q322 255 345 240 Q368 227 382 248" stroke="#10b981" strokeWidth="2.5" fill="none" strokeLinecap="round" />
+        {/* zigzag */}
+        <path d="M600 350 l12-18 l12 18 l12-18 l12 18 l12-18 l12 18" stroke="#f59e0b" strokeWidth="2.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M180 740 l10-16 l10 16 l10-16 l10 16 l10-16 l10 16" stroke="#0ea5e9" strokeWidth="2.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        {/* squiggly underlines */}
+        <path d="M200 56 Q208 50 216 56 Q224 62 232 56 Q240 50 248 56 Q256 62 264 56 Q272 50 280 56" stroke="#f43f5e" strokeWidth="2" fill="none" strokeLinecap="round" />
+        <path d="M740 820 Q748 814 756 820 Q764 826 772 820 Q780 814 788 820 Q796 826 804 820 Q812 814 820 820" stroke="#a855f7" strokeWidth="2" fill="none" strokeLinecap="round" />
+      </svg>
+      <div className="relative z-10">
       {/* Nav */}
       <nav className="flex items-center justify-between px-6 py-4 max-w-7xl mx-auto">
         <div className="flex items-center gap-2">
@@ -206,6 +250,7 @@ export default function Home() {
           </footer>
         </div>
       </div>
+      </div>{/* end z-10 wrapper */}
     </main>
   );
 }
