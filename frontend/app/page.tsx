@@ -133,9 +133,14 @@ export default function Home() {
       <div className="container mx-auto px-4 py-8">
         <div className="max-w-7xl mx-auto">
           <div className="text-center mb-8">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-sky-200 bg-white/70 text-xs font-semibold uppercase tracking-[0.24em] text-sky-700 shadow-sm">
-              <Sparkles className="w-3.5 h-3.5" />
-              Your judgment, on demand
+            <div className="inline-flex items-center gap-2 flex-wrap justify-center">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-sky-200 bg-white/70 text-xs font-semibold uppercase tracking-[0.24em] text-sky-700 shadow-sm">
+                <Sparkles className="w-3.5 h-3.5" />
+                Your judgment, on demand
+              </div>
+              <span className="text-gray-300 text-xs hidden sm:inline">&middot;</span>
+              <span className="text-xs text-gray-500">Start with Sidd&apos;s persona, then build one trained on your own voice.</span>
+              <Link href="/create" className="text-xs text-sky-700 hover:text-sky-900 font-medium underline underline-offset-2">Create your own →</Link>
             </div>
             <h1 className="text-4xl md:text-5xl font-bold text-center text-gray-900 mt-4 mb-2 tracking-tight">
               Meet personas that think like real people
@@ -192,15 +197,7 @@ export default function Home() {
                 <Twin />
               </div>
             </div>
-            <div className="text-center text-sm text-gray-500 space-y-2">
-              <p>Start with Sidd&apos;s persona, then build one trained on your own voice and decisions.</p>
-              <Link
-                href="/create"
-                className="inline-block text-sky-700 hover:text-sky-900 font-medium underline underline-offset-2"
-              >
-                Create your own persona →
-              </Link>
-            </div>
+
           </section>
 
           <footer className="mt-8 text-center text-sm text-gray-500 space-y-2">
