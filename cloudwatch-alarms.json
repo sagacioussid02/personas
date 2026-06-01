@@ -1,0 +1,110 @@
+{
+  "AlarmDefinitions": [
+    {
+      "AlarmName": "twin-lambda-duration-p99",
+      "MetricName": "Duration",
+      "Namespace": "AWS/Lambda",
+      "Statistic": "p99",
+      "Period": 60,
+      "EvaluationPeriods": 2,
+      "Threshold": 25000,
+      "ComparisonOperator": "GreaterThanThreshold",
+      "Dimensions": [
+        {
+          "Name": "FunctionName",
+          "Value": "twin-api"
+        }
+      ],
+      "AlarmActions": ["arn:aws:sns:us-east-1:ACCOUNT_ID:pagerduty-topic"],
+      "AlarmDescription": "Alert when Lambda p99 duration exceeds 25 seconds (cold start indicator). Threshold is 5 seconds below API Gateway 30-second timeout.",
+      "TreatMissingData": "notBreaching"
+    },
+    {
+      "AlarmName": "twin-bedrock-throttle-rate",
+      "MetricName": "ThrottledRequests",
+      "Namespace": "AWS/Bedrock",
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "Threshold": 5,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+      "Dimensions": [
+        {
+          "Name": "ModelId",
+          "Value": "anthropic.claude-3-sonnet-20240229-v1:0"
+        }
+      ],
+      "AlarmActions": ["arn:aws:sns:us-east-1:ACCOUNT_ID:pagerduty-topic"],
+      "AlarmDescription": "Alert when Bedrock throttles 5+ requests in 5 minutes. Indicates rate limit exceeded or quota issue.",
+      "TreatMissingData": "notBreaching"
+    },
+    {
+      "AlarmName": "twin-s3-error-rate",
+      "MetricName": "4XXError",
+      "Namespace": "AWS/S3",
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 2,
+      "Threshold": 10,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+      "Dimensions": [
+        {
+          "Name": "BucketName",
+          "Value": "twin-personas-prod"
+        }
+      ],
+      "AlarmActions": ["arn:aws:sns:us-east-1:ACCOUNT_ID:pagerduty-topic"],
+      "AlarmDescription": "Alert when S3 4XX errors (AccessDenied, NoSuchBucket, etc.) exceed 10 in 5 minutes. Indicates permission or configuration issue.",
+      "TreatMissingData": "notBreaching"
+    },
+    {
+      "AlarmName": "twin-lambda-errors",
+      "MetricName": "Errors",
+      "Namespace": "AWS/Lambda",
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "Threshold": 10,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+      "Dimensions": [
+        {
+          "Name": "FunctionName",
+          "Value": "twin-api"
+        }
+      ],
+      "AlarmActions": ["arn:aws:sns:us-east-1:ACCOUNT_ID:pagerduty-topic"],
+      "AlarmDescription": "Alert when Lambda errors exceed 10 in 5 minutes. Indicates application or infrastructure failure.",
+      "TreatMissingData": "notBreaching"
+    },
+    {
+      "AlarmName": "twin-api-gateway-5xx",
+      "MetricName": "5XXError",
+      "Namespace": "AWS/ApiGateway",
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "Threshold": 5,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+      "Dimensions": [
+        {
+          "Name": "ApiName",
+          "Value": "twin-api"
+        }
+      ],
+      "AlarmActions": ["arn:aws:sns:us-east-1:ACCOUNT_ID:pagerduty-topic"],
+      "AlarmDescription": "Alert when API Gateway 5XX errors exceed 5 in 5 minutes. Indicates backend or Lambda failure.",
+      "TreatMissingData": "notBreaching"
+    }
+  ],
+  "DeploymentInstructions": {
+    "Description": "Deploy CloudWatch alarms using AWS CLI or CloudFormation",
+    "CLIExample": "aws cloudwatch put-metric-alarm --alarm-name twin-lambda-duration-p99 --metric-name Duration --namespace AWS/Lambda --statistic p99 --period 60 --evaluation-periods 2 --threshold 25000 --comparison-operator GreaterThanThreshold --dimensions Name=FunctionName,Value=twin-api --alarm-actions arn:aws:sns:us-east-1:ACCOUNT_ID:pagerduty-topic",
+    "CloudFormationExample": "See deploy.yml for CloudFormation template integration",
+    "Notes": [
+      "Replace ACCOUNT_ID with your AWS account ID",
+      "Replace pagerduty-topic with your actual SNS topic ARN",
+      "Adjust thresholds based on your baseline metrics",
+      "Test alarms in dev/staging before deploying to production"
+    ]
+  }
+}
