@@ -83,64 +83,59 @@ Browser
   │
   └── API calls ──► FastAPI (Python)
                       Lambda in prod, uvicorn locally
-                      │
-                      ├── AWS Bedrock  ← all the LLM calls (Nova / Claude)
-                      │
-                      └── S3  ← twin JSON files + conversation history
-                                (local disk when USE_S3=false)
 ```
 
-**Auth:** Clerk handles sign-up/login. The frontend gets a JWT, sends it as a Bearer token, and the backend verifies it against Clerk's public keys. Standard stuff.
+For a detailed architecture diagram, request flow, and operational runbook, see:
 
-**Twin storage:** Each twin is a single JSON file. No database. This is either elegant simplicity or a future problem, depending on when you're reading this.
-
-**Conversations:** Also JSON files, keyed by a session ID. Authenticated sessions use an HMAC-derived ID so they're stable across devices without any server-side session lookup.
-
-**LLM calls:** Everything goes through AWS Bedrock. The default model is Amazon Nova — fast and cheap for homepage chat. The same model handles twin creation synthesis, deepen re-synthesis, and tagline generation.
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — End-to-end system design, Lambda + Bedrock integration, and failure modes
+- **[RUNBOOK.md](./RUNBOOK.md)** — Operational procedures for Lambda cold starts, Bedrock throttling, and S3 failures
+- **[CI_WORKFLOWS.md](./CI_WORKFLOWS.md)** — Automated workflow governance, security gates, and deployment approval rules
 
 ---
 
-## Project structure
+## Contributing
 
-```
-├── backend/
-│   ├── server.py          # All API endpoints (~2200 lines, yes it's a lot)
-│   ├── context.py         # Prompt engineering for twin conversations
-│   ├── personality_agent.py  # Archetype detection
-│   ├── resources.py       # Loads the default twin's data files
-│   ├── data/              # Sidd's actual profile data (bio, skills, etc.)
-│   └── public_personas/   # Public persona JSON files loaded at startup
-│
-├── frontend/
-│   ├── app/               # Next.js App Router pages
-│   │   ├── page.tsx       # Homepage
-│   │   ├── dashboard/     # Your twins
-│   │   ├── create/        # Twin creation flow
-│   │   ├── twin/          # Chat with any twin
-│   │   └── deepen/        # Depth interview
-│   └── components/
-│       ├── twin.tsx        # Unauthenticated homepage chat
-│       └── twin-chat.tsx   # Authenticated chat for user twins
-│
-└── terraform/             # AWS infrastructure as code
-```
+We welcome contributions. See [CONTRIBUTING.md](./CONTRIBUTING.md) for:
+
+- Local setup and testing
+- Code style and standards
+- Monorepo package.json boundary (root vs. frontend)
+- PR submission and review process
+- Automated workflow gates and required status checks
 
 ---
 
-## Deploying
+## Deployment
 
-Push to `main`. GitHub Actions handles the rest — builds the Lambda package, runs Terraform, and deploys the frontend to the AWS-hosted static site stack managed in this repo (S3 + CloudFront).
+The project deploys to AWS Lambda + CloudFront. See the deployment workflow in `.github/workflows/deploy.yml` and operational guidance in [RUNBOOK.md](./RUNBOOK.md).
 
-The platform runs on a modern serverless AWS stack using Lambda, API Gateway, S3, CloudFront, and Bedrock, giving it the speed, scalability, and production posture expected from a sellable AI product.
+**Key points:**
 
----
-
-## The backstory
-
-This started as "what if my resume could talk back" and evolved into something more interesting: a platform for capturing how people actually reason, not just what they've done. Resumes list accomplishments. This tries to capture the mental model behind them.
-
-The historical personas (like Gandhi, Charlie Chaplin, and Buffett) exist to prove the concept works for public figures — and because having Gandhi explain nonviolent resistance to you directly is genuinely a different experience than reading a Wikipedia summary.
+- Frontend is built and deployed to S3 + CloudFront
+- Backend is packaged as a Lambda function
+- All deployments require human approval (no automated deploy from automated PRs)
+- See [CI_WORKFLOWS.md](./CI_WORKFLOWS.md) for deployment approval gates
 
 ---
 
-*Built by [Siddharth Shankar](https://github.com/sagacioussid02) · Binosus LLC · 2026*
+## Lessons Learned
+
+We track operational incidents and known issues in [LESSONS_LEARNED.md](./LESSONS_LEARNED.md). Common failure modes include:
+
+- Lambda cold starts (mitigated with provisioned concurrency)
+- Bedrock throttling (mitigated with exponential backoff and user-friendly error messages)
+- S3 failures (mitigated with retry logic and fallback caching)
+
+See [RUNBOOK.md](./RUNBOOK.md) for diagnosis and recovery steps.
+
+---
+
+## License
+
+MIT. See LICENSE for details.
+
+---
+
+## Questions?
+
+Reach out to the team or open an issue. We're here to help.
