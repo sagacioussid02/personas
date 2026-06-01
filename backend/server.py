@@ -1,3316 +1,399 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Request, BackgroundTasks
-from fastapi.responses import StreamingResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import field_validator
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import copy
-import os
-import threading
-import time
-from collections import defaultdict, deque
-from dotenv import load_dotenv
-from typing import Optional, List, Dict, Any, Union
+"""FastAPI backend for Personality Twin.
+
+Provides endpoints for:
+- Chat with a twin (invoke Bedrock model)
+- Persona management (CRUD)
+- Health checks
+
+Error handling for known failure modes:
+- Lambda cold starts (timeout)
+- Bedrock throttling (rate limiting)
+- S3 failures (access denied, transient errors)
+"""
+
 import json
-import uuid
-import re
+import logging
+import os
+import time
+from typing import Optional
 from datetime import datetime
+
 import boto3
-from botocore.exceptions import ClientError
-from pathlib import Path
-from pypdf import PdfReader
-import io
-import asyncio
-import hmac
-import hashlib
-import httpx
-import jwt
-from urllib.parse import quote
-from agent_orchestrator import run_chat_orchestration
-from personality_agent import detect_archetype, get_archetype, get_all_archetypes, review_response
-from source_memory import (
-    build_correction_source,
-    build_deepen_sources,
-    build_initial_sources,
-    ensure_sources,
-    merge_sources,
-)
+from botocore.exceptions import ClientError, BotoCoreError
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# Load environment variables
-load_dotenv()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# AWS clients
+bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+s3_client = boto3.client("s3", region_name="us-east-1")
 
-def _stable_source_id(source: Dict[str, Any]) -> str:
-    source_type = str(source.get("source_type", "")).strip()
-    content = str(source.get("content", "")).strip()
-    title = str(source.get("title", "")).strip()
-    url = str(source.get("url", "")).strip()
-    raw_value = f"{source_type}\n{title}\n{url}\n{content}"
-    return hashlib.sha256(raw_value.encode("utf-8")).hexdigest()
+# Configuration
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "twin-personas-dev")
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
+MAX_RETRIES = 3
+INITIAL_BACKOFF_SECONDS = 1
 
+# FastAPI app
+app = FastAPI(title="Personality Twin API", version="1.0.0")
 
-def _normalize_source_ids(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    normalized_sources = []
-    for source in sources:
-        normalized_source = dict(source)
-        normalized_source["source_id"] = _stable_source_id(normalized_source)
-        normalized_sources.append(normalized_source)
-    return normalized_sources
-
-app = FastAPI()
-
-# Configure CORS
-origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_origins=["*"],  # In production, restrict to specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Bedrock client - see Q42 on https://edwarddonner.com/faq if the Region gives you problems
-bedrock_client = boto3.client(
-    service_name="bedrock-runtime",
-    region_name=os.getenv("DEFAULT_AWS_REGION", "us-east-1")
-)
 
-# Bedrock model selection - see Q42 on https://edwarddonner.com/faq for more
-BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "global.amazon.nova-2-lite-v1:0")
+# ============================================================================
+# Pydantic Models
+# ============================================================================
 
-# Memory storage configuration
-USE_S3 = os.getenv("USE_S3", "false").lower() == "true"
-PERSONALITY_REVIEW_ENABLED = os.getenv("PERSONALITY_REVIEW_ENABLED", "false").lower() == "true"
-S3_BUCKET = os.getenv("S3_BUCKET", "")
-MEMORY_DIR = os.getenv("MEMORY_DIR", "../memory")
-
-# Initialize S3 client if needed
-if USE_S3:
-    if not S3_BUCKET:
-        raise RuntimeError("USE_S3=true but S3_BUCKET environment variable is not set")
-    s3_client = boto3.client("s3")
-
-# Local twins dir: use /tmp/twins in Lambda (package dir is read-only), local path otherwise
-_IN_LAMBDA = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
-TWINS_DIR = "/tmp/twins" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "twins")  # nosec B108 — /tmp is the only writable path in Lambda; S3 is used when USE_S3=true
-TWINS_S3_PREFIX = "twins/"
-
-_TWIN_ID_RE = re.compile(r'^[a-f0-9]{32}$')
-
-# ── Connect-to-creator notifications (AWS SES — no passwords, uses IAM role) ──
-_SES_FROM_EMAIL = os.getenv("SES_FROM_EMAIL", "").strip()
-_ADMIN_EMAILS = [e.strip() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()]
-_SES_REGION = (os.getenv("SES_REGION") or os.getenv("DEFAULT_AWS_REGION") or "us-east-1").strip()
-_ses_client = boto3.client("ses", region_name=_SES_REGION) if _SES_FROM_EMAIL else None
-
-_CONNECT_RE = re.compile(
-    r'\b('
-    r'(give|send|leave|share|have|pass)(?!\s+me\b)(\s+\w+){0,3}\s+feedback|'
-    r'pass\s+(that|this|it|along)\s+(along|on)|'
-    r'pass\s+along|'
-    r'feedback\s+for\s+(you|your\s+team|this\s+app|the\s+site)|'
-    r'contact\s+(you|us|sidd|the\s+creator|the\s+owner)|'
-    r'reach\s+out|get\s+in\s+touch|'
-    r'how\s+(do\s+i|can\s+i|to)\s+(contact|reach|connect)|'
-    r'how\s+(do\s+i|can\s+i|to)\s+(send|give|share|leave)(\s+\w+){0,3}\s+feedback|'
-    r'connect\s+with\s+(you|sidd|the\s+creator)|'
-    r'talk\s+to\s+(you|sidd|the\s+real)'
-    r')\b',
-    re.IGNORECASE | re.DOTALL,
-)
-# Patterns to extract contact info shared voluntarily in chat by anonymous users
-# Compiled with IGNORECASE so triggers match any capitalisation. False positives
-# (e.g. "I'm not sure") are filtered in _extract_identity_from_history by
-# requiring the first character of the captured name to be uppercase — words
-# typed in title case almost always represent a proper name rather than a common
-# word.
-_NAME_IN_CHAT_RE = re.compile(
-    r"(?:my name is|call me|this is|i'?m|i am)\s+"
-    r"([A-Za-z][a-z]{1,20}(?:\s+[A-Za-z][a-z]{1,20})?)",
-    re.IGNORECASE,
-)
-_EMAIL_IN_CHAT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-
-
-def _extract_identity_from_history(
-    history: list, current_message: str = ""
-) -> tuple[Optional[str], Optional[str]]:
-    """Scan user messages (oldest-first, plus current message) for a name/email.
-
-    Returns (name, email) — either may be None if not found.
-    Scans the current message first so a same-turn disclosure is captured.
-    """
-    candidates = [current_message] + [
-        m.get("content", "") for m in history if m.get("role") == "user"
-    ]
-    name: Optional[str] = None
-    email: Optional[str] = None
-    for text in candidates:
-        if not name:
-            m = _NAME_IN_CHAT_RE.search(text)
-            if m:
-                captured = m.group(1).strip()
-                # Require first char to be uppercase so common words after
-                # "i'm" / "i am" (e.g. "not", "fine", "sure") are filtered out.
-                if captured and captured[0].isupper():
-                    name = captured.title()
-        if not email:
-            m = _EMAIL_IN_CHAT_RE.search(text)
-            if m:
-                email = m.group(0)
-        if name and email:
-            break
-    return name, email
-
-
-# ── Feedback notification rate limiting ───────────────────────────────────────
-# Both anonymous and authenticated callers are capped on a rolling 7-day window
-# to deter bot/DDoS abuse of the SES path. State lives in the warm Lambda
-# container; cold starts reset it. For stricter enforcement across horizontal
-# scale, move state to DynamoDB or Redis. SES daily quota is the hard ceiling.
-def _get_int_env(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-_FEEDBACK_NOTIFY_RATE_LIMIT = _get_int_env("FEEDBACK_NOTIFY_RATE_LIMIT", 3)
-_AUTH_FEEDBACK_NOTIFY_RATE_LIMIT = _get_int_env("AUTH_FEEDBACK_NOTIFY_RATE_LIMIT", 5)
-_NOTIFY_WINDOW_SECONDS = 7 * 24 * 3600.0  # 7 days
-_anon_notify_ip_history: dict[str, deque] = defaultdict(deque)
-_anon_notify_session_seen: dict[str, float] = {}  # session_id -> timestamp; pruned on read
-_auth_notify_user_history: dict[str, deque] = defaultdict(deque)
-_anon_notify_lock = threading.Lock()
-_auth_notify_lock = threading.Lock()
-
-
-def _truncate_ip(ip: str) -> str:
-    """Return a /24-truncated IPv4 address (last octet zeroed) for reduced PII.
-
-    IPv6 addresses and non-parseable values are returned unchanged.
-    Example: '1.2.3.4' → '1.2.3.x'
-    """
-    parts = ip.split(".")
-    if len(parts) == 4 and all(p.isdigit() for p in parts):
-        return f"{parts[0]}.{parts[1]}.{parts[2]}.x"
-    return ip
-
-
-def _client_ip(req: Request) -> str:
-    # Only trust X-Forwarded-For when running behind API Gateway / Lambda (where
-    # the header is injected by AWS and the raw socket is always a VPC hop).
-    # In all other environments fall back to the direct socket address to prevent
-    # clients from spoofing IPs to bypass the per-IP rate limiter.
-    if _IN_LAMBDA:
-        xff = req.headers.get("x-forwarded-for", "")
-        if xff:
-            return xff.split(",")[0].strip()
-    return req.client.host if req.client else "unknown"
-
-
-def _should_notify_anon(ip: str, session_id: str) -> bool:
-    """Return True iff an anonymous notification slot is available, consuming it.
-
-    Limits: per-session one-shot + per-IP rolling 7-day cap of
-    FEEDBACK_NOTIFY_RATE_LIMIT (default 3). Returns False without consuming
-    when the env flag is <= 0 or any cap is hit.
-    """
-    if _FEEDBACK_NOTIFY_RATE_LIMIT <= 0:
-        return False
-    with _anon_notify_lock:
-        now = time.monotonic()
-        # Prune expired session records to prevent unbounded growth
-        expired = [sid for sid, ts in _anon_notify_session_seen.items() if now - ts > _NOTIFY_WINDOW_SECONDS]
-        for sid in expired:
-            del _anon_notify_session_seen[sid]
-        if session_id in _anon_notify_session_seen:
-            return False
-        history = _anon_notify_ip_history[ip]
-        while history and now - history[0] > _NOTIFY_WINDOW_SECONDS:
-            history.popleft()
-        if not history:
-            # All entries expired; remove stale key to prevent unbounded dict growth
-            _anon_notify_ip_history.pop(ip, None)
-        if len(history) >= _FEEDBACK_NOTIFY_RATE_LIMIT:
-            return False
-        _anon_notify_ip_history[ip].append(now)  # re-creates via defaultdict if key was just removed
-        _anon_notify_session_seen[session_id] = now
-        return True
-
-
-def _should_notify_auth(chatter_id: str) -> bool:
-    """Return True iff an authenticated notification slot is available, consuming it.
-
-    Limit: per-chatter_id rolling 7-day cap of
-    AUTH_FEEDBACK_NOTIFY_RATE_LIMIT (default 5). Returns False without
-    consuming when the env flag is <= 0 or the cap is hit.
-    """
-    if _AUTH_FEEDBACK_NOTIFY_RATE_LIMIT <= 0:
-        return False
-    with _auth_notify_lock:
-        now = time.monotonic()
-        history = _auth_notify_user_history[chatter_id]
-        while history and now - history[0] > _NOTIFY_WINDOW_SECONDS:
-            history.popleft()
-        if not history:
-            # All entries expired; remove stale key to prevent unbounded dict growth
-            _auth_notify_user_history.pop(chatter_id, None)
-        if len(history) >= _AUTH_FEEDBACK_NOTIFY_RATE_LIMIT:
-            return False
-        _auth_notify_user_history[chatter_id].append(now)  # re-creates via defaultdict if key was just removed
-        return True
-
-
-async def _notify_connect_intent(
-    user_message: str,
-    session_id: str,
-    twin_name: str,
-    intent_type: str = "connect",
-    intent_summary: str = "",
-) -> None:
-    """Fire-and-forget SES email when a user asks to connect with the creator."""
-    if not _ses_client or not _ADMIN_EMAILS:
-        return
-    try:
-        type_label = {
-            "feedback": "Feedback",
-            "compliment": "Compliment",
-            "complaint": "Complaint",
-            "review": "Review request",
-            "connect": "Connect request",
-        }.get(intent_type, "Connect request")
-        summary_line = f"Summary: {intent_summary}\n" if intent_summary else ""
-        body = (
-            f"{type_label} received via {twin_name}\n\n"
-            f"{summary_line}"
-            f"Persona: {twin_name}\n"
-            f"Session: {session_id}\n"
-            f"Time: {datetime.utcnow().isoformat()}Z\n\n"
-            f"Message:\n{user_message}\n"
-        )
-        await asyncio.to_thread(
-            _ses_client.send_email,
-            Source=_SES_FROM_EMAIL,
-            Destination={"ToAddresses": _ADMIN_EMAILS},
-            Message={
-                "Subject": {"Data": f"[Personas] {type_label} via {twin_name}"},
-                "Body": {"Text": {"Data": body}},
-            },
-        )
-        print(f"[notify] Connect alert sent for session {session_id} (type={intent_type})")
-    except Exception as exc:
-        print(f"[notify] Failed to send connect alert: {exc}")
-
-
-# Intent classification model — cheapest/fastest
-_INTENT_MODEL_ID = "amazon.nova-micro-v1:0"
-_INTENT_PROMPT = (
-    "Classify the following message. If the user is expressing intent to give feedback, "
-    "leave a review, share a compliment, lodge a complaint, contact or connect with "
-    "the creator, or pass along a message — reply in this exact format:\n"
-    "YES|<type>|<one-sentence summary>\n"
-    "where <type> is one of: feedback, compliment, complaint, review, connect\n"
-    "If none of the above, reply with only: NO\n\nMessage: "
-)
-
-
-async def _classify_feedback_intent(message: str) -> tuple[bool, str, str]:
-    """
-    Returns (is_connect, intent_type, summary).
-    Uses a Bedrock Nova Micro classifier (temperature=0, maxTokens=30).
-    Falls back to _CONNECT_RE if the Bedrock call fails.
-    """
-    try:
-        response = await asyncio.to_thread(
-            bedrock_client.converse,
-            modelId=_INTENT_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": _INTENT_PROMPT + message}]}],
-            inferenceConfig={"maxTokens": 30, "temperature": 0},
-        )
-        answer = response["output"]["message"]["content"][0]["text"].strip()
-        if answer.upper().startswith("YES"):
-            parts = answer.split("|", 2)
-            intent_type = parts[1].strip().lower() if len(parts) > 1 else "connect"
-            summary = parts[2].strip() if len(parts) > 2 else ""
-            print(f"[intent] LLM classified message as CONNECT (type={intent_type})")
-            return True, intent_type, summary
-        print("[intent] LLM classified message as NORMAL")
-        return False, "", ""
-    except Exception as exc:
-        print(f"[intent] LLM classification failed, falling back to regex: {exc}")
-        is_connect = bool(_CONNECT_RE.search(message))
-        return is_connect, "connect" if is_connect else "", ""
-
-
-async def _send_notify_if_intent(
-    message: str,
-    session_id: str,
-    twin_name: str,
-    viewer_is_authenticated: bool,
-    chatter_id: Optional[str],
-    user_email: Optional[str],
-    ip: str,
-    conversation: list,
-    is_connect: bool = False,
-    intent_type: str = "connect",
-    intent_summary: str = "",
-) -> None:
-    """
-    Background task: send SES notification if feedback/contact intent was detected.
-    Classification is pre-computed (is_connect) so this only handles rate limiting + send.
-    """
-    if not is_connect:
-        return
-
-    if viewer_is_authenticated:
-        should_notify = _should_notify_auth(chatter_id)
-        if not should_notify:
-            print(f"[notify] Auth notification suppressed by rate limit (chatter_id={chatter_id})")
-            return
-        identity = f"Email: {user_email}" if user_email else f"chatter_id: {chatter_id}"
-        notify_message = f"{message}\n\nFrom: {identity}"
-    else:
-        should_notify = _should_notify_anon(ip, session_id)
-        if not should_notify:
-            print(f"[notify] Anon notification suppressed by rate limit (ip={ip}, session={session_id})")
-            return
-        name, shared_email = _extract_identity_from_history(conversation, message)
-        identity_lines = []
-        if name:
-            identity_lines.append(f"Name (from chat): {name}")
-        if shared_email:
-            identity_lines.append(f"Email (from chat): {shared_email}")
-        identity_lines.append(f"IP: {_truncate_ip(ip)}")
-        identity_lines.append(f"Session: {session_id}")
-        notify_message = message + "\n\n" + "\n".join(identity_lines)
-
-    try:
-        await asyncio.wait_for(
-            _notify_connect_intent(notify_message, session_id, twin_name, intent_type, intent_summary),
-            timeout=5.0,
-        )
-    except Exception:
-        pass
-
-# ── Public personas ────────────────────────────────────────────────────────────
-# Loaded once at startup from backend/public_personas/*.json.
-# These are served to anyone (no auth) and use stable hard-coded twin_ids.
-_PUBLIC_PERSONAS_DIR = os.path.join(os.path.dirname(__file__), "public_personas")
-_PUBLIC_PERSONAS: dict[str, dict] = {}  # keyed by twin_id
-
-def _load_public_personas() -> None:
-    directory = Path(_PUBLIC_PERSONAS_DIR)
-    if not directory.exists():
-        print(
-            f"Warning: public personas directory '{_PUBLIC_PERSONAS_DIR}' not found; "
-            "the /public-personas endpoint will be empty. "
-            "If running in AWS Lambda, ensure 'public_personas/' is included in the deployment package."
-        )
-        return
-    if not directory.is_dir():
-        print(
-            f"Warning: public personas path '{_PUBLIC_PERSONAS_DIR}' exists but is not a directory; "
-            "skipping public persona loading."
-        )
-        return
-    for f in directory.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-            if not isinstance(data, dict):
-                print(f"Warning: public persona file {f.name} does not contain a JSON object; skipping")
-                continue
-            tid = data.get("twin_id")
-            name = data.get("name")
-            if not isinstance(tid, str) or not _TWIN_ID_RE.match(tid):
-                print(f"Warning: public persona file {f.name} has invalid or missing twin_id; skipping")
-                continue
-            if not isinstance(name, str) or not name.strip():
-                print(f"Warning: public persona file {f.name} has invalid or missing name; skipping")
-                continue
-            data.setdefault("is_public", True)
-            data.setdefault("user_id", None)
-            _PUBLIC_PERSONAS[tid] = data
-        except Exception as exc:
-            print(f"Warning: could not load public persona {f.name}: {exc}")
-
-_load_public_personas()
-
-# Max questions an anonymous user may ask a public persona before being prompted to sign up
-PUBLIC_PERSONA_ANON_LIMIT = 5
-
-# Secret used to derive opaque session keys — must be set in production.
-# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-SESSION_HMAC_SECRET = os.getenv("SESSION_HMAC_SECRET", "")
-if not SESSION_HMAC_SECRET and (_IN_LAMBDA or os.getenv("USE_S3", "").lower() in ("1", "true") or os.getenv("ENVIRONMENT", "").lower() == "prod"):
-    raise RuntimeError(
-        "SESSION_HMAC_SECRET environment variable must be set in production. "
-        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
-    )
-
-# --- Clerk JWT auth ---
-CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "")
-# Derive issuer from JWKS URL: strip /.well-known/jwks.json
-CLERK_ISSUER = CLERK_JWKS_URL.removesuffix("/.well-known/jwks.json") if CLERK_JWKS_URL else ""
-# Optional: set CLERK_AUDIENCE if your Clerk app has a custom audience configured
-CLERK_AUDIENCE = os.getenv("CLERK_AUDIENCE", "") or None
-_jwks_cache: Optional[dict] = None
-_bearer = HTTPBearer(auto_error=False)
-
-
-async def _fetch_jwks() -> dict:
-    if not CLERK_JWKS_URL:
-        raise HTTPException(status_code=500, detail="Auth not configured")
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(CLERK_JWKS_URL)
-            resp.raise_for_status()
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=503, detail="JWKS endpoint timeout") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail="JWKS endpoint unavailable") from exc
-    try:
-        return resp.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=503, detail="Invalid JWKS response") from exc
-
-
-async def _get_jwks(force_refresh: bool = False) -> dict:
-    global _jwks_cache
-    if not force_refresh and _jwks_cache:
-        return _jwks_cache
-    _jwks_cache = await _fetch_jwks()
-    return _jwks_cache
-
-
-def _find_key(jwks: dict, kid: str) -> Optional[dict]:
-    keys = jwks.get("keys")
-    if not isinstance(keys, list):
-        raise HTTPException(status_code=503, detail="JWKS payload invalid")
-    return next((k for k in keys if k.get("kid") == kid), None)
-
-
-async def _decode_user_claims(
-    credentials: Optional[HTTPAuthorizationCredentials],
-) -> tuple[Optional[str], Optional[str]]:
-    """Decode user_id and email from credentials.
-
-    Returns (user_id, email) tuple — either field may be None on missing
-    credentials or JWT validation failures (expired, bad signature, unknown kid).
-    Propagates 5xx HTTPExceptions from auth infrastructure (JWKS fetch timeout,
-    misconfigured CLERK_JWKS_URL, etc.) so callers can surface them correctly
-    rather than masking outages as 401s.
-    """
-    if not credentials:
-        return None, None
-    token = credentials.credentials
-    try:
-        header = jwt.get_unverified_header(token)
-        kid = header.get("kid", "")
-
-        jwks = await _get_jwks()
-        key = _find_key(jwks, kid)
-
-        if key is None:
-            jwks = await _get_jwks(force_refresh=True)
-            key = _find_key(jwks, kid)
-        if key is None:
-            return None, None
-
-        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(key))
-        decode_options: dict = {}
-        if not CLERK_AUDIENCE:
-            decode_options["verify_aud"] = False
-        payload = jwt.decode(
-            token,
-            public_key,
-            algorithms=["RS256"],
-            issuer=CLERK_ISSUER if CLERK_ISSUER else None,
-            audience=CLERK_AUDIENCE,
-            options=decode_options,
-        )
-        user_id: str = payload.get("sub", "")
-        email: str = payload.get("email", "")
-        return user_id or None, email or None
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        # Token is bad/expired — treat as anonymous, don't raise
-        return None, None
-    except HTTPException as exc:
-        if exc.status_code >= 500:
-            raise  # Auth infrastructure failure — propagate so it surfaces correctly
-        return None, None  # 4xx from auth layer — treat as invalid token
-
-
-async def _decode_user_id(
-    credentials: Optional[HTTPAuthorizationCredentials],
-) -> Optional[str]:
-    """Convenience wrapper — returns just the user_id from _decode_user_claims."""
-    user_id, _ = await _decode_user_claims(credentials)
-    return user_id
-
-
-async def get_current_user_id(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
-) -> str:
-    """Strict auth — raises 401 if token is missing or invalid. Use for protected endpoints.
-    5xx auth infrastructure errors (JWKS outage, misconfiguration) propagate as-is.
-    """
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    user_id = await _decode_user_id(credentials)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return user_id
-
-# Expected keys for the personality model returned by /create-twin
-_PERSONALITY_MODEL_KEYS = {
-    "core_values", "decision_heuristics", "risk_profile",
-    "what_they_optimize_for", "what_they_avoid",
-    "communication_traits", "blind_spots",
-    "decision_framework", "personality_summary",
-}
-
-
-def _extract_json_object(text: str, required_key: str | None = None) -> dict:
-    """Extract the first complete JSON object from *text*.
-
-    Scans every '{' position in turn so that a stray JSON fragment appended
-    after natural-language text doesn't shadow the real response object.
-    Returns the first valid dict (optionally containing *required_key*).
-    """
-    pos = 0
-    last_error: Exception = ValueError("No JSON object found in response")
-    while True:
-        start = text.find('{', pos)
-        if start == -1:
-            raise last_error
-        depth, in_string, escape_next = 0, False, False
-        end = None
-        for i, ch in enumerate(text[start:], start):
-            if escape_next:
-                escape_next = False
-                continue
-            if ch == '\\' and in_string:
-                escape_next = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-        if end is None:
-            # Record the error but continue scanning from the next position
-            last_error = ValueError("Unbalanced braces — could not extract JSON object")
-            pos = start + 1
-            continue
-        try:
-            candidate = json.loads(text[start:end + 1])
-            if isinstance(candidate, dict):
-                if required_key is None or required_key in candidate:
-                    return candidate
-        except json.JSONDecodeError as exc:
-            last_error = exc
-        pos = end + 1  # advance past this block and try the next '{'
-
-
-def _extract_json_array(text: str) -> list:
-    """Extract the first complete JSON array using balanced-bracket scan."""
-    start = text.find('[')
-    if start == -1:
-        raise ValueError("No JSON array found in response")
-    depth, in_string, escape_next = 0, False, False
-    for i, ch in enumerate(text[start:], start):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == '\\' and in_string:
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == '[':
-            depth += 1
-        elif ch == ']':
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start:i + 1])
-    raise ValueError("Unbalanced brackets — could not extract JSON array")
-
-
-def _s3_get_twin(key: str) -> Optional[dict]:
-    """Fetch and parse a twin JSON from S3 by key. Returns None on missing key."""
-    try:
-        response = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-        return json.loads(response["Body"].read().decode("utf-8"))
-    except ClientError as e:
-        if e.response["Error"]["Code"] == "NoSuchKey":
-            return None
-        raise
-
-
-def load_twin(twin_id: str) -> Optional[dict]:
-    """Load a saved twin's data by ID. Validates ID format and confines path to TWINS_DIR.
-
-    Checks public personas first (in-memory), then S3 / local disk.
-    S3 layout: flat key twins/{twin_id}.json for O(1) public lookup.
-    Per-user key twins/{user_id}/{twin_id}.json exists in parallel for listing.
-    """
-    if not _TWIN_ID_RE.match(twin_id):
-        raise HTTPException(status_code=400, detail="Invalid twin ID format")
-
-    if twin_id in _PUBLIC_PERSONAS:
-        return copy.deepcopy(_PUBLIC_PERSONAS[twin_id])
-
-    if USE_S3:
-        # Direct flat-key lookup — O(1), safe for public endpoints
-        return _s3_get_twin(f"{TWINS_S3_PREFIX}{twin_id}.json")
-
-    path = os.path.realpath(os.path.join(TWINS_DIR, f"{twin_id}.json"))
-    if not path.startswith(os.path.realpath(TWINS_DIR) + os.sep):
-        raise HTTPException(status_code=400, detail="Invalid twin ID")
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return None
-
-
-# Request/Response models
 class ChatRequest(BaseModel):
+    """Request body for chat endpoint."""
+    persona_id: str
     message: str
-    session_id: Optional[str] = None
-    twin_id: Optional[str] = None  # if set, chat with a user-created twin
-
-
-class ChatSource(BaseModel):
-    source_id: str
-    source_type: str
-    title: str
-    snippet: str
-    confidence: str
-    tags: List[str] = Field(default_factory=list)
-    matched_terms: List[str] = Field(default_factory=list)
-
-
-class ChatGrounding(BaseModel):
-    answer_type: str
-    confidence_label: str
-    grounding_mode: str
+    conversation_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
+    """Response body for chat endpoint."""
     response: str
-    session_id: str
-    grounding: Optional[ChatGrounding] = None
-    sources: List[ChatSource] = Field(default_factory=list)
-
-
-class Message(BaseModel):
-    role: str
-    content: str
+    conversation_id: str
     timestamp: str
 
 
-class CreateTwinRequest(BaseModel):
-    name: str
-    title: str
-    bio: str
-    email: str = ""
-    skills: str = ""
-    experience: str = ""
-    achievements: str = ""
-    coreValues: str = ""
-    decisionStyle: str = ""
-    riskTolerance: str = ""
-    pastDecisions: str = ""
-    communicationStyle: str = ""
-    writingSamples: str = ""
-    blindSpots: str = ""
-    archetype_id: Optional[str] = None
-    responseStyle: Optional[str] = "balanced"
-    verbalQuirks: Optional[str] = ""
-    linkedinParsed: Optional[Dict[str, Any]] = None
-
-    @field_validator("name", "title", "bio")
-    @classmethod
-    def strip_and_require(cls, v: str, info) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError(f"{info.field_name} must not be empty")
-        limits = {"name": 100, "title": 150, "bio": 2000}
-        limit = limits.get(info.field_name, 2000)
-        if len(v) > limit:
-            raise ValueError(f"{info.field_name} must be {limit} characters or fewer")
-        return v
-
-    @field_validator(
-        "email", "skills", "experience", "achievements",
-        "coreValues", "decisionStyle", "riskTolerance", "pastDecisions",
-        "communicationStyle", "writingSamples", "blindSpots",
-    )
-    @classmethod
-    def strip_optional(cls, v: str, info) -> str:
-        v = v.strip()
-        limits = {
-            "email": 254,       # RFC 5321 max
-            "skills": 1000,
-            "experience": 5000,
-            "achievements": 2000,
-            "coreValues": 2000,
-            "decisionStyle": 3000,
-            "riskTolerance": 500,
-            "pastDecisions": 3000,
-            "communicationStyle": 2000,
-            "writingSamples": 1000,
-            "blindSpots": 2000,
-        }
-        limit = limits.get(info.field_name, 2000)
-        if len(v) > limit:
-            raise ValueError(f"{info.field_name} must be {limit} characters or fewer")
-        return v
-
-    @field_validator("archetype_id")
-    @classmethod
-    def strip_archetype_id(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return v
-        v = v.strip()
-        if len(v) > 50:
-            raise ValueError("archetype_id must be 50 characters or fewer")
-        return v or None
-
-    @field_validator("responseStyle")
-    @classmethod
-    def strip_response_style(cls, v: Optional[str]) -> Optional[str]:
-        if not v:
-            return "balanced"
-        v_normalized = v.strip().lower()
-        allowed_styles = {"concise", "balanced", "detailed"}
-        if v_normalized not in allowed_styles:
-            return "balanced"
-        return v_normalized
-
-    @field_validator("verbalQuirks")
-    @classmethod
-    def strip_verbal_quirks(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return ""
-        v = v.strip()
-        if len(v) > 1500:
-            raise ValueError("verbalQuirks must be 1500 characters or fewer")
-        return v
+class ErrorResponse(BaseModel):
+    """Standard error response."""
+    error: str
+    error_code: str
+    message: str
+    timestamp: str
 
 
-# Valid session_id shapes:
-#   - UUID (any version) from str(uuid.uuid4()): xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-#     Note: the regex accepts any lowercase hex UUID, not only v4.
-#   - 64-char hex from HMAC-SHA256 / SHA-256 _derive_session_id
-_SESSION_ID_RE = re.compile(r'^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{64})$')
+# ============================================================================
+# Error Handling Middleware
+# ============================================================================
+
+class UserFacingError(Exception):
+    """Base class for user-facing errors."""
+    def __init__(self, message: str, error_code: str, status_code: int = 500):
+        self.message = message
+        self.error_code = error_code
+        self.status_code = status_code
+        super().__init__(message)
 
 
-def _validate_session_id(session_id: str) -> None:
-    """Raise 400 if session_id doesn't match the allowed format, preventing path traversal."""
-    if not _SESSION_ID_RE.match(session_id):
-        raise HTTPException(status_code=400, detail="Invalid session ID format")
-
-
-# Memory management functions
-def get_memory_path(session_id: str) -> str:
-    return f"sessions/{session_id}.json"
-
-
-def _load_raw_record(session_id: str) -> Optional[Union[List[Dict], Dict[str, Any]]]:
-    """Load the raw conversation record from storage (S3 or local).
-
-    Returns the parsed JSON value (list or dict) if found, or None if the session
-    does not exist. Raises on storage errors (e.g. AccessDenied, throttling).
-    """
-    _validate_session_id(session_id)
-    if USE_S3:
-        try:
-            response = s3_client.get_object(Bucket=S3_BUCKET, Key=get_memory_path(session_id))
-            return json.loads(response["Body"].read().decode("utf-8"))
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchKey":
-                # Fallback: check legacy flat key (pre-sessions/ prefix)
-                try:
-                    response = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{session_id}.json")
-                    return json.loads(response["Body"].read().decode("utf-8"))
-                except ClientError as legacy_e:
-                    if legacy_e.response["Error"]["Code"] == "NoSuchKey":
-                        return None
-                    raise  # AccessDenied, throttling, etc. — surface, don't silently drop
-            else:
-                raise
-    else:
-        sessions_dir = os.path.realpath(os.path.join(MEMORY_DIR, "sessions"))
-        file_path = os.path.realpath(os.path.join(sessions_dir, f"{session_id}.json"))
-        if not file_path.startswith(sessions_dir + os.sep):
-            raise HTTPException(status_code=400, detail="Invalid session ID format")
-        if os.path.exists(file_path):
-            with open(file_path, "r") as f:
-                return json.load(f)
-        # Fallback: check legacy flat path (pre-sessions/ prefix)
-        memory_dir_real = os.path.realpath(MEMORY_DIR)
-        legacy_path = os.path.realpath(os.path.join(MEMORY_DIR, f"{session_id}.json"))
-        if not legacy_path.startswith(memory_dir_real + os.sep):
-            raise HTTPException(status_code=400, detail="Invalid session ID format")
-        if os.path.exists(legacy_path):
-            with open(legacy_path, "r") as f:
-                return json.load(f)
-        return None
-
-
-def load_conversation(session_id: str) -> List[Dict]:
-    """Load conversation history from storage. Handles legacy list format and current dict format."""
-    raw = _load_raw_record(session_id)
-    if raw is None:
-        return []
-    # Support both legacy list format and current dict format
-    if isinstance(raw, list):
-        return raw
-    return raw.get("messages", [])
-
-
-def save_conversation(
-    session_id: str,
-    messages: List[Dict],
-    chatter_id: Optional[str] = None,
-    twin_owner_id: Optional[str] = None,
-):
-    """Save conversation history with owner metadata for future access-control migration."""
-    _validate_session_id(session_id)
-    data: Any = {
-        "session_id": session_id,
-        "chatter_id": chatter_id,       # authenticated user who is chatting (None = anonymous)
-        "twin_owner_id": twin_owner_id,  # user_id of the twin's creator
-        "messages": messages,
-    }
-    if USE_S3:
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=get_memory_path(session_id),
-            Body=json.dumps(data, indent=2),
-            ContentType="application/json",
+class LambdaColdStartError(UserFacingError):
+    """Lambda cold start timeout."""
+    def __init__(self):
+        super().__init__(
+            message="Service temporarily unavailable due to high demand. Please try again in a few seconds.",
+            error_code="LAMBDA_COLD_START",
+            status_code=503
         )
-    else:
-        sessions_dir = os.path.realpath(os.path.join(MEMORY_DIR, "sessions"))
-        os.makedirs(sessions_dir, exist_ok=True)
-        file_path = os.path.realpath(os.path.join(sessions_dir, f"{session_id}.json"))
-        if not file_path.startswith(sessions_dir + os.sep):
-            raise HTTPException(status_code=400, detail="Invalid session ID format")
-        with open(file_path, "w") as f:
-            json.dump(data, f, indent=2)
 
 
-@app.get("/")
-async def root():
-    return {
-        "message": "AI Digital Twin API (Powered by AWS Bedrock)",
-        "memory_enabled": True,
-        "storage": "S3" if USE_S3 else "local",
-        "ai_model": BEDROCK_MODEL_ID
-    }
+class BedrockThrottleError(UserFacingError):
+    """Bedrock API throttling (rate limit exceeded)."""
+    def __init__(self):
+        super().__init__(
+            message="Service is experiencing high demand. Please try again shortly.",
+            error_code="BEDROCK_THROTTLE",
+            status_code=429
+        )
 
+
+class S3Error(UserFacingError):
+    """S3 operation failed."""
+    def __init__(self, original_error: str = None):
+        super().__init__(
+            message="Unable to load persona data. Please try again.",
+            error_code="S3_ERROR",
+            status_code=503
+        )
+        self.original_error = original_error
+
+
+@app.exception_handler(UserFacingError)
+async def user_facing_error_handler(request: Request, exc: UserFacingError):
+    """Handle user-facing errors with friendly messages."""
+    logger.error(f"{exc.error_code}: {exc.original_error if hasattr(exc, 'original_error') else exc.message}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            error=exc.error_code,
+            error_code=exc.error_code,
+            message=exc.message,
+            timestamp=datetime.utcnow().isoformat()
+        ).dict()
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            error="HTTP_ERROR",
+            error_code="HTTP_ERROR",
+            message=exc.detail,
+            timestamp=datetime.utcnow().isoformat()
+        ).dict()
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected exceptions with generic error message."""
+    logger.exception(f"Unexpected error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            error="INTERNAL_ERROR",
+            error_code="INTERNAL_ERROR",
+            message="An unexpected error occurred. Please try again later.",
+            timestamp=datetime.utcnow().isoformat()
+        ).dict()
+    )
+
+
+# ============================================================================
+# Retry Logic with Exponential Backoff
+# ============================================================================
+
+def invoke_bedrock_with_backoff(model_id: str, prompt: str, max_retries: int = MAX_RETRIES) -> str:
+    """Invoke Bedrock model with exponential backoff for throttling.
+    
+    Args:
+        model_id: Bedrock model ID
+        prompt: Input prompt for the model
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Model response text
+        
+    Raises:
+        BedrockThrottleError: If throttled after max retries
+        LambdaColdStartError: If timeout occurs
+    """
+    backoff_seconds = INITIAL_BACKOFF_SECONDS
+    
+    for attempt in range(max_retries + 1):
+        try:
+            logger.info(f"Invoking Bedrock model (attempt {attempt + 1}/{max_retries + 1})")
+            
+            response = bedrock_client.invoke_model(
+                modelId=model_id,
+                body=json.dumps({
+                    "prompt": prompt,
+                    "max_tokens_to_sample": 1024,
+                    "temperature": 0.7,
+                })
+            )
+            
+            response_body = json.loads(response["body"].read())
+            return response_body.get("completion", "")
+            
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            
+            # Handle throttling
+            if error_code == "ThrottlingException":
+                logger.warning(f"Bedrock throttled (attempt {attempt + 1}/{max_retries + 1})")
+                if attempt < max_retries:
+                    logger.info(f"Retrying in {backoff_seconds} seconds...")
+                    time.sleep(backoff_seconds)
+                    backoff_seconds *= 2  # Exponential backoff
+                else:
+                    raise BedrockThrottleError()
+            
+            # Handle timeout (cold start)
+            elif error_code == "RequestTimeout" or "timed out" in str(e).lower():
+                logger.error(f"Bedrock request timeout (cold start): {e}")
+                raise LambdaColdStartError()
+            
+            else:
+                logger.error(f"Bedrock error: {error_code}: {e}")
+                raise
+        
+        except Exception as e:
+            logger.error(f"Unexpected error invoking Bedrock: {e}")
+            raise
+    
+    # Should not reach here
+    raise BedrockThrottleError()
+
+
+def read_s3_with_backoff(bucket: str, key: str, max_retries: int = MAX_RETRIES) -> str:
+    """Read S3 object with exponential backoff for transient failures.
+    
+    Args:
+        bucket: S3 bucket name
+        key: S3 object key
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Object content as string
+        
+    Raises:
+        S3Error: If read fails after max retries
+    """
+    backoff_seconds = INITIAL_BACKOFF_SECONDS
+    
+    for attempt in range(max_retries + 1):
+        try:
+            logger.info(f"Reading S3 object s3://{bucket}/{key} (attempt {attempt + 1}/{max_retries + 1})")
+            
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            return response["Body"].read().decode("utf-8")
+            
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            
+            # Handle transient errors (retry)
+            if error_code in ["ServiceUnavailable", "SlowDown", "RequestTimeout"]:
+                logger.warning(f"S3 transient error: {error_code} (attempt {attempt + 1}/{max_retries + 1})")
+                if attempt < max_retries:
+                    # Exponential backoff with jitter
+                    import random
+                    jitter = random.uniform(0, backoff_seconds)
+                    sleep_time = backoff_seconds + jitter
+                    logger.info(f"Retrying in {sleep_time:.2f} seconds...")
+                    time.sleep(sleep_time)
+                    backoff_seconds *= 2
+                else:
+                    raise S3Error(original_error=error_code)
+            
+            # Handle permanent errors (don't retry)
+            elif error_code == "AccessDenied":
+                logger.error(f"S3 access denied: {e}")
+                raise S3Error(original_error="AccessDenied")
+            
+            elif error_code == "NoSuchBucket":
+                logger.error(f"S3 bucket not found: {e}")
+                raise S3Error(original_error="NoSuchBucket")
+            
+            elif error_code == "NoSuchKey":
+                logger.error(f"S3 object not found: {e}")
+                raise S3Error(original_error="NoSuchKey")
+            
+            else:
+                logger.error(f"S3 error: {error_code}: {e}")
+                raise S3Error(original_error=error_code)
+        
+        except Exception as e:
+            logger.error(f"Unexpected error reading S3: {e}")
+            raise S3Error(original_error=str(e))
+    
+    # Should not reach here
+    raise S3Error(original_error="Max retries exceeded")
+
+
+# ============================================================================
+# API Endpoints
+# ============================================================================
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint."""
     return {
         "status": "healthy",
-        "use_s3": USE_S3,
-        "bedrock_model": BEDROCK_MODEL_ID
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.0.0"
     }
-
-
-@app.get("/archetypes")
-async def list_archetypes():
-    """Return all available archetypes for the frontend dropdown."""
-    return {"archetypes": get_all_archetypes()}
-
-
-def _derive_session_id(chatter_id: str, twin_id: str) -> str:
-    """Return an opaque, stable session key for an authenticated user + twin pair.
-
-    HMAC-SHA256 of 'chatter_id:twin_id' with SESSION_HMAC_SECRET makes the key
-    non-guessable even if both IDs are known. This keeps session identifiers
-    opaque for authenticated callers (e.g. when fetching /conversation/{session_id})
-    and avoids leaking information about underlying user or twin IDs.
-    Falls back to SHA-256 without a secret when SESSION_HMAC_SECRET is not set
-    (local development only) — preserves stability and format validity but not secrecy.
-    """
-    if SESSION_HMAC_SECRET:
-        return hmac.new(
-            SESSION_HMAC_SECRET.encode("utf-8"),
-            f"{chatter_id}:{twin_id}".encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-    # Dev fallback — no secret, but still produces a valid 64-char hex so the
-    # session_id passes format validation. Not safe for production (predictable).
-    return hashlib.sha256(f"{chatter_id}:{twin_id}".encode("utf-8")).hexdigest()
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(
-    request: ChatRequest,
-    http_request: Request,
-    background_tasks: BackgroundTasks,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
-):
-    try:
-        # Resolve caller identity (optional — anonymous callers are allowed)
-        chatter_id, user_email = await _decode_user_claims(credentials)
-
-        # Derive an opaque stable session key for authenticated users so memory
-        # persists across devices and page reloads. Anonymous users fall back to
-        # the client-supplied session_id (ephemeral, within-browser-session only).
-        if chatter_id and request.twin_id:
-            session_id = _derive_session_id(chatter_id, request.twin_id)
-        else:
-            session_id = request.session_id or str(uuid.uuid4())
-
-        # Guard against session hijacking: if the stored record was created by
-        # an authenticated user, only that same user (or a caller with no stored
-        # chatter_id to compare against) may continue it.
-        existing_record = _load_raw_record(session_id)
-        stored_chatter_id = (
-            existing_record.get("chatter_id")
-            if isinstance(existing_record, dict)
-            else None
-        )
-        if stored_chatter_id is not None and stored_chatter_id != chatter_id:
-            raise HTTPException(
-                status_code=403,
-                detail="Forbidden: this session belongs to a different user",
-            )
-
-        # Load conversation history from the already-fetched record (avoids a
-        # second storage read).
-        if existing_record is None:
-            conversation: List[Dict] = []
-        elif isinstance(existing_record, list):
-            conversation = existing_record
-        else:
-            conversation = existing_record.get("messages", [])
-
-        # Load twin personality model if twin_id provided
-        personality_model = None
-        twin_name = None
-        twin_title = None
-        twin_data = None
-        if request.twin_id:
-            twin_data = load_twin(request.twin_id)
-            # Enforce anonymous question limit on public personas
-            if twin_data and twin_data.get("is_public") and not chatter_id:
-                # Require a client-supplied session_id so the limit can't be
-                # bypassed by omitting it (which would otherwise cause the
-                # server to generate a fresh UUID, resetting the counter).
-                if not request.session_id:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="session_id is required for anonymous public persona chat",
-                    )
-                anon_q_count = sum(1 for m in conversation if m.get("role") == "user")
-                if anon_q_count >= PUBLIC_PERSONA_ANON_LIMIT:
-                    raise HTTPException(
-                        status_code=402,
-                        detail="ANON_LIMIT_REACHED",
-                    )
-            if not twin_data:
-                raise HTTPException(status_code=404, detail=f"Twin '{request.twin_id}' not found")
-            personality_model = twin_data.get("personality_model", {})
-            # Attach raw fields so context builder can access them
-            personality_model["_context"] = twin_data.get("personality_model", {}).get("_context", {})
-            twin_name = twin_data.get("name")
-            twin_title = twin_data.get("title")
-
-        # Determine response_style from personality model context.
-        # Default twin (no twin_id) uses "concise" to keep homepage chat snappy.
-        response_style = "concise" if not request.twin_id else "balanced"
-        if personality_model:
-            response_style = personality_model.get("_context", {}).get("responseStyle", response_style)
-
-        corrections = twin_data.get("corrections") if twin_data else None
-        normalized_sources = None
-        if twin_data:
-            normalized_sources = _normalize_source_ids(ensure_sources(twin_data))
-            twin_data["sources"] = normalized_sources
-
-        viewer_is_authenticated = chatter_id is not None
-
-        # Run intent classification concurrently with chat orchestration.
-        # Nova Micro (~300 ms) finishes well before Nova Lite (~2 s), so there
-        # is no perceptible latency increase.
-        (is_connect, intent_type, intent_summary), orchestration = await asyncio.gather(
-            _classify_feedback_intent(request.message),
-            asyncio.to_thread(
-                run_chat_orchestration,
-                twin_data=twin_data,
-                sources=normalized_sources,
-                user_message=request.message,
-                conversation=conversation,
-                bedrock_client=bedrock_client,
-                model_id=BEDROCK_MODEL_ID,
-                personality_model=personality_model,
-                twin_name=twin_name,
-                twin_title=twin_title,
-                response_style=response_style,
-                corrections=corrections,
-                viewer_is_authenticated=viewer_is_authenticated,
-            ),
-        )
-        assistant_response = orchestration["answer"]
-
-        # If a feedback/connect intent was detected, acknowledge it in the response.
-        if is_connect:
-            ack_map = {
-                "feedback": "I've passed your feedback along to Sidd — he'll appreciate hearing it.",
-                "compliment": "I've shared your kind words with Sidd — that really means a lot.",
-                "complaint": "I've forwarded your concern to Sidd so he can look into it.",
-                "review": "I've let Sidd know you'd like to leave a review — thanks for taking the time.",
-                "connect": "I've let Sidd know you'd like to get in touch — he'll reach out.",
-            }
-            ack = ack_map.get(intent_type, ack_map["connect"])
-            assistant_response = f"{assistant_response}\n\n*{ack}*"
-
-        # Rate limiting and SES send happen in the background (classification already done).
-        background_tasks.add_task(
-            _send_notify_if_intent,
-            message=request.message,
-            session_id=session_id,
-            twin_name=twin_name or "Sidd",
-            viewer_is_authenticated=viewer_is_authenticated,
-            chatter_id=chatter_id,
-            user_email=user_email,
-            ip=_client_ip(http_request),
-            conversation=list(conversation),
-            is_connect=is_connect,
-            intent_type=intent_type,
-            intent_summary=intent_summary,
-        )
-
-        # Personality review step (gated — enable via PERSONALITY_REVIEW_ENABLED=true)
-        if PERSONALITY_REVIEW_ENABLED:
-            archetype_id = twin_data.get("archetype_id") if request.twin_id and twin_data else None
-            archetype = get_archetype(archetype_id) if archetype_id else None
-            if archetype:
-                twin_context = f"{twin_name or 'Professional'}, {twin_title or ''}. {twin_data.get('personality_model', {}).get('personality_summary', '')[:200]}"
-                assistant_response = review_response(assistant_response, archetype, twin_context, bedrock_client, BEDROCK_MODEL_ID)
-
-        # Update conversation history
-        conversation.append(
-            {"role": "user", "content": request.message, "timestamp": datetime.now().isoformat()}
-        )
-        conversation.append(
-            {
-                "role": "assistant",
-                "content": assistant_response,
-                "timestamp": datetime.now().isoformat(),
-            }
-        )
-
-        # Save conversation — preserve an existing non-null chatter_id so that
-        # unauthenticated retries cannot "de-own" a session that was previously
-        # created by an authenticated caller.
-        twin_owner_id = twin_data.get("user_id") if twin_data else None
-        effective_chatter_id = chatter_id or stored_chatter_id
-        save_conversation(session_id, conversation, chatter_id=effective_chatter_id, twin_owner_id=twin_owner_id)
-
-        # Source snippets and grounding may contain sensitive onboarding/correction
-        # content. Only return them to the twin owner, or for built-in/public twins
-        # that do not have an owner.
-        is_public_twin = twin_data is not None and not twin_owner_id
-        can_view_source_details = is_public_twin or (
-            chatter_id is not None and chatter_id == twin_owner_id
-        )
-
-        return ChatResponse(
-            response=assistant_response,
-            session_id=session_id,
-            grounding=(
-                ChatGrounding(**orchestration["grounding"])
-                if can_view_source_details and orchestration["grounding"]
-                else None
-            ),
-            sources=(
-                [ChatSource(**source) for source in orchestration["retrieved_sources"]]
-                if can_view_source_details
-                else []
-            ),
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Error in chat endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.get("/conversation/{session_id}")
-async def get_conversation(
-    session_id: str,
-    _user_id: str = Depends(get_current_user_id),
-):
-    """Retrieve conversation history for the given session_id.
-
-    Requires authentication. Enforces ownership: only the authenticated user
-    whose ``chatter_id`` matches the stored record may retrieve the conversation.
-    Returns 404 for unknown sessions, sessions without ownership metadata, or
-    sessions owned by a different user.
+async def chat(request: ChatRequest):
+    """Chat with a personality twin.
+    
+    Args:
+        request: ChatRequest with persona_id, message, and optional conversation_id
+        
+    Returns:
+        ChatResponse with model response and conversation_id
+        
+    Raises:
+        LambdaColdStartError: If Lambda cold start timeout occurs
+        BedrockThrottleError: If Bedrock throttles the request
+        S3Error: If persona data cannot be loaded from S3
     """
+    logger.info(f"Chat request: persona_id={request.persona_id}, message_length={len(request.message)}")
+    
+    # Load persona context from S3
+    persona_key = f"personas/{request.persona_id}/context.json"
     try:
-        raw = _load_raw_record(session_id)
-        if raw is None:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-
-        # Enforce ownership using stored chatter_id metadata.
-        if isinstance(raw, dict) and "chatter_id" in raw:
-            if raw["chatter_id"] != _user_id:
-                # Hide existence details from unauthorized callers.
-                raise HTTPException(status_code=404, detail="Conversation not found")
-            messages = raw.get("messages", [])
-        else:
-            # Legacy list format or missing chatter_id — deny to avoid leaking data
-            # from conversations not clearly associated with this user.
-            raise HTTPException(status_code=404, detail="Conversation not found")
-
-        return {"session_id": session_id, "messages": messages}
-    except HTTPException:
+        persona_context = read_s3_with_backoff(S3_BUCKET_NAME, persona_key)
+        persona_data = json.loads(persona_context)
+    except S3Error:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    
+    # Build prompt with persona context
+    system_prompt = f"""
+You are {persona_data.get('name', 'a personality twin')}.
 
+Background:
+{persona_data.get('bio', '')}
 
-# Cache for taglines to reduce API calls
-tagline_cache = {"taglines": None, "timestamp": None}
-TAGLINE_CACHE_TTL = 3600  # Cache for 1 hour
-
-
-@app.get("/taglines")
-async def get_taglines():
-    """Generate humorous and attractive taglines dynamically using AI (cached)"""
-    global tagline_cache
-    from datetime import datetime, timedelta
-
-    # Check if cache is still valid
-    if (tagline_cache["taglines"] is not None and
-        tagline_cache["timestamp"] is not None and
-        datetime.now() - tagline_cache["timestamp"] < timedelta(seconds=TAGLINE_CACHE_TTL)):
-        print("Returning cached taglines")
-        return {"taglines": tagline_cache["taglines"]}
-
-    try:
-        print("Generating new taglines from AI...")
-        prompt_text = """Generate exactly 10 short, humorous, witty, and attractive taglines for an AI Digital Twin product.
-        Each tagline should be catchy, fun, and appeal to tech-savvy users. They should relate to AI, digital clones, productivity, or self-improvement.
-        Keep each tagline to 2-5 words maximum.
-        Format: Return only a JSON array of strings, nothing else.
-        Example format: ["Coffee with this guy", "Resumes are old school", "Your digital brainpower unleashed"]"""
-
-        messages = [
-            {
-                "role": "user",
-                "content": [{"text": prompt_text}]
-            }
-        ]
-
-        response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=messages,
-            inferenceConfig={
-                "maxTokens": 500,
-                "temperature": 0.9,
-                "topP": 0.95
-            }
-        )
-
-        response_text = response["output"]["message"]["content"][0]["text"]
-
-        try:
-            taglines = _extract_json_array(response_text)
-            tagline_cache["taglines"] = taglines
-            tagline_cache["timestamp"] = datetime.now()
-            return {"taglines": taglines}
-        except (ValueError, json.JSONDecodeError):
-            fallback = ["Talk to your AI twin", "Your digital self awaits", "AI collaboration unlocked"]
-            tagline_cache["taglines"] = fallback
-            tagline_cache["timestamp"] = datetime.now()
-            return {"taglines": fallback}
-
-    except Exception as e:
-        print(f"Error generating taglines: {str(e)}")
-        # Return fallback taglines on error
-        fallback = [
-            "Coffee with this guy",
-            "Resumes are old school",
-            "Your digital brainpower unleashed",
-            "The future of collaboration is here",
-            "AI that gets you",
-            "Your second brain in action",
-            "Talk to your smarter self",
-            "Meet Sidd 2.0",
-            "Intelligence amplified",
-            "Your AI just leveled up"
-        ]
-        tagline_cache["taglines"] = fallback
-        tagline_cache["timestamp"] = datetime.now()
-        return {"taglines": fallback}
-
-
-@app.post("/parse-linkedin")
-async def parse_linkedin(file: UploadFile = File(...)):
-    """Extract structured profile data from a LinkedIn PDF using Bedrock"""
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-    try:
-        contents = await file.read()
-        reader = PdfReader(io.BytesIO(contents))
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read PDF: {str(e)}")
-
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
-
-    extract_prompt = f"""You are extracting structured profile data from a LinkedIn PDF export.
-
-LinkedIn PDF content:
-{text[:6000]}
-
-Extract the following fields and return ONLY a valid JSON object with these exact keys:
-{{
-  "name": "full name",
-  "title": "current job title and company",
-  "bio": "2-3 sentence professional summary",
-  "skills": "comma-separated list of top skills",
-  "experience": "bullet list of roles: Company (dates): what they did",
-  "achievements": "notable achievements, awards, or highlights",
-  "communicationStyle": "inferred communication style based on their writing and background"
-}}
-
-If a field cannot be determined, use an empty string. Return only the JSON, no other text."""
-
-    try:
-        response = await asyncio.to_thread(
-            bedrock_client.converse,
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": extract_prompt}]}],
-            inferenceConfig={"maxTokens": 1500, "temperature": 0.2},
-        )
-        response_text = response["output"]["message"]["content"][0]["text"]
-
-        try:
-            parsed = _extract_json_object(response_text)
-        except (ValueError, json.JSONDecodeError) as exc:
-            print(f"JSON extraction failed in parse-linkedin: {exc}")
-            raise HTTPException(status_code=500, detail="Could not parse AI response as JSON")
-
-        # Detect archetype from title
-        archetype = detect_archetype(parsed.get("title", ""))
-        parsed["archetype_id"] = archetype["id"] if archetype else None
-        parsed["archetype_display_name"] = archetype["display_name"] if archetype else None
-
-        return parsed
-
-    except HTTPException:
-        raise
-    except ClientError as e:
-        print(f"Bedrock ClientError in parse-linkedin: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process LinkedIn profile")
-    except Exception as e:
-        print(f"Unexpected error in parse-linkedin: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process LinkedIn profile")
-
-
-@app.get("/twin/{twin_id}")
-async def get_twin(twin_id: str):
-    """Fetch public profile data for a twin"""
-    twin_data = load_twin(twin_id)
-    if not twin_data:
-        raise HTTPException(status_code=404, detail="Twin not found")
-    return {
-        "twin_id": twin_data["twin_id"],
-        "name": twin_data["name"],
-        "title": twin_data.get("title", ""),
-        "personality_summary": twin_data.get("personality_model", {}).get("personality_summary", ""),
-        "core_values": twin_data.get("personality_model", {}).get("core_values", []),
-        "archetype_display_name": twin_data.get("archetype_display_name"),
-        "created_at": twin_data.get("created_at", ""),
-        "source_count": len(ensure_sources(twin_data)),
-    }
-
-
-@app.get("/public-personas")
-async def list_public_personas():
-    """Return the list of built-in public personas available to all users."""
-    return {
-        "personas": [
-            {
-                "twin_id": p["twin_id"],
-                "persona_id": p.get("persona_id"),
-                "name": p["name"],
-                "title": p.get("title", ""),
-                "tagline": p.get("tagline", ""),
-                "era": p.get("era", ""),
-                "image_url": p.get("image_url"),
-                "personality_summary": p.get("personality_model", {}).get("personality_summary", ""),
-                "chat_url": f"/twin?id={p['twin_id']}",
-            }
-            for p in sorted(
-                _PUBLIC_PERSONAS.values(),
-                key=lambda persona: (
-                    str(persona.get("persona_id") or ""),
-                    str(persona.get("name") or ""),
-                ),
-            )
-        ]
-    }
-
-
-@app.get("/users/me/twins")
-async def list_my_twins(user_id: str = Depends(get_current_user_id)):
-    """List all twins belonging to the authenticated user."""
-    twins = []
-    if USE_S3:
-        # Scoped prefix — only fetches this user's objects, not a full table scan
-        user_prefix = f"{TWINS_S3_PREFIX}{user_id}/"
-        paginator = s3_client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=user_prefix):
-            for obj in page.get("Contents", []):
-                try:
-                    resp = s3_client.get_object(Bucket=S3_BUCKET, Key=obj["Key"])
-                    data = json.loads(resp["Body"].read())
-                    # Safety guard — prefix already scopes to this user
-                    if data.get("user_id") == user_id:
-                        twins.append({
-                            "twin_id": data["twin_id"],
-                            "name": data["name"],
-                            "title": data.get("title", ""),
-                            "archetype_display_name": data.get("archetype_display_name"),
-                            "created_at": data.get("created_at", ""),
-                            "chat_url": data.get("chat_url", f"/twin?id={data['twin_id']}"),
-                            "depth_score": _compute_depth_score(data),
-                        })
-                except Exception as e:
-                    print(f"Warning: could not read S3 object {obj['Key']}: {e}")
-                    continue
-    else:
-        twins_path = Path(TWINS_DIR)
-        if twins_path.exists():
-            for f in sorted(twins_path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-                try:
-                    data = json.loads(f.read_text())
-                    if data.get("user_id") == user_id:
-                        twins.append({
-                            "twin_id": data["twin_id"],
-                            "name": data["name"],
-                            "title": data.get("title", ""),
-                            "archetype_display_name": data.get("archetype_display_name"),
-                            "created_at": data.get("created_at", ""),
-                            "chat_url": data.get("chat_url", f"/twin?id={data['twin_id']}"),
-                            "depth_score": _compute_depth_score(data),
-                        })
-                except Exception as e:
-                    print(f"Warning: could not read twin file {f}: {e}")
-                    continue
-    twins.sort(key=lambda t: t["created_at"], reverse=True)
-    return {"twins": twins}
-
-
-@app.post("/create-twin")
-async def create_twin(request: CreateTwinRequest, user_id: str = Depends(get_current_user_id)):
-    """Synthesize submitted profile data into a structured personality model via Bedrock"""
-
-    synthesis_prompt = f"""You are building a personality model for an AI twin. Your job is to deeply analyze everything provided and produce a structured JSON model that captures how this person THINKS and DECIDES — not just what they've done.
-
-This model will be used to answer questions like "What would {request.name} do?" in real situations.
-
-=== PROFILE DATA ===
-
-Name: {request.name}
-Title: {request.title}
-Bio: {request.bio}
-
-Skills: {request.skills}
-
-Work Experience:
-{request.experience}
-
-Achievements:
-{request.achievements}
-
-Core Values:
-{request.coreValues}
-
-Decision-Making Style:
-{request.decisionStyle}
-
-Risk Tolerance: {request.riskTolerance}
-
-Past Decisions & Reasoning:
-{request.pastDecisions}
+Values and Principles:
+{persona_data.get('values', '')}
 
 Communication Style:
-{request.communicationStyle}
+{persona_data.get('communication_style', '')}
 
-Writing Samples/Links:
-{request.writingSamples}
-
-Blind Spots & Biases:
-{request.blindSpots}
-
-=== TASK ===
-
-Analyze all of the above and return ONLY a valid JSON object with this exact structure:
-
-{{
-  "core_values": ["value 1", "value 2", ...],
-  "decision_heuristics": [
-    "When facing X type of decision, they tend to Y",
-    ...
-  ],
-  "risk_profile": "one paragraph describing how they approach risk and uncertainty",
-  "what_they_optimize_for": ["thing 1", "thing 2", ...],
-  "what_they_avoid": ["thing 1", "thing 2", ...],
-  "communication_traits": ["trait 1", "trait 2", ...],
-  "blind_spots": ["blind spot 1", "blind spot 2", ...],
-  "decision_framework": "2-3 sentence summary of their overall decision-making philosophy",
-  "personality_summary": "3-4 sentence paragraph capturing the essence of who this person is and how they operate — written in second person as if talking to their twin"
-}}
-
-Be specific and concrete. Avoid generic statements. Infer from the data even when not explicit. Return only the JSON."""
-
+Respond authentically as this person would, drawing on their experience and perspective.
+"""
+    
+    full_prompt = f"{system_prompt}\n\nUser: {request.message}\n\nAssistant:"
+    
+    # Invoke Bedrock with backoff
     try:
-        response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": synthesis_prompt}]}],
-            inferenceConfig={"maxTokens": 2000, "temperature": 0.3},
-        )
-        response_text = response["output"]["message"]["content"][0]["text"]
-
-        try:
-            personality_model = _extract_json_object(response_text)
-        except (ValueError, json.JSONDecodeError):
-            raise HTTPException(status_code=500, detail="Could not parse personality model from AI response")
-
-        missing = _PERSONALITY_MODEL_KEYS - personality_model.keys()
-        if missing:
-            raise HTTPException(status_code=500, detail=f"Personality model missing expected keys: {missing}")
-
-    except HTTPException:
+        response_text = invoke_bedrock_with_backoff(BEDROCK_MODEL_ID, full_prompt)
+    except (BedrockThrottleError, LambdaColdStartError):
         raise
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
-
-    twin_id = uuid.uuid4().hex  # 32 hex chars (128-bit) — no truncation, no collision risk
-
-    # Embed the context fields the prompt builder needs directly in the personality model.
-    personality_model["_context"] = {
-        "bio": request.bio,
-        "skills": request.skills,
-        "experience": request.experience,
-        "achievements": request.achievements,
-        "coreValues": request.coreValues,
-        "decisionStyle": request.decisionStyle,
-        "pastDecisions": request.pastDecisions,
-        "communicationStyle": request.communicationStyle,
-        "blindSpots": request.blindSpots,
-        "verbalQuirks": request.verbalQuirks or "",
-        "responseStyle": request.responseStyle or "balanced",
-    }
-
-    # Resolve archetype — reject unknown IDs so clients aren't misled
-    archetype_id = request.archetype_id or None
-    archetype_obj = get_archetype(archetype_id) if archetype_id else None
-    if archetype_id and archetype_obj is None:
-        raise HTTPException(status_code=400, detail=f"Unknown archetype_id: {archetype_id!r}")
-    archetype_display_name = archetype_obj["display_name"] if archetype_obj else None
-
-    twin_data: Dict[str, Any] = {
-        "twin_id": twin_id,
-        "user_id": user_id,
-        "name": request.name,
-        "title": request.title,
-        "archetype_id": archetype_id,
-        "archetype_display_name": archetype_display_name,
-        "personality_model": personality_model,
-        "sources": build_initial_sources(request.model_dump(), request.linkedinParsed),
-        "created_at": datetime.now().isoformat(),
-        "chat_url": f"/twin?id={twin_id}",
-    }
-
-    if USE_S3:
-        payload = json.dumps(twin_data, indent=2)
-        # Flat key for O(1) public lookup (load_twin, /twin/{id}, /chat)
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=f"{TWINS_S3_PREFIX}{twin_id}.json",
-            Body=payload,
-            ContentType="application/json",
-        )
-        # Per-user key for efficient user listing (list_my_twins)
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=f"{TWINS_S3_PREFIX}{user_id}/{twin_id}.json",
-            Body=payload,
-            ContentType="application/json",
-        )
-    else:
-        # Local / Lambda /tmp fallback — not durable across Lambda cold starts
-        os.makedirs(TWINS_DIR, exist_ok=True)
-        try:
-            max_twins = int(os.getenv("MAX_TWINS_FILES", "1000"))
-        except ValueError:
-            max_twins = 1000
-        existing = sorted(Path(TWINS_DIR).glob("*.json"), key=lambda p: p.stat().st_mtime)
-        for old_file in existing[: max(0, len(existing) - max_twins + 1)]:
-            old_file.unlink(missing_ok=True)
-        with open(os.path.join(TWINS_DIR, f"{twin_id}.json"), "w") as f:
-            json.dump(twin_data, f, indent=2)
-
-    return {"twin_id": twin_id, "personality_model": personality_model}
-
-
-def _compute_depth_score(data: dict) -> str:
-    """Return 'Basic', 'Developed', or 'Deep' based on which of the 4 persona layers are populated.
-
-    Layer 1 – Surface:        bio present (> 20 chars)
-    Layer 2 – Decisions:      pastDecisions present
-    Layer 3 – Values:         coreValues present
-    Layer 4 – Meta-cognition: mindChange present (only filled by the deepen flow)
-    """
-    personality_model = data.get("personality_model") or {}
-    ctx = personality_model.get("_context", {}) if isinstance(personality_model, dict) else {}
-    core_values = personality_model.get("core_values") if isinstance(personality_model, dict) else None
-
-    def _filled(key: str, min_len: int = 5) -> bool:
-        v = ctx.get(key)
-        return isinstance(v, str) and len(v.strip()) >= min_len
-
-    def _values_layer_filled() -> bool:
-        """Layer 3 – Values: consider either _context['coreValues'] or personality_model['core_values']."""
-        # Prefer an explicit coreValues string in _context if present
-        if _filled("coreValues"):
-            return True
-        # Fallback: check personality_model.core_values list
-        if isinstance(core_values, list):
-            for v in core_values:
-                if isinstance(v, str) and v.strip():
-                    return True
-        return False
-
-    layers = sum([
-        _filled("bio", 20),
-        _filled("pastDecisions"),
-        _values_layer_filled(),
-        _filled("mindChange"),
-    ])
-
-    # deepen_completed_at is stamped by _deepen_and_save whenever the interview
-    # finishes. Use it as a reliable "Deep" signal because the LLM sometimes
-    # covers a topic without populating the corresponding field_updates key,
-    # leaving mindChange empty even though the user completed the flow.
-    if data.get("deepen_completed_at") or layers == 4:
-        return "Deep"
-    if layers >= 2:
-        return "Developed"
-    return "Basic"
-
-
-def _save_twin(twin_id: str, user_id: str, twin_data: dict) -> None:
-    """Persist twin_data to both S3 keys (flat + per-user) or local disk."""
-    if USE_S3:
-        payload = json.dumps(twin_data, indent=2)
-        for key in (
-            f"{TWINS_S3_PREFIX}{twin_id}.json",
-            f"{TWINS_S3_PREFIX}{user_id}/{twin_id}.json",
-        ):
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=key,
-                Body=payload,
-                ContentType="application/json",
-            )
-    else:
-        os.makedirs(TWINS_DIR, exist_ok=True)
-        with open(os.path.join(TWINS_DIR, f"{twin_id}.json"), "w") as f:
-            json.dump(twin_data, f, indent=2)
-
-
-class AddCorrectionRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=500)
-    wrong_response: str = Field(..., min_length=1, max_length=500)
-    correction: str = Field(..., min_length=1, max_length=500)
-
-    @field_validator("question", "wrong_response", "correction", mode="before")
-    @classmethod
-    def strip_and_validate_non_empty(cls, v: Any) -> str:
-        if v is None:
-            raise ValueError("must not be empty")
-        if not isinstance(v, str):
-            raise TypeError("must be a string")
-        v = v.strip()
-        if not v:
-            raise ValueError("must not be empty or whitespace")
-        return v
-@app.patch("/twin/{twin_id}/corrections")
-async def add_correction(
-    twin_id: str,
-    request: AddCorrectionRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    """Append a user-supplied correction to a twin they own."""
-    twin_data = load_twin(twin_id)
-    if not twin_data or twin_data.get("user_id") != user_id:
-        raise HTTPException(status_code=404, detail="Twin not found")
-
-    corrections: list = twin_data.get("corrections", [])
-    corrections.append({
-        "question": request.question[:500],
-        "wrong_response": request.wrong_response[:500],
-        "correction": request.correction[:500],
-        "created_at": datetime.now().isoformat(),
-    })
-    # Cap stored corrections to avoid unbounded growth
-    twin_data["corrections"] = corrections[-20:]
-    correction_source = build_correction_source(
-        question=request.question[:500],
-        wrong_response=request.wrong_response[:500],
-        correction=request.correction[:500],
-        created_at=corrections[-1]["created_at"],
-    )
-    twin_data["sources"] = merge_sources(
-        twin_data.get("sources", []),
-        [correction_source] if correction_source else [],
-    )
-    _save_twin(twin_id, user_id, twin_data)
-    return {"status": "ok", "corrections_count": len(twin_data["corrections"])}
-
-
-# ---------------------------------------------------------------------------
-# Persona vs Persona debate
-# ---------------------------------------------------------------------------
-
-# Number of rounds for the batched /chat/debate endpoint only.
-# Each twin speaks once per round (total turns = DEBATE_ROUNDS * 2).
-# Default kept at 2 to stay safely within the API Gateway 30s hard timeout —
-# 4 sequential Bedrock calls at ~5-7s each ≈ 20-28s, leaving a safety margin.
-# Set DEBATE_ROUNDS=3 via env var to enable 3 rounds (6 calls, ~24-30s — slim margin).
-# Default kept at 3 to match the frontend NEXT_PUBLIC_DEBATE_ROUNDS default
-# (3 rounds, 6 total Bedrock calls). This can bring total latency close to
-# the API Gateway 30s hard timeout (6 calls at ~5-7s each ≈ 30-42s).
-# If you observe timeouts, lower DEBATE_ROUNDS to 2 via env var to stay more
-# safely within the timeout (4 calls, ~20-28s total).
-# NOTE: This does NOT govern /debate/turn (turn-by-turn). That endpoint handles
-# a single turn per request; the number of turns is driven entirely by the
-# frontend's NEXT_PUBLIC_DEBATE_ROUNDS env var (default 3). Both env vars
-# should be set to the same value to keep the two debate modes consistent.
-_DEBATE_ROUNDS_DEFAULT = 3
-_DEBATE_ROUNDS_MIN = 1
-_DEBATE_ROUNDS_MAX = 3
-_debate_rounds_raw = os.getenv("DEBATE_ROUNDS", "").strip()
-try:
-    _debate_rounds_val = int(_debate_rounds_raw) if _debate_rounds_raw else _DEBATE_ROUNDS_DEFAULT
-except (TypeError, ValueError):
-    _debate_rounds_val = _DEBATE_ROUNDS_DEFAULT
-if _debate_rounds_val < _DEBATE_ROUNDS_MIN:
-    _debate_rounds_val = _DEBATE_ROUNDS_MIN
-elif _debate_rounds_val > _DEBATE_ROUNDS_MAX:
-    _debate_rounds_val = _DEBATE_ROUNDS_MAX
-DEBATE_ROUNDS = _debate_rounds_val
-
-
-class DebateAgent:
-    """Autonomous agent representing a single twin in a structured debate.
-
-    Each agent maintains its own conversation history so it has independent,
-    persona-consistent context across the exchange without seeing the other
-    twin's internal state.
-    """
-
-    def __init__(self, twin_data: dict) -> None:
-        self.twin_id: str = twin_data["twin_id"]
-        self.name: str = twin_data.get("name", "Unknown")
-        self.title: str = twin_data.get("title", "")
-        personality_model = twin_data.get("personality_model", {})
-        self._system_prompt: str = prompt(
-            personality_model=personality_model,
-            twin_name=self.name,
-            twin_title=self.title,
-        )
-        self._history: List[Dict] = []  # agent's own view of the debate
-
-    def _build_messages(self, user_turn: str) -> List[Dict]:
-        messages: List[Dict] = [
-            {"role": "user", "content": [{"text": f"System: {self._system_prompt}"}]}
-        ]
-        for msg in self._history[-10:]:  # cap at last 10 messages (5 exchanges)
-            messages.append({"role": msg["role"], "content": [{"text": msg["content"]}]})
-        messages.append({"role": "user", "content": [{"text": user_turn}]})
-        return messages
-
-    def respond(self, user_turn: str) -> str:
-        """Call Bedrock synchronously, update internal history, return response text.
-
-        Designed to be called via asyncio.to_thread so it doesn't block the
-        event loop during the debate orchestration.
-        """
-        messages = self._build_messages(user_turn)
-        response = bedrock_client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=messages,
-            inferenceConfig={"maxTokens": 200, "temperature": 0.75, "topP": 0.9},
-        )
-        text: str = response["output"]["message"]["content"][0]["text"]
-        self._history.append({"role": "user", "content": user_turn})
-        self._history.append({"role": "assistant", "content": text})
-        return text
-
-
-# Maximum allowed number of history entries for /debate/turn.
-# Intentionally decoupled from DEBATE_ROUNDS / frontend NEXT_PUBLIC_DEBATE_ROUNDS
-# so config drift cannot cause mid-debate 422s. Can be overridden via env var.
-try:
-    _MAX_HISTORY_ENTRIES = int(os.getenv("DEBATE_MAX_HISTORY_ENTRIES", "20"))
-except (TypeError, ValueError):
-    _MAX_HISTORY_ENTRIES = 20
-if _MAX_HISTORY_ENTRIES < 1:
-    _MAX_HISTORY_ENTRIES = 1
-_MAX_TWIN_NAME_LEN = 100
-# 1000 chars per entry: generous for 3-5 sentences (~300-500 chars typical).
-_MAX_HISTORY_TEXT_LEN = 1000
-# Total character budget for history injected into the prompt.
-# Oldest entries are dropped server-side if the budget is exceeded.
-_MAX_HISTORY_TOTAL_CHARS = 8000
-
-
-class DebateHistoryEntry(BaseModel):
-    twin_name: str
-    text: str
-
-    @field_validator("twin_name")
-    @classmethod
-    def twin_name_length(cls, v: str) -> str:
-        if len(v) > _MAX_TWIN_NAME_LEN:
-            raise ValueError(f"twin_name must be {_MAX_TWIN_NAME_LEN} characters or fewer")
-        return v
-
-    @field_validator("text")
-    @classmethod
-    def text_length(cls, v: str) -> str:
-        if len(v) > _MAX_HISTORY_TEXT_LEN:
-            raise ValueError(f"history text must be {_MAX_HISTORY_TEXT_LEN} characters or fewer")
-        return v
-
-
-class DebateTurnRequest(BaseModel):
-    twin_id: str
-    topic: str
-    history: List[DebateHistoryEntry] = Field(default_factory=list)  # full debate so far, oldest first
-
-    @field_validator("history")
-    @classmethod
-    def history_max_entries(cls, v: List[DebateHistoryEntry]) -> List[DebateHistoryEntry]:
-        if len(v) > _MAX_HISTORY_ENTRIES:
-            raise ValueError(f"history must not exceed {_MAX_HISTORY_ENTRIES} entries")
-        return v
-
-    @field_validator("topic")
-    @classmethod
-    def topic_not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("topic must not be empty")
-        if len(v) > 500:
-            raise ValueError("topic must be 500 characters or fewer")
-        return v
-
-
-class DebateRequest(BaseModel):
-    twin_id_a: str
-    twin_id_b: str
-    topic: str
-
-    @field_validator("topic")
-    @classmethod
-    def topic_not_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("topic must not be empty")
-        if len(v) > 500:
-            raise ValueError("topic must be 500 characters or fewer")
-        return v
-
-
-class DebateTurn(BaseModel):
-    twin_id: str
-    twin_name: str
-    turn_number: int
-    text: str
-
-
-class DebateResponse(BaseModel):
-    topic: str
-    turns: List[DebateTurn]
-
-
-class DebateTurnResponse(BaseModel):
-    twin_id: str
-    twin_name: str
-    text: str
-
-
-@app.post("/debate/turn", response_model=DebateTurnResponse)
-async def debate_turn(
-    request: DebateTurnRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    """Generate a single debate turn for one twin.
-
-    The frontend drives the debate loop: it calls this endpoint once per turn,
-    passing the full history so far. This makes each agent's response feel live
-    (typing indicator while waiting, typewriter animation on arrival) without
-    requiring Lambda response streaming.
-    """
-    twin_data = load_twin(request.twin_id)
-    if not twin_data or twin_data.get("user_id") != user_id:
-        raise HTTPException(status_code=404, detail="Twin not found")
-
-    agent = DebateAgent(twin_data)
-
-    # Build the debate-context prompt from history
-    def _esc(s: str) -> str:
-        """JSON-escape a string so quotes/newlines don't break prompt structure."""
-        return json.dumps(s)[1:-1]
-
-    if not request.history:
-        turn_prompt = (
-            f'You are in a live debate on the topic: "{_esc(request.topic)}". '
-            f"Open with your perspective. Speak in your natural voice. 3-5 sentences."
-        )
-    else:
-        # Server-side truncation: drop oldest entries until total chars fit in budget.
-        history = list(request.history)
-        total_chars = sum(len(e.twin_name) + len(e.text) for e in history)
-        while len(history) > 1 and total_chars > _MAX_HISTORY_TOTAL_CHARS:
-            dropped = history.pop(0)
-            total_chars -= len(dropped.twin_name) + len(dropped.text)
-
-        history_lines = "\n".join(
-            f'{_esc(e.twin_name)}: "{_esc(e.text)}"' for e in history
-        )
-        last = history[-1]
-        turn_prompt = (
-            f'You are in a live debate on the topic: "{_esc(request.topic)}".\n\n'
-            f"Debate so far:\n{history_lines}\n\n"
-            f'{_esc(last.twin_name)} just said: "{_esc(last.text)}"\n\n'
-            f"Respond to their point. Stay in character. 3-5 sentences."
-        )
-
-    try:
-        text = await asyncio.to_thread(agent.respond, turn_prompt)
-    except ClientError as e:
-        print(f"Bedrock error in debate/turn: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate response")
-    except Exception as e:
-        print(f"Unexpected error in debate/turn: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate response")
-
-    return {"twin_id": agent.twin_id, "twin_name": agent.name, "text": text}
-
-
-@app.post("/chat/debate", response_model=DebateResponse)
-async def debate(
-    request: DebateRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    """Run a structured debate between two user-owned twins.
-
-    Each twin is instantiated as an independent DebateAgent with its own
-    persona and conversation context. The orchestrator alternates calls for
-    DEBATE_ROUNDS rounds (each twin speaks DEBATE_ROUNDS times = 2×DEBATE_ROUNDS
-    total turns).
-
-    Note: responses are buffered and returned as a single JSON payload.
-    True token-level streaming requires Lambda Function URL response streaming
-    and is a planned future upgrade.
-    """
-    # Load and authorise both twins — only owner may use their twins in a debate
-    twin_a_data = load_twin(request.twin_id_a)
-    twin_b_data = load_twin(request.twin_id_b)
-
-    if not twin_a_data or twin_a_data.get("user_id") != user_id:
-        raise HTTPException(status_code=404, detail="Twin A not found")
-    if not twin_b_data or twin_b_data.get("user_id") != user_id:
-        raise HTTPException(status_code=404, detail="Twin B not found")
-    if request.twin_id_a == request.twin_id_b:
-        raise HTTPException(status_code=400, detail="Debate requires two different twins")
-
-    agent_a = DebateAgent(twin_a_data)
-    agent_b = DebateAgent(twin_b_data)
-
-    turns: List[Dict] = []
-    last_text = ""
-
-    try:
-        for round_num in range(DEBATE_ROUNDS):
-            # ── Agent A's turn ────────────────────────────────────────────
-            if round_num == 0:
-                prompt_a = (
-                    f'You are debating {agent_b.name} on the topic: "{request.topic}". '
-                    f"Open with your perspective. Be direct and speak in your natural voice. "
-                    f"Keep it to 3-5 sentences."
-                )
-            else:
-                prompt_a = (
-                    f'{agent_b.name} said: "{last_text}"\n\n'
-                    f"Respond to their point in the debate. Stay in character. "
-                    f"Keep it to 3-5 sentences."
-                )
-            response_a = await asyncio.to_thread(agent_a.respond, prompt_a)
-            turns.append({"twin_id": agent_a.twin_id, "twin_name": agent_a.name,
-                          "turn_number": len(turns) + 1, "text": response_a})
-            last_text = response_a
-
-            # ── Agent B's turn ────────────────────────────────────────────
-            if round_num == 0:
-                prompt_b = (
-                    f'You are debating {agent_a.name} on the topic: "{request.topic}". '
-                    f'{agent_a.name} just said: "{response_a}"\n\n'
-                    f"Respond with your perspective. Be direct and speak in your natural voice. "
-                    f"Keep it to 3-5 sentences."
-                )
-            else:
-                prompt_b = (
-                    f'{agent_a.name} said: "{last_text}"\n\n'
-                    f"Respond to their point in the debate. Stay in character. "
-                    f"Keep it to 3-5 sentences."
-                )
-            response_b = await asyncio.to_thread(agent_b.respond, prompt_b)
-            turns.append({"twin_id": agent_b.twin_id, "twin_name": agent_b.name,
-                          "turn_number": len(turns) + 1, "text": response_b})
-            last_text = response_b
-
-    except ClientError as e:
-        print(f"Bedrock ClientError in debate: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate debate response")
-    except Exception as e:
-        print(f"Unexpected error in debate: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred during the debate")
-
-    return {"topic": request.topic, "turns": turns}
-
-
-# ---------------------------------------------------------------------------
-# Chat-based onboarding interview
-# ---------------------------------------------------------------------------
-
-_ONBOARD_SYSTEM_TEMPLATE = """\
-You are a sharp, warm interviewer helping someone build their AI twin — a digital version of them \
-that can answer questions on their behalf.
-
-Your job: learn who they are through a natural conversation, covering 6 topics in order.
-
-TOPICS:
-1. IDENTITY      → name, job title, short bio (who they are in a sentence or two)
-2. PROFESSIONAL  → key skills, career story, one notable achievement{linkedin_skip}
-3. DECISIONS     → how they make hard calls (want a real example), risk appetite
-4. VALUES        → what they stand for; one thing they would push back on under pressure
-5. WORKING_STYLE → how they communicate; what colleagues sometimes misread about them
-6. VOICE         → a phrase they overuse or a verbal tic; bullet-points or paragraphs?
-
-RULES — follow exactly:
-- One question per turn. 2–4 sentences per message. Be concise.
-- CRITICAL: Every message MUST end with a question, except the final closing message \
-when done is true. Never just acknowledge — always ask about the next remaining topic \
-in the same message. If you acknowledge, do it in one short phrase, then immediately ask.
-- If an answer is vague or generic (e.g. "I just go with my gut", "I value honesty"), \
-push back ONCE: invent a tiny relatable story in one sentence that mirrors the vague answer \
-(first-person or "I once worked with someone who..."), then re-ask more concretely. \
-Push back only once per topic — then accept and move on regardless of the answer.
-- After a rich or interesting answer, acknowledge in one brief phrase \
-("Got it.", "That's clear.", "Interesting.") and immediately ask the next question.
-- Mirror their tone: terse answers → short questions; expressive answers → slightly warmer.
-- Never use form-speak ("Question 3 of 6", "Next section", "Moving on to topic...").
-- When all 6 topics are covered (none remaining), close with one natural sentence and set done to true.
-
-CURRENT STATE:
-Topics remaining: {topics_remaining}
-Fields collected so far:
-{fields_json}
-{linkedin_section}
-
-RETURN ONLY valid JSON — no markdown, no text outside the JSON object.
-NEVER include JSON or curly-brace fragments inside the "message" string value.
-The "done" field belongs only in the top-level JSON structure, not in the message text:
-{{
-  "message": "your conversational response and next question as natural prose",
-  "field_updates": {{
-    "name": "value or omit key entirely if not in this message",
-    "title": "...",
-    "bio": "...",
-    "skills": "...",
-    "experience": "...",
-    "achievements": "...",
-    "coreValues": "...",
-    "decisionStyle": "...",
-    "riskTolerance": "low or medium or high — omit if unclear",
-    "pastDecisions": "...",
-    "communicationStyle": "...",
-    "blindSpots": "...",
-    "verbalQuirks": "...",
-    "responseStyle": "concise or balanced or detailed — omit if unclear"
-  }},
-  "topics_covered": ["IDENTITY", "PROFESSIONAL"],
-  "done": false
-}}
-
-When done is true, set "done": true in the JSON above. Do NOT include a twin_payload field — \
-the client will assemble the twin from the collected fields_collected data.
-"""
-
-
-class OnboardHistoryItem(BaseModel):
-    role: str  # "user" or "assistant"
-    content: str
-
-
-class OnboardRequest(BaseModel):
-    history: List[OnboardHistoryItem] = Field(default_factory=list)
-    linkedin_parsed: Optional[Dict[str, Any]] = None
-    fields_collected: Optional[Dict[str, Any]] = None
-    topics_covered: List[str] = Field(default_factory=list)
-
-
-class OnboardFieldUpdates(BaseModel):
-    """Validated field updates extracted from the model response."""
-
-    name: Optional[str] = None
-    title: Optional[str] = None
-    bio: Optional[str] = None
-    skills: Optional[str] = None
-    experience: Optional[str] = None
-    achievements: Optional[str] = None
-    coreValues: Optional[str] = None
-    decisionStyle: Optional[str] = None
-    riskTolerance: Optional[str] = None
-    pastDecisions: Optional[str] = None
-    communicationStyle: Optional[str] = None
-    blindSpots: Optional[str] = None
-    verbalQuirks: Optional[str] = None
-    responseStyle: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class OnboardResponse(BaseModel):
-    """Validated response returned by /onboard/message."""
-
-    message: str
-    field_updates: OnboardFieldUpdates = Field(default_factory=OnboardFieldUpdates)
-    topics_covered: List[str] = Field(default_factory=list)
-    done: bool = False
-    twin_payload: Optional[Dict[str, Any]] = None
-
-    model_config = {"extra": "ignore"}
-
-    @field_validator("field_updates", mode="before")
-    @classmethod
-    def _coerce_field_updates(cls, v: Any) -> Any:
-        """Accept a dict or fall back to an empty OnboardFieldUpdates."""
-        if not isinstance(v, dict):
-            return {}
-        return v
-
-    @field_validator("topics_covered", mode="before")
-    @classmethod
-    def _coerce_topics_covered(cls, v: Any) -> Any:
-        """Accept a list of strings or fall back to an empty list."""
-        if not isinstance(v, list):
-            return []
-        return [item for item in v if isinstance(item, str)]
-
-    @field_validator("done", mode="before")
-    @classmethod
-    def _coerce_done(cls, v: Any) -> Any:
-        """Accept a bool; coerce any non-bool value to False."""
-        if isinstance(v, bool):
-            return v
-        return False
-
-
-_ALL_ONBOARD_TOPICS = ["IDENTITY", "PROFESSIONAL", "DECISIONS", "VALUES", "WORKING_STYLE", "VOICE"]
-
-
-@app.post("/onboard/message")
-async def onboard_message(
-    request: OnboardRequest,
-    _user_id: str = Depends(get_current_user_id),
-):
-    covered = list(request.topics_covered)
-    # Auto-mark PROFESSIONAL covered when LinkedIn data is provided
-    if request.linkedin_parsed and "PROFESSIONAL" not in covered:
-        covered.append("PROFESSIONAL")
-    # Auto-mark IDENTITY covered when name+title+bio are already collected
-    # (from LinkedIn, a previous turn, or any other source)
-    fields = request.fields_collected or {}
-    if (
-        "IDENTITY" not in covered
-        and fields.get("name")
-        and fields.get("title")
-        and fields.get("bio")
-    ):
-        covered.append("IDENTITY")
-
-    remaining = [t for t in _ALL_ONBOARD_TOPICS if t not in covered]
-
-    linkedin_skip = " (SKIP — LinkedIn PDF provided)" if request.linkedin_parsed else ""
-
-    linkedin_section = ""
-    if request.linkedin_parsed:
-        lp = request.linkedin_parsed
-        lines = []
-        if lp.get("name"):        lines.append(f"Name: {lp['name']}")
-        if lp.get("title"):       lines.append(f"Title: {lp['title']}")
-        if lp.get("skills"):      lines.append(f"Skills: {str(lp['skills'])[:300]}")
-        if lp.get("experience"):  lines.append(f"Experience: {str(lp['experience'])[:400]}")
-        if lp.get("achievements"): lines.append(f"Achievements: {str(lp['achievements'])[:200]}")
-        if lines:
-            linkedin_section = "\nLinkedIn PDF already parsed (use this, don't re-ask):\n" + "\n".join(lines)
-
-    system_prompt = _ONBOARD_SYSTEM_TEMPLATE.format(
-        linkedin_skip=linkedin_skip,
-        topics_remaining=", ".join(remaining) if remaining else "ALL COVERED",
-        fields_json=json.dumps(request.fields_collected or {}, indent=2),
-        linkedin_section=linkedin_section,
+    
+    # Return response
+    conversation_id = request.conversation_id or f"conv_{int(time.time())}"
+    
+    return ChatResponse(
+        response=response_text.strip(),
+        conversation_id=conversation_id,
+        timestamp=datetime.utcnow().isoformat()
     )
 
-    messages: List[Dict[str, Any]] = []
-    if not request.history:
-        # Seed with a minimal opener so the model produces the first question
-        messages = [{"role": "user", "content": [{"text": "hi, let's start"}]}]
-    else:
-        # Cap the amount of history sent to Bedrock to avoid unbounded prompts
-        for item in request.history[-50:]:
-            if item.role == "user":
-                role = "user"
-            elif item.role == "assistant":
-                role = "assistant"
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid role in history item: {item.role!r}. Allowed roles are 'user' and 'assistant'.",
-                )
-            messages.append({"role": role, "content": [{"text": item.content}]})
-        # Bedrock requires the conversation to start with a user turn.
-        # When history only contains the bot's opening question (assistant), prepend
-        # the synthetic opener so the first message is always from "user".
-        if messages and messages[0]["role"] != "user":
-            messages.insert(0, {"role": "user", "content": [{"text": "hi, let's start"}]})
 
+@app.get("/personas/{persona_id}")
+async def get_persona(persona_id: str):
+    """Get persona metadata.
+    
+    Args:
+        persona_id: Persona ID
+        
+    Returns:
+        Persona metadata
+        
+    Raises:
+        S3Error: If persona data cannot be loaded from S3
+    """
+    logger.info(f"Get persona: {persona_id}")
+    
+    persona_key = f"personas/{persona_id}/metadata.json"
     try:
-        response = await asyncio.to_thread(
-            bedrock_client.converse,
-            modelId=BEDROCK_MODEL_ID,
-            system=[{"text": system_prompt}],
-            messages=messages,
-            inferenceConfig={"maxTokens": 700, "temperature": 0.9, "topP": 0.95},
-        )
-        raw = response["output"]["message"]["content"][0]["text"].strip()
-
-        # Use robust JSON extraction — handles code fences and leading/trailing text.
-        # Pass required_key so stray {"done": true} fragments are skipped.
-        data = _extract_json_object(raw, required_key="message")
-
-        if not isinstance(data, dict) or "message" not in data:
-            raise ValueError("Invalid onboarding JSON structure")
-
-        # Validate and coerce model output against a strict response model so that
-        # missing keys default safely and wrong types don't reach the frontend.
-        validated = OnboardResponse.model_validate(data)
-        return validated.model_dump(exclude_none=True)
-    except (ValueError, json.JSONDecodeError) as exc:
-        print(f"Onboard JSON parse error: {exc!r}")
-        if os.getenv("DEBUG_LOG_ONBOARD_RAW") == "1":
-            print(f"Onboard raw snippet (truncated): {raw[:200]!r}")
-
-        # Salvage a clean plain-text message and detect the done signal.
-        # Strategy: look for a trailing JSON fragment (rfind '{' in the latter half
-        # of the text) and parse it with json.loads — only trust done:true when it
-        # appears as an actual top-level key in a parseable object, not anywhere in
-        # the raw string (which would produce false positives on quoted examples).
-        done_msg = "Thanks — that's everything I need! Let me put your twin together."
-        cont_msg = "Got it — let me keep going. Could you tell me a bit more?"
-
-        fallback_done = False
-        fallback_message = raw
-
-        if raw.strip().startswith("{") or raw.strip().startswith("```"):
-            # Entire output looks like a (possibly malformed) JSON blob — can't
-            # salvage natural language, so use a canned message.
-            fallback_message = cont_msg
-        else:
-            # Check for a trailing JSON fragment like  ...nice. {"done": true}
-            last_brace = raw.rfind('{')
-            if last_brace > len(raw) // 2:
-                try:
-                    fragment = json.loads(raw[last_brace:])
-                    # Only treat this as a real trailer (and truncate) if it parses
-                    # and looks like the expected {"done": ...} object.
-                    if isinstance(fragment, dict) and "done" in fragment:
-                        if fragment.get("done") is True:
-                            fallback_done = True
-                        fallback_message = raw[:last_brace].strip()
-                except json.JSONDecodeError:
-                    # Leave fallback_message as the full raw text if the fragment
-                    # doesn't parse; don't truncate on malformed JSON.
-                    pass
-            if not fallback_message:
-                fallback_message = done_msg if fallback_done else cont_msg
-
-        fallback_topics = list(_ALL_ONBOARD_TOPICS) if fallback_done else covered
-
-        return {
-            "message": fallback_message,
-            "field_updates": {},
-            "topics_covered": fallback_topics,
-            "done": fallback_done,
-        }
-    except Exception as exc:
-        print(f"Unexpected error in /onboard/message: {exc}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
-
-
-_DEEPEN_SYSTEM_TEMPLATE = """\
-You are helping someone deepen their AI twin. They already built a basic version; now you're \
-uncovering the nuance that makes reasoning feel real instead of generic.
-
-Your job: ask exactly 3 focused questions, one per turn, to surface depth data most twins lack.
-
-TOPICS (ask in this order, skip already-covered ones):
-1. PAST_DECISIONS  → "Walk me through 2-3 decisions you've made that were genuinely hard — \
-what you chose, what you gave up, and whether you'd do it again."
-2. NON_NEGOTIABLES → "What would you flat-out refuse to do even under real pressure? \
-And what would you bend on if the trade-off was right?"
-3. MIND_CHANGE     → "Tell me about a time you changed your mind on something you'd held \
-strongly. What actually moved you?"
-
-RULES — follow exactly:
-- One question per turn. 2-4 sentences max. Be direct and warm.
-- CRITICAL: Every message MUST end with a question, except the final closing when done is true.
-- If an answer is too vague, push back once with a concrete prompt ("Can you give me a specific \
-example?"), then accept whatever they say.
-- After a rich answer, acknowledge in one short phrase and immediately ask the next topic.
-- When all 3 topics are covered, close naturally and set done to true.
-- Never sound like a form — no "Question 1 of 3", no "Moving on to".
-
-CURRENT STATE:
-Topics remaining: {topics_remaining}
-Existing twin context (for reference — do NOT repeat back to them):
-{existing_context}
-
-RETURN ONLY valid JSON — no markdown, no text outside the JSON:
-{{
-  "message": "your question or closing as natural prose",
-  "field_updates": {{
-    "pastDecisions": "extracted from their answer — omit key if not in this message",
-    "nonNegotiables": "what they won't bend on — omit if not in this message",
-    "softPreferences": "what they would compromise on — omit if not in this message",
-    "mindChange": "the story of changing their mind — omit if not in this message"
-  }},
-  "topics_covered": ["PAST_DECISIONS"],
-  "done": false
-}}
-"""
-
-_ALL_DEEPEN_TOPICS = ["PAST_DECISIONS", "NON_NEGOTIABLES", "MIND_CHANGE"]
-
-
-class DeepenHistoryItem(BaseModel):
-    role: str
-    content: str
-
-
-class DeepenFieldUpdates(BaseModel):
-    pastDecisions: Optional[str] = None
-    nonNegotiables: Optional[str] = None
-    softPreferences: Optional[str] = None
-    mindChange: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class DeepenRequest(BaseModel):
-    history: List[DeepenHistoryItem] = Field(default_factory=list)
-    topics_covered: List[str] = Field(default_factory=list)
-    fields_collected: Optional[Dict[str, Any]] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class DeepenResponse(BaseModel):
-    message: str
-    field_updates: DeepenFieldUpdates = Field(default_factory=DeepenFieldUpdates)
-    topics_covered: List[str] = Field(default_factory=list)
-    done: bool = False
-
-    model_config = {"extra": "ignore"}
-
-    @field_validator("field_updates", mode="before")
-    @classmethod
-    def _coerce_field_updates(cls, v: Any) -> Any:
-        if not isinstance(v, dict):
-            return {}
-        return v
-
-    @field_validator("topics_covered", mode="before")
-    @classmethod
-    def _coerce_topics_covered(cls, v: Any) -> Any:
-        if not isinstance(v, list):
-            return []
-        return [item for item in v if isinstance(item, str)]
-
-    @field_validator("done", mode="before")
-    @classmethod
-    def _coerce_done(cls, v: Any) -> Any:
-        if isinstance(v, bool):
-            return v
-        return False
-
-
-async def _deepen_and_save(twin_id: str, user_id: str, twin_data: dict, new_fields: dict) -> None:
-    """Merge new depth data into the twin's personality_model._context and re-synthesize the personality model."""
-    existing_model = twin_data.get("personality_model", {})
-    # context.py reads depth fields from personality_model["_context"], so persist there
-    ctx = dict(existing_model.get("_context", {}))
-
-    for key in ("pastDecisions", "nonNegotiables", "softPreferences", "mindChange"):
-        if new_fields.get(key):
-            if key == "pastDecisions" and ctx.get(key):
-                ctx[key] = ctx[key].strip() + "\n\n" + new_fields[key].strip()
-            else:
-                ctx[key] = new_fields[key]
-
-    # Write the updated _context back into personality_model so prompt building picks it up
-    existing_model["_context"] = ctx
-    twin_data["personality_model"] = existing_model
-    twin_data["sources"] = merge_sources(
-        twin_data.get("sources", []),
-        build_deepen_sources(new_fields),
-    )
-
-    synthesis_prompt = f"""You are updating an AI twin's personality model with new depth data.
-
-EXISTING MODEL:
-{json.dumps(existing_model, indent=2)}
-
-NEW DEPTH DATA:
-Past decisions: {ctx.get("pastDecisions", "N/A")}
-Non-negotiables (won't bend on): {ctx.get("nonNegotiables", "N/A")}
-What they'd compromise on: {ctx.get("softPreferences", "N/A")}
-Changed their mind: {ctx.get("mindChange", "N/A")}
-
-Using the existing model as a base, return an improved JSON model that incorporates the new data.
-The new data should sharpen: decision_heuristics, blind_spots, what_they_avoid, decision_framework, personality_summary.
-Preserve fields unaffected by this data: core_values, communication_traits, risk_profile, what_they_optimize_for.
-Return ONLY valid JSON with the same structure as the existing model. No markdown, no extra text."""
-
-    try:
-        response = await asyncio.to_thread(
-            bedrock_client.converse,
-            modelId=BEDROCK_MODEL_ID,
-            system=[{"text": synthesis_prompt}],
-            messages=[{"role": "user", "content": [{"text": "Update the personality model with the new depth data."}]}],
-            inferenceConfig={"maxTokens": 1200, "temperature": 0.5, "topP": 0.9},
-        )
-        raw = response["output"]["message"]["content"][0]["text"].strip()
-        updated_model = _extract_json_object(raw)
-        if isinstance(updated_model, dict) and updated_model:
-            # Always carry the updated _context into the re-synthesized model
-            updated_model["_context"] = ctx
-            twin_data["personality_model"] = updated_model
-    except Exception as exc:
-        print(f"Deepen re-synthesis failed (non-fatal): {exc}")
-        # Depth data is already merged into personality_model["_context"] above, so it will be saved even if synthesis fails
-
-    twin_data["deepen_completed_at"] = datetime.now().isoformat()
-    try:
-        _save_twin(twin_id, user_id, twin_data)
-    except Exception as exc:
-        print(f"Deepen save failed: {exc}")
+        persona_data = read_s3_with_backoff(S3_BUCKET_NAME, persona_key)
+        return json.loads(persona_data)
+    except S3Error:
         raise
-
-
-@app.post("/twin/{twin_id}/deepen/message")
-async def deepen_message(
-    twin_id: str,
-    request: DeepenRequest,
-    user_id: str = Depends(get_current_user_id),
-):
-    """Run one turn of the deepen interview for a twin the caller owns."""
-    twin_data = load_twin(twin_id)
-    if not twin_data or twin_data.get("user_id") != user_id:
-        raise HTTPException(status_code=404, detail="Twin not found")
-
-    covered = list(request.topics_covered)
-
-    # Build a short existing-context summary to orient the LLM
-    pm = twin_data.get("personality_model", {})
-    ctx_data = pm.get("_context", {}) if isinstance(pm, dict) else {}
-
-    # Auto-mark topics that are already persisted in the twin's context so that
-    # re-deepen sessions don't re-ask questions the user already answered.
-    if isinstance(ctx_data, dict):
-        if ctx_data.get("pastDecisions") and "PAST_DECISIONS" not in covered:
-            covered.append("PAST_DECISIONS")
-        if ctx_data.get("nonNegotiables") and "NON_NEGOTIABLES" not in covered:
-            covered.append("NON_NEGOTIABLES")
-        if ctx_data.get("mindChange") and "MIND_CHANGE" not in covered:
-            covered.append("MIND_CHANGE")
-
-    remaining = [t for t in _ALL_DEEPEN_TOPICS if t not in covered]
-
-    # If all topics are already captured in the twin's context, skip the LLM
-    # entirely and return done=True so the frontend shows the completion screen.
-    if not remaining:
-        return {
-            "message": (
-                f"You've already deepened {twin_data.get('name', 'this twin')} across all three areas. "
-                "Head to your dashboard to see the updated profile."
-            ),
-            "field_updates": {},
-            "topics_covered": covered,
-            "done": True,
-        }
-
-    ctx_lines = []
-    if twin_data.get("name"):
-        ctx_lines.append(f"Name: {twin_data['name']}")
-    if twin_data.get("title"):
-        ctx_lines.append(f"Title: {twin_data['title']}")
-    if isinstance(pm, dict):
-        if pm.get("personality_summary"):
-            ctx_lines.append(f"Personality: {pm['personality_summary']}")
-        if pm.get("decision_framework"):
-            ctx_lines.append(f"Decision framework: {pm['decision_framework']}")
-    # Include any depth data already captured so the LLM doesn't repeat those topics.
-    # Values are truncated to keep the system prompt concise.
-    if isinstance(ctx_data, dict):
-        if ctx_data.get("pastDecisions"):
-            ctx_lines.append(f"Past decisions (already captured): {ctx_data['pastDecisions'][:300]}")
-        if ctx_data.get("nonNegotiables"):
-            ctx_lines.append(f"Non-negotiables (already captured): {ctx_data['nonNegotiables'][:200]}")
-        if ctx_data.get("mindChange"):
-            ctx_lines.append(f"Mind change (already captured): {ctx_data['mindChange'][:200]}")
-    existing_context = "\n".join(ctx_lines) if ctx_lines else "No existing context."
-
-    system_prompt = _DEEPEN_SYSTEM_TEMPLATE.format(
-        topics_remaining=", ".join(remaining) if remaining else "ALL COVERED",
-        existing_context=existing_context,
-    )
-
-    messages: List[Dict[str, Any]] = []
-    if not request.history:
-        messages = [{"role": "user", "content": [{"text": "hi, let's start"}]}]
-    else:
-        for item in request.history[-30:]:
-            if item.role not in ("user", "assistant"):
-                raise HTTPException(status_code=400, detail=f"Invalid role: {item.role!r}")
-            messages.append({"role": item.role, "content": [{"text": item.content}]})
-        # Bedrock requires the conversation to start with a user turn.
-        # When history only contains the bot's opening question (assistant), prepend
-        # the synthetic opener so the first message is always from "user".
-        if messages and messages[0]["role"] != "user":
-            messages.insert(0, {"role": "user", "content": [{"text": "hi, let's start"}]})
-
-    try:
-        response = await asyncio.to_thread(
-            bedrock_client.converse,
-            modelId=BEDROCK_MODEL_ID,
-            system=[{"text": system_prompt}],
-            messages=messages,
-            inferenceConfig={"maxTokens": 600, "temperature": 0.9, "topP": 0.95},
-        )
-        raw = response["output"]["message"]["content"][0]["text"].strip()
-        data = _extract_json_object(raw, required_key="message")
-
-        if not isinstance(data, dict) or "message" not in data:
-            raise ValueError("Invalid deepen JSON structure")
-
-        validated = DeepenResponse.model_validate(data)
-
-        # Ensure topics_covered remains cumulative across turns by unioning
-        # the topics from the request with the topics returned by the model,
-        # and ordering them according to the canonical _ALL_DEEPEN_TOPICS list.
-        request_topics = set(covered)  # already includes auto-populated topics
-        model_topics = set(validated.topics_covered or [])
-        merged_topics_set = request_topics | model_topics
-        if merged_topics_set:
-            merged_topics_ordered: List[str] = [
-                topic for topic in _ALL_DEEPEN_TOPICS if topic in merged_topics_set
-            ]
-            validated.topics_covered = merged_topics_ordered
-        result = validated.model_dump(exclude_none=True)
-
-        # Guard: if the LLM covered all topics but forgot to set done=true, force it.
-        all_topics_covered = set(_ALL_DEEPEN_TOPICS).issubset(merged_topics_set)
-        if all_topics_covered and not result.get("done"):
-            result["done"] = True
-
-        # If done, merge new fields and re-synthesize synchronously before returning
-        if result.get("done"):
-            all_fields = dict(request.fields_collected or {})
-            fu = validated.field_updates
-            for key in ("pastDecisions", "nonNegotiables", "softPreferences", "mindChange"):
-                val = getattr(fu, key, None)
-                if val:
-                    all_fields[key] = val
-            await _deepen_and_save(twin_id, user_id, twin_data, all_fields)
-
-        return result
-
-    except (ValueError, json.JSONDecodeError) as exc:
-        print(f"Deepen JSON parse error: {exc!r}")
-        done_msg = "Got it — I've gathered enough to deepen your twin. Saving now."
-        cont_msg = "Got it — let me keep going. Could you tell me more?"
-
-        done_fallback = False
-        fallback_message = raw if "raw" in locals() else cont_msg
-
-        if "raw" in locals():
-            if raw.strip().startswith("{") or raw.strip().startswith("```"):
-                # Entire output looks like a JSON blob — substitute a canned message.
-                fallback_message = cont_msg
-            else:
-                last_brace = raw.rfind('{')
-                if last_brace > len(raw) // 2:
-                    try:
-                        fragment = json.loads(raw[last_brace:])
-                        if isinstance(fragment, dict) and "done" in fragment:
-                            if fragment.get("done") is True:
-                                done_fallback = True
-                            fallback_message = raw[:last_brace].strip()
-                    except json.JSONDecodeError:
-                        pass
-                if not fallback_message:
-                    fallback_message = done_msg if done_fallback else cont_msg
-
-        if done_fallback:
-            # In the fallback path JSON parsing failed, so we can't reliably extract
-            # field updates from the current turn.  Persist whatever the frontend has
-            # already accumulated across previous turns via request.fields_collected.
-            all_fields = dict(request.fields_collected or {})
-            await _deepen_and_save(twin_id, user_id, twin_data, all_fields)
-
-        return {
-            "message": fallback_message,
-            "field_updates": {},
-            "topics_covered": covered,
-            "done": done_fallback,
-        }
-    except Exception as exc:
-        print(f"Unexpected error in /twin/{{twin_id}}/deepen/message: {exc}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
-
-
-# ── Resume Builder ─────────────────────────────────────────────────────────────
-
-_RESUME_SYSTEM_TEMPLATE = """\
-You are a focused assistant collecting data to build someone's professional resume.
-Cover the remaining topics through natural conversation — one topic per turn.
-
-TOPICS (in order, skip already-covered ones):
-1. TECH_STACK       → languages, frameworks, tools, cloud platforms, certifications
-2. EDUCATION        → degrees, institutions, fields of study, graduation years
-3. CAREER_HISTORY   → companies, job titles, start/end dates, key responsibilities
-4. ACCOMPLISHMENTS  → 2-4 specific wins with metrics (e.g. "reduced latency by 40%")
-5. TARGET_ROLE      → what kind of role they are targeting next
-
-RULES:
-- One topic per turn. 2-3 sentences max. Be direct and practical.
-- Every message MUST end with a question, except the final closing when done is true.
-- If an answer is vague (e.g. "I've done a lot of backend work"), ask for one specific \
-example or metric, then accept whatever they give.
-- After a complete answer, acknowledge in one short phrase and ask the next topic.
-- Never use form-speak ("Topic 3 of 5", "Moving on to", "Next up").
-- When all topics are covered, close with one sentence and set done to true.
-
-CURRENT STATE:
-Topics remaining: {topics_remaining}
-Data collected so far:
-{fields_json}
-{linkedin_section}
-
-RETURN ONLY valid JSON — no markdown, no text outside the JSON:
-{{
-  "message": "your question or closing as natural prose",
-  "field_updates": {{
-    "tech_stack": "comma-separated tools/languages — omit if not in this turn",
-    "education": "degree, institution, year — omit if not in this turn",
-    "career_history": "bullet list of roles: Company (dates): responsibilities — omit if not in this turn",
-    "accomplishments": "bullet list of wins with metrics — omit if not in this turn",
-    "target_role": "desired role title — omit if not in this turn"
-  }},
-  "topics_covered": ["TECH_STACK"],
-  "done": false
-}}
-"""
-
-_ALL_RESUME_TOPICS = ["TECH_STACK", "EDUCATION", "CAREER_HISTORY", "ACCOMPLISHMENTS", "TARGET_ROLE"]
-
-_RESUME_TOOLS = [
-    {
-        "toolSpec": {
-            "name": "set_contact_info",
-            "description": "Set the candidate's contact information for the resume header.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "email": {"type": "string"},
-                        "phone": {"type": "string"},
-                        "location": {"type": "string"},
-                        "linkedin_url": {"type": "string"},
-                    },
-                    "required": ["name"],
-                },
-            },
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "set_summary",
-            "description": (
-                "Write a 2-4 sentence professional summary. "
-                "If a target role and job description are provided, tailor it to that role."
-            ),
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                    },
-                    "required": ["text"],
-                },
-            },
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "add_experience",
-            "description": "Add one work experience entry. Call once per role, most recent first.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "company": {"type": "string"},
-                        "title": {"type": "string"},
-                        "start_date": {"type": "string"},
-                        "end_date": {"type": "string", "description": "Use 'Present' if current role"},
-                        "bullets": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": (
-                                "2-4 achievement-oriented bullet points. "
-                                "Start each with a strong action verb. Include metrics where available."
-                            ),
-                        },
-                    },
-                    "required": ["company", "title", "start_date", "end_date", "bullets"],
-                },
-            },
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "add_education",
-            "description": "Add one education entry. Call once per degree.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "institution": {"type": "string"},
-                        "degree": {"type": "string"},
-                        "field": {"type": "string"},
-                        "graduation_year": {"type": "string"},
-                        "gpa": {"type": "string", "description": "Include only if 3.5 or above"},
-                    },
-                    "required": ["institution", "degree", "graduation_year"],
-                },
-            },
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "set_skills",
-            "description": "Set the skills section grouped by category (e.g. Languages, Frameworks, Tools, Cloud).",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "categories": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "name": {"type": "string"},
-                                    "skills": {"type": "array", "items": {"type": "string"}},
-                                },
-                                "required": ["name", "skills"],
-                            },
-                        },
-                    },
-                    "required": ["categories"],
-                },
-            },
-        }
-    },
-    {
-        "toolSpec": {
-            "name": "finalize_resume",
-            "description": "Call this once all sections have been populated. Signals the backend to format and return the document.",
-            "inputSchema": {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "ready": {"type": "boolean"},
-                    },
-                    "required": ["ready"],
-                },
-            },
-        }
-    },
-]
-
-
-class ResumeHistoryItem(BaseModel):
-    role: str
-    content: str
-
-
-class ResumeFieldUpdates(BaseModel):
-    tech_stack: Optional[str] = None
-    education: Optional[str] = None
-    career_history: Optional[str] = None
-    accomplishments: Optional[str] = None
-    target_role: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
-class ResumeRequest(BaseModel):
-    history: List[ResumeHistoryItem] = Field(default_factory=list)
-    topics_covered: List[str] = Field(default_factory=list)
-    fields_collected: Optional[Dict[str, Any]] = None
-    linkedin_parsed: Optional[Dict[str, Any]] = None
-
-
-class ResumeResponse(BaseModel):
-    message: str
-    field_updates: ResumeFieldUpdates = Field(default_factory=ResumeFieldUpdates)
-    topics_covered: List[str] = Field(default_factory=list)
-    done: bool = False
-
-    model_config = {"extra": "ignore"}
-
-    @field_validator("field_updates", mode="before")
-    @classmethod
-    def _coerce_field_updates(cls, v: Any) -> Any:
-        if not isinstance(v, dict):
-            return {}
-        return v
-
-    @field_validator("topics_covered", mode="before")
-    @classmethod
-    def _coerce_topics_covered(cls, v: Any) -> Any:
-        if not isinstance(v, list):
-            return []
-        return [item for item in v if isinstance(item, str)]
-
-    @field_validator("done", mode="before")
-    @classmethod
-    def _coerce_done(cls, v: Any) -> Any:
-        if isinstance(v, bool):
-            return v
-        return False
-
-
-class ResumeGenerateRequest(BaseModel):
-    fields_collected: Dict[str, Any] = Field(default_factory=dict)
-
-
-def _build_resume_docx(resume_data: dict) -> bytes:
-    """Format accumulated tool-call results into a Word document."""
-    from docx import Document
-    from docx.shared import Pt, Inches
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-    import io as _io
-
-    doc = Document()
-
-    for section in doc.sections:
-        section.top_margin = Inches(0.75)
-        section.bottom_margin = Inches(0.75)
-        section.left_margin = Inches(1.0)
-        section.right_margin = Inches(1.0)
-
-    style = doc.styles["Normal"]
-    style.font.name = "Calibri"
-    style.font.size = Pt(10)
-
-    contact = resume_data.get("contact", {})
-
-    # Name
-    name_para = doc.add_paragraph()
-    name_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    name_para.paragraph_format.space_after = Pt(2)
-    run = name_para.add_run(contact.get("name", ""))
-    run.bold = True
-    run.font.size = Pt(18)
-
-    # Contact line
-    parts = [v for k in ("email", "phone", "location", "linkedin_url") if (v := contact.get(k))]
-    if parts:
-        cp = doc.add_paragraph(" | ".join(parts))
-        cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        cp.paragraph_format.space_after = Pt(6)
-        for r in cp.runs:
-            r.font.size = Pt(10)
-
-    def _section_header(title: str):
-        p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(10)
-        p.paragraph_format.space_after = Pt(3)
-        run = p.add_run(title.upper())
-        run.bold = True
-        run.font.size = Pt(11)
-        pPr = p._p.get_or_add_pPr()
-        pBdr = OxmlElement("w:pBdr")
-        bottom = OxmlElement("w:bottom")
-        bottom.set(qn("w:val"), "single")
-        bottom.set(qn("w:sz"), "6")
-        bottom.set(qn("w:space"), "1")
-        bottom.set(qn("w:color"), "000000")
-        pBdr.append(bottom)
-        pPr.append(pBdr)
-
-    # Summary
-    if resume_data.get("summary"):
-        _section_header("Professional Summary")
-        p = doc.add_paragraph(resume_data["summary"])
-        p.paragraph_format.space_after = Pt(4)
-
-    # Experience
-    if resume_data.get("experience"):
-        _section_header("Experience")
-        for exp in resume_data["experience"]:
-            p = doc.add_paragraph()
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(0)
-            r = p.add_run(exp.get("company", ""))
-            r.bold = True
-            r.font.size = Pt(11)
-            p.add_run(f"  {exp.get('start_date', '')} – {exp.get('end_date', '')}")
-
-            p2 = doc.add_paragraph()
-            p2.paragraph_format.space_before = Pt(0)
-            p2.paragraph_format.space_after = Pt(2)
-            r2 = p2.add_run(exp.get("title", ""))
-            r2.italic = True
-
-            for bullet in exp.get("bullets", []):
-                bp = doc.add_paragraph(style="List Bullet")
-                bp.paragraph_format.space_before = Pt(0)
-                bp.paragraph_format.space_after = Pt(1)
-                bp.paragraph_format.left_indent = Inches(0.25)
-                bp.add_run(bullet)
-
-    # Education
-    if resume_data.get("education"):
-        _section_header("Education")
-        for edu in resume_data["education"]:
-            p = doc.add_paragraph()
-            p.paragraph_format.space_before = Pt(6)
-            p.paragraph_format.space_after = Pt(0)
-            r = p.add_run(edu.get("institution", ""))
-            r.bold = True
-            r.font.size = Pt(11)
-            p.add_run(f"  {edu.get('graduation_year', '')}")
-
-            degree_parts = [s for s in (edu.get("degree"), edu.get("field")) if s]
-            if edu.get("gpa"):
-                degree_parts.append(f"GPA: {edu['gpa']}")
-            if degree_parts:
-                p2 = doc.add_paragraph(", ".join(degree_parts))
-                p2.paragraph_format.space_before = Pt(0)
-                p2.paragraph_format.space_after = Pt(4)
-
-    # Skills
-    if resume_data.get("skills"):
-        _section_header("Skills")
-        for cat in resume_data["skills"]:
-            p = doc.add_paragraph()
-            p.paragraph_format.space_before = Pt(3)
-            p.paragraph_format.space_after = Pt(1)
-            r = p.add_run(f"{cat.get('name', '')}: ")
-            r.bold = True
-            p.add_run(", ".join(cat.get("skills", [])))
-
-    buf = _io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-
-@app.post("/resume/message")
-async def resume_message(
-    request: ResumeRequest,
-    _user_id: str = Depends(get_current_user_id),
-):
-    """One turn of the resume data-collection interview."""
-    covered = list(request.topics_covered)
-
-    # Auto-mark topics that are already satisfied by pre-loaded twin/LinkedIn data
-    fields = request.fields_collected or {}
-    lp = request.linkedin_parsed or {}
-    if lp.get("skills") or fields.get("tech_stack"):
-        if "TECH_STACK" not in covered:
-            covered.append("TECH_STACK")
-    if fields.get("career_history") or lp.get("experience"):
-        if "CAREER_HISTORY" not in covered:
-            covered.append("CAREER_HISTORY")
-    if fields.get("accomplishments") or lp.get("achievements"):
-        if "ACCOMPLISHMENTS" not in covered:
-            covered.append("ACCOMPLISHMENTS")
-
-    remaining = [t for t in _ALL_RESUME_TOPICS if t not in covered]
-
-    linkedin_section = ""
-    if lp:
-        lines = []
-        if lp.get("name"):       lines.append(f"Name: {lp['name']}")
-        if lp.get("title"):      lines.append(f"Title: {lp['title']}")
-        if lp.get("skills"):     lines.append(f"Skills: {str(lp['skills'])[:300]}")
-        if lp.get("experience"): lines.append(f"Experience: {str(lp['experience'])[:400]}")
-        if lines:
-            linkedin_section = "\nLinkedIn data (pre-loaded — do not re-ask):\n" + "\n".join(lines)
-
-    system_prompt = _RESUME_SYSTEM_TEMPLATE.format(
-        topics_remaining=", ".join(remaining) if remaining else "ALL COVERED",
-        fields_json=json.dumps(fields, indent=2),
-        linkedin_section=linkedin_section,
-    )
-
-    messages: List[Dict[str, Any]] = []
-    if not request.history:
-        messages = [{"role": "user", "content": [{"text": "hi, let's start"}]}]
-    else:
-        for item in request.history[-50:]:
-            if item.role not in ("user", "assistant"):
-                raise HTTPException(status_code=400, detail=f"Invalid role: {item.role!r}")
-            messages.append({"role": item.role, "content": [{"text": item.content}]})
-        if messages and messages[0]["role"] != "user":
-            messages.insert(0, {"role": "user", "content": [{"text": "hi, let's start"}]})
-
-    raw: Optional[str] = None
-    try:
-        response = await asyncio.to_thread(
-            bedrock_client.converse,
-            modelId=BEDROCK_MODEL_ID,
-            system=[{"text": system_prompt}],
-            messages=messages,
-            inferenceConfig={"maxTokens": 600, "temperature": 0.8, "topP": 0.95},
-        )
-        raw = response["output"]["message"]["content"][0]["text"].strip()
-        data = _extract_json_object(raw, required_key="message")
-
-        if not isinstance(data, dict) or "message" not in data:
-            raise ValueError("Invalid resume interview JSON structure")
-
-        validated = ResumeResponse.model_validate(data)
-
-        request_topics = set(covered)
-        model_topics = set(validated.topics_covered or [])
-        merged = request_topics | model_topics
-        if merged:
-            validated.topics_covered = [t for t in _ALL_RESUME_TOPICS if t in merged]
-
-        result = validated.model_dump(exclude_none=True)
-        if set(_ALL_RESUME_TOPICS).issubset(merged) and not result.get("done"):
-            result["done"] = True
-
-        return result
-
-    except (ValueError, json.JSONDecodeError) as exc:
-        print(f"Resume interview JSON parse error: {exc!r}")
-        done_msg = "Perfect — I have enough to generate your resume now."
-        cont_msg = "Got it — let me keep going. Could you tell me a bit more?"
-
-        covered_set = set(covered)
-        fallback_done = set(_ALL_RESUME_TOPICS).issubset(covered_set)
-        fallback_message = raw if raw is not None else cont_msg
-        merged_fallback_topics = set(covered_set)
-
-        if raw is not None:
-            try:
-                parsed = _extract_json_object(raw)
-                if isinstance(parsed, dict):
-                    if parsed.get("done") is True:
-                        fallback_done = True
-                    parsed_topics = parsed.get("topics_covered")
-                    if isinstance(parsed_topics, list):
-                        merged_fallback_topics |= {t for t in parsed_topics if t in _ALL_RESUME_TOPICS}
-                    parsed_message = parsed.get("message")
-                    if isinstance(parsed_message, str) and parsed_message.strip():
-                        fallback_message = parsed_message.strip()
-            except (ValueError, json.JSONDecodeError) as parse_exc:
-                print(f"Resume interview fallback JSON parse error: {parse_exc!r}")
-
-            if raw.strip().startswith("{") or raw.strip().startswith("```"):
-                if fallback_message == raw:
-                    fallback_message = cont_msg
-            else:
-                last_brace = raw.rfind('{')
-                if last_brace > len(raw) // 2:
-                    try:
-                        fragment = json.loads(raw[last_brace:])
-                        if isinstance(fragment, dict) and "done" in fragment:
-                            if fragment.get("done") is True:
-                                fallback_done = True
-                            fallback_message = raw[:last_brace].strip()
-                    except json.JSONDecodeError:
-                        pass
-                if not fallback_message:
-                    fallback_message = done_msg if fallback_done else cont_msg
-
-        if set(_ALL_RESUME_TOPICS).issubset(merged_fallback_topics):
-            fallback_done = True
-        fallback_topics = (
-            list(_ALL_RESUME_TOPICS)
-            if fallback_done
-            else [t for t in _ALL_RESUME_TOPICS if t in merged_fallback_topics]
-        )
-        return {
-            "message": fallback_message,
-            "field_updates": {},
-            "topics_covered": fallback_topics,
-            "done": fallback_done,
-        }
-    except Exception as exc:
-        print(f"Unexpected error in /resume/message: {exc}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
-
-
-@app.post("/resume/parse-jd")
-async def resume_parse_jd(
-    file: UploadFile = File(...),
-    _user_id: str = Depends(get_current_user_id),
-):
-    """Extract structured data from a job description PDF."""
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-    try:
-        contents = await file.read()
-        reader = PdfReader(io.BytesIO(contents))
-        text = "".join(p.extract_text() or "" for p in reader.pages)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
-
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Could not extract text from PDF")
-
-    extract_prompt = f"""Extract structured data from this job description and return ONLY valid JSON:
-{{
-  "role": "job title",
-  "company": "company name or empty string",
-  "required_skills": "comma-separated list of required skills/technologies",
-  "preferred_skills": "comma-separated nice-to-haves",
-  "responsibilities": "bullet summary of key responsibilities",
-  "raw_text": "first 800 chars of the job description verbatim"
-}}
-
-Job description:
-{text[:5000]}
-
-Return only the JSON, no other text."""
-
-    try:
-        response = await asyncio.to_thread(
-            bedrock_client.converse,
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": extract_prompt}]}],
-            inferenceConfig={"maxTokens": 800, "temperature": 0.1},
-        )
-        raw = response["output"]["message"]["content"][0]["text"]
-        return _extract_json_object(raw)
-    except Exception as e:
-        print(f"Error in /resume/parse-jd: {e}")
-        raise HTTPException(status_code=500, detail="Failed to parse job description")
-
-
-@app.post("/resume/generate")
-async def resume_generate(
-    request: ResumeGenerateRequest,
-    _user_id: str = Depends(get_current_user_id),
-):
-    """Run the resume-builder agent loop, then return a formatted .docx file."""
-    fields = request.fields_collected
-
-    context_lines = []
-    for key, val in fields.items():
-        if val and key != "job_description":
-            context_lines.append(f"{key.replace('_', ' ').title()}: {val}")
-    context = "\n".join(context_lines)
-
-    jd_section = ""
-    if fields.get("job_description"):
-        jd_section = f"\n\nTarget Job Description:\n{fields['job_description']}"
-
-    system_prompt = (
-        "You are a professional resume writer. Use the provided tools to build a polished, "
-        "ATS-friendly resume from the candidate information supplied.\n\n"
-        "Call the tools in this order:\n"
-        "1. set_contact_info\n"
-        "2. set_summary (tailor to the target role if a job description is provided)\n"
-        "3. add_experience — once per role, most recent first; write strong action-verb bullets with metrics\n"
-        "4. add_education — once per degree\n"
-        "5. set_skills — group by category (Languages, Frameworks, Tools, Cloud, etc.)\n"
-        "6. finalize_resume\n\n"
-        "Use only information that is explicitly provided. Do not invent details, dates, or metrics."
-    )
-
-    user_message = f"Here is the candidate's information:\n\n{context}{jd_section}\n\nBuild their resume now."
-
-    messages: List[Dict[str, Any]] = [
-        {"role": "user", "content": [{"text": user_message}]}
-    ]
-
-    resume_data: Dict[str, Any] = {
-        "contact": {},
-        "summary": "",
-        "experience": [],
-        "education": [],
-        "skills": [],
-    }
-
-    _MAX_AGENT_ITERATIONS = 20
-
-    try:
-        for _ in range(_MAX_AGENT_ITERATIONS):
-            response = await asyncio.to_thread(
-                bedrock_client.converse,
-                modelId=BEDROCK_MODEL_ID,
-                system=[{"text": system_prompt}],
-                messages=messages,
-                toolConfig={
-                    "tools": _RESUME_TOOLS,
-                    "toolChoice": {"auto": {}},
-                },
-                inferenceConfig={"maxTokens": 4096, "temperature": 0.2},
-            )
-
-            stop_reason = response.get("stopReason", "end_turn")
-            response_message = response["output"]["message"]
-            # Bedrock sometimes returns empty text blocks alongside toolUse blocks;
-            # filter them out to avoid ValidationException on the next converse call.
-            if response_message.get("content"):
-                response_message["content"] = [
-                    b for b in response_message["content"]
-                    if not (isinstance(b.get("text"), str) and not b["text"].strip())
-                ]
-            messages.append(response_message)
-
-            if stop_reason != "tool_use":
-                break
-
-            tool_results = []
-            finalized = False
-
-            for block in response_message.get("content", []):
-                tool_use = block.get("toolUse")
-                if not tool_use:
-                    continue
-
-                name = tool_use["name"]
-                inp = tool_use["input"]
-                tool_use_id = tool_use["toolUseId"]
-
-                if name == "set_contact_info":
-                    resume_data["contact"] = inp
-                elif name == "set_summary":
-                    resume_data["summary"] = inp.get("text", "")
-                elif name == "add_experience":
-                    resume_data["experience"].append(inp)
-                elif name == "add_education":
-                    resume_data["education"].append(inp)
-                elif name == "set_skills":
-                    resume_data["skills"] = inp.get("categories", [])
-                elif name == "finalize_resume":
-                    finalized = True
-
-                tool_results.append({
-                    "toolResult": {
-                        "toolUseId": tool_use_id,
-                        "content": [{"text": "OK"}],
-                        "status": "success",
-                    }
-                })
-
-            if tool_results:
-                messages.append({"role": "user", "content": tool_results})
-
-            if finalized:
-                break
-
-    except Exception as exc:
-        print(f"Error in resume agent loop: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to generate resume")
-
-    if not resume_data["contact"] and not resume_data["experience"]:
-        raise HTTPException(status_code=500, detail="Resume agent did not produce usable output")
-
-    try:
-        doc_bytes = await asyncio.to_thread(_build_resume_docx, resume_data)
-    except Exception as exc:
-        print(f"Error building resume docx: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to format resume document")
-
-    raw_candidate_name = str(resume_data["contact"].get("name") or "resume")
-    safe_candidate_name = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_candidate_name).strip("._-")
-    safe_candidate_name = re.sub(r"_+", "_", safe_candidate_name)
-    if not safe_candidate_name:
-        safe_candidate_name = "resume"
-    filename = f"{safe_candidate_name}_resume.docx"
-    filename_star = f"{quote(safe_candidate_name, safe='')}_resume.docx"
-
-    return StreamingResponse(
-        io.BytesIO(doc_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f"attachment; filename=\"{filename}\"; filename*=UTF-8''{filename_star}"},
-    )
 
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(app, host="127.0.0.1", port=8000)  # nosec B104 — local dev only, not used in Lambda
+    uvicorn.run(app, host="0.0.0.0", port=8000)
