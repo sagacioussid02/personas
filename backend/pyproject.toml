@@ -1,19 +1,22 @@
 [project]
-name = "backend"
+name = "twin-backend"
 version = "0.1.0"
-requires-python = ">=3.11"
+description = "FastAPI backend for Personality Twin"
+requires-python = ">=3.12"
+authors = [{name = "Twin Team"}]
+
 dependencies = [
-    "boto3>=1.42.54",
-    "fastapi>=0.129.2",
-    "httpx>=0.27.0",
-    "mangum>=0.21.0",
-    "openai>=2.21.0",
-    "cryptography>=46.0.7",
-    "pyjwt[crypto]>=2.8.0",
-    "pypdf>=6.10.2",
-    "python-dotenv>=1.2.2",
-    "python-multipart>=0.0.27",
-    "uvicorn>=0.41.0",
-    "python-docx>=1.1.2",
-    "idna>=3.15",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-dotenv>=1.0.0",
+    "boto3>=1.28.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "pyjwt>=2.8.0",
+    "httpx>=0.25.0",
+    "starlette>=1.0.1",
 ]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
