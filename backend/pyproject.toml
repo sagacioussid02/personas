@@ -1,46 +1,29 @@
 [project]
-name = "twin-backend"
+name = "backend"
 version = "0.1.0"
 description = "FastAPI backend for Personality Twin"
 requires-python = ">=3.12"
-authors = [{name = "Twin Team"}]
+authors = [{name = "Sidd", email = "sidd@example.com"}]
 
 dependencies = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
     "python-dotenv>=1.0.0",
-    "boto3>=1.28.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    "PyJWT>=2.8.0",
+    "boto3>=1.28.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "python-multipart>=0.0.6",
     "httpx>=0.25.0",
-    "starlette>=1.0.1",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.4.0",
-    "pytest-asyncio>=0.21.0",
-    "black>=23.0.0",
-    "ruff>=0.1.0",
-    "mypy>=1.5.0",
+    "aiofiles>=23.2.0",
 ]
 
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.black]
-line-length = 100
-target-version = ["py312"]
-
-[tool.ruff]
-line-length = 100
-target-version = "py312"
-select = ["E", "F", "W", "I"]
-
-[tool.mypy]
-python_version = "3.12"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false
+[tool.uv]
+# Exclude the backend package itself from being exported as an editable dependency
+# The backend code is deployed directly in Lambda, not as an installed package
+managed = true
