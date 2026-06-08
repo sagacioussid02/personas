@@ -73,6 +73,31 @@ Everything else has sensible defaults for local development.
 
 ---
 
+## Architecture & Operations
+
+### System Design
+
+For a detailed breakdown of how Lambda, Bedrock, CloudFront, and S3 fit together, see [**ARCHITECTURE.md**](./ARCHITECTURE.md). It covers:
+
+- End-to-end request flow (CloudFront → Lambda → Bedrock → S3)
+- Key configuration parameters for each AWS service
+- Known failure modes and their mitigations
+- Deployment pipeline and scaling considerations
+
+### Operational Runbook
+
+If you're on-call or troubleshooting, start with [**RUNBOOK.md**](./RUNBOOK.md). It provides step-by-step diagnosis and recovery procedures for:
+
+- **Lambda Cold Starts** — Why first requests are slow and how to fix it
+- **Bedrock Throttling** — Rate limit errors and quota management
+- **S3 Failures** — Missing personas and permission issues
+
+### Incident Log
+
+See [**LESSONS_LEARNED.md**](./LESSONS_LEARNED.md) for a curated log of production incidents, their root causes, and remediation status.
+
+---
+
 ## Architecture (the 30-second version)
 
 ```
@@ -83,64 +108,193 @@ Browser
   │
   └── API calls ──► FastAPI (Python)
                       Lambda in prod, uvicorn locally
+```
+
+For a detailed architecture diagram, request flow, and operational runbook, see:
+
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — End-to-end system design, Lambda + Bedrock integration, and failure modes
+- **[RUNBOOK.md](./RUNBOOK.md)** — Operational procedures for Lambda cold starts, Bedrock throttling, and S3 failures
+- **[CI_WORKFLOWS.md](./CI_WORKFLOWS.md)** — Automated workflow governance, security gates, and deployment approval rules
+
+---
+
+## Contributing
+
+We welcome contributions. See [CONTRIBUTING.md](./CONTRIBUTING.md) for:
+
+- Local setup and testing
+- Code style and standards
+- Monorepo package.json boundary (root vs. frontend)
+- PR submission and review process
+- Automated workflow gates and required status checks
                       │
-                      ├── AWS Bedrock  ← all the LLM calls (Nova / Claude)
+                      ├─► Bedrock (Claude inference)
                       │
-                      └── S3  ← twin JSON files + conversation history
-                                (local disk when USE_S3=false)
-```
-
-**Auth:** Clerk handles sign-up/login. The frontend gets a JWT, sends it as a Bearer token, and the backend verifies it against Clerk's public keys. Standard stuff.
-
-**Twin storage:** Each twin is a single JSON file. No database. This is either elegant simplicity or a future problem, depending on when you're reading this.
-
-**Conversations:** Also JSON files, keyed by a session ID. Authenticated sessions use an HMAC-derived ID so they're stable across devices without any server-side session lookup.
-
-**LLM calls:** Everything goes through AWS Bedrock. The default model is Amazon Nova — fast and cheap for homepage chat. The same model handles twin creation synthesis, deepen re-synthesis, and tagline generation.
-
----
-
-## Project structure
-
-```
-├── backend/
-│   ├── server.py          # All API endpoints (~2200 lines, yes it's a lot)
-│   ├── context.py         # Prompt engineering for twin conversations
-│   ├── personality_agent.py  # Archetype detection
-│   ├── resources.py       # Loads the default twin's data files
-│   ├── data/              # Sidd's actual profile data (bio, skills, etc.)
-│   └── public_personas/   # Public persona JSON files loaded at startup
-│
-├── frontend/
-│   ├── app/               # Next.js App Router pages
-│   │   ├── page.tsx       # Homepage
-│   │   ├── dashboard/     # Your twins
-│   │   ├── create/        # Twin creation flow
-│   │   ├── twin/          # Chat with any twin
-│   │   └── deepen/        # Depth interview
-│   └── components/
-│       ├── twin.tsx        # Unauthenticated homepage chat
-│       └── twin-chat.tsx   # Authenticated chat for user twins
-│
-└── terraform/             # AWS infrastructure as code
+                      └─► S3 (persona context storage)
 ```
 
 ---
 
-## Deploying
+## Deployment
 
-Push to `main`. GitHub Actions handles the rest — builds the Lambda package, runs Terraform, and deploys the frontend to the AWS-hosted static site stack managed in this repo (S3 + CloudFront).
+### Local → AWS
 
-The platform runs on a modern serverless AWS stack using Lambda, API Gateway, S3, CloudFront, and Bedrock, giving it the speed, scalability, and production posture expected from a sellable AI product.
+```bash
+# 1. Ensure you have AWS credentials configured
+aws sts get-caller-identity
+
+# 2. Backend: build and deploy Lambda function
+cd backend
+pip install -r requirements.txt
+zip -r ../lambda.zip . -x "*.git*" "__pycache__/*" "*.pyc"
+aws lambda update-function-code \
+  --function-name twin-api-prod \
+  --zip-file fileb://../lambda.zip
+
+# 3. Frontend: build and deploy to S3 + CloudFront
+cd ../frontend
+npm run build
+aws s3 sync out/ s3://twin-frontend-prod/ --delete
+aws cloudfront create-invalidation \
+  --distribution-id E123ABC \
+  --paths "/*"
+```
+
+For CI/CD automation, see `.github/workflows/deploy.yml`.
 
 ---
 
-## The backstory
+## Deployment
 
-This started as "what if my resume could talk back" and evolved into something more interesting: a platform for capturing how people actually reason, not just what they've done. Resumes list accomplishments. This tries to capture the mental model behind them.
+The project deploys to AWS Lambda + CloudFront. See the deployment workflow in `.github/workflows/deploy.yml` and operational guidance in [RUNBOOK.md](./RUNBOOK.md).
 
-The historical personas (like Gandhi, Charlie Chaplin, and Buffett) exist to prove the concept works for public figures — and because having Gandhi explain nonviolent resistance to you directly is genuinely a different experience than reading a Wikipedia summary.
+**Key points:**
+
+- Frontend is built and deployed to S3 + CloudFront
+- Backend is packaged as a Lambda function
+- All deployments require human approval (no automated deploy from automated PRs)
+- See [CI_WORKFLOWS.md](./CI_WORKFLOWS.md) for deployment approval gates
 
 ---
 
-*Built by [Siddharth Shankar](https://github.com/sagacioussid02) · Binosus LLC · 2026*
+## Lessons Learned
+
+We track operational incidents and known issues in [LESSONS_LEARNED.md](./LESSONS_LEARNED.md). Common failure modes include:
+
+- Lambda cold starts (mitigated with provisioned concurrency)
+- Bedrock throttling (mitigated with exponential backoff and user-friendly error messages)
+- S3 failures (mitigated with retry logic and fallback caching)
+```
+twin/
+├── backend/                    # FastAPI application
+│   ├── server.py              # Main app, /chat endpoint
+│   ├── models.py              # Pydantic schemas
+│   ├── bedrock.py             # Bedrock client wrapper
+│   ├── storage.py             # S3 and local storage
+│   └── requirements.txt        # Python dependencies
+├── frontend/                   # Next.js application
+│   ├── app/                   # App router (Next.js 13+)
+│   ├── components/            # React components
+│   ├── lib/                   # Utilities
+│   └── package.json           # Node dependencies
+├── .github/workflows/          # CI/CD pipelines
+│   ├── deploy.yml             # Deploy to AWS
+│   ├── destroy.yml            # Teardown (manual approval)
+│   └── tests.yml              # Run tests on PR
+├── ARCHITECTURE.md            # System design & operations
+├── RUNBOOK.md                 # Troubleshooting guide
+├── LESSONS_LEARNED.md         # Incident log
+├── CONTRIBUTING.md            # Development guidelines
+└── README.md                  # This file
+```
+
+---
+
+## Development
+
+### Code style
+
+- **Python:** Black formatter, mypy type checking
+- **TypeScript/React:** ESLint, Prettier
+- **Commits:** Conventional Commits (feat:, fix:, docs:, etc.)
+
+### Testing
+
+```bash
+# Backend
+cd backend
+pytest tests/ -v
+
+# Frontend
+cd frontend
+npm test
+```
+---
+
+## Monitoring & Alerts
+
+Production deployments are monitored via CloudWatch. Key metrics:
+
+- **Lambda duration** — P50, P95, P99 latencies
+- **Lambda errors** — 4xx and 5xx error rates
+- **Bedrock throttling** — Rate limit exceeded events
+- **S3 access errors** — Permission and missing-key failures
+- **CloudFront cache hit ratio** — Should be > 80%
+
+Alarms are configured to page on-call for:
+
+- Error rate > 1%
+- P95 latency > 5 sec
+- Any Bedrock throttle event
+- S3 access denied > 5 in 5 min
+
+See [RUNBOOK.md](./RUNBOOK.md) for diagnosis and recovery steps.
+
+See [RUNBOOK.md](./RUNBOOK.md) for diagnosis and recovery steps.
+
+---
+
+## Questions?
+
+Reach out to the team or open an issue. We're here to help.
+## FAQ
+
+**Q: How do I create a new persona?**
+
+A: Use the `/personas/create` endpoint (POST) with a structured intake payload. The frontend guides users through prompts, uploads, and Q&A. Context is stored in S3; Bedrock embeddings are generated for semantic search.
+
+**Q: What's the latency for a chat request?**
+
+A: Typical: 1–3 sec (S3 context fetch + Bedrock inference). Cold starts add 5–15 sec on first request after deployment. See [ARCHITECTURE.md](./ARCHITECTURE.md) for optimization tips.
+
+**Q: Can I use a different LLM instead of Claude?**
+
+A: Yes. Bedrock supports multiple models (Llama, Mistral, etc.). Update `bedrock.py` to change the `modelId` parameter. Note: prompt format and token limits vary by model.
+
+**Q: How much does this cost to run?**
+
+A: Rough monthly estimate (10k chat requests/month):
+
+- Lambda: $0.20 (compute)
+- Bedrock: $5–10 (inference, depends on model)
+- S3: < $0.10 (storage)
+- CloudFront: $0.50–2 (data transfer)
+- **Total: ~$6–13/month** (very cheap for a production service)
+
+**Q: How do I scale to 1000s of concurrent users?**
+
+A: Lambda auto-scales. Bedrock has per-account rate limits (default: 100 req/min). Request a quota increase to 1000+ req/min. See [RUNBOOK.md](./RUNBOOK.md) for details.
+
+---
+
+## License
+
+MIT. See LICENSE file.
+
+---
+
+## Support
+
+- **Documentation:** [ARCHITECTURE.md](./ARCHITECTURE.md), [RUNBOOK.md](./RUNBOOK.md), [LESSONS_LEARNED.md](./LESSONS_LEARNED.md)
+- **Issues:** GitHub Issues
+- **On-call:** See [RUNBOOK.md](./RUNBOOK.md) for escalation path

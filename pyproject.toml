@@ -1,0 +1,13 @@
+[project]
+name = "twin"
+version = "1.0.0"
+description = "Personality Twin - Turn human expertise into an always-on AI persona"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+resolution = "highest"
