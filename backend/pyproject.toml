@@ -6,7 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "twin-backend"
 version = "1.0.0"
 description = "Personality Twin backend API"
+readme = "README.md"
 requires-python = ">=3.12"
+license = {text = "MIT"}
 authors = [{name = "Twin Team"}]
 
 dependencies = [
