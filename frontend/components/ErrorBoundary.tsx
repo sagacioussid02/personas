@@ -41,11 +41,10 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
       } catch {
         // Not a JSON error, treat as unknown
         friendlyError = {
-          type: "unknown" as any,
           title: "Something Went Wrong",
           message: error.message || "An unexpected error occurred.",
-          actionLabel: "Retry",
-          isDismissible: true,
+          action: "Retry",
+          retryable: true,
         };
       }
     }
@@ -93,13 +92,6 @@ function DefaultErrorFallback({
   const handleRetry = useCallback(async () => {
     setIsRetrying(true);
 
-    // Wait for retry_after delay if specified
-    if (error.retryAfterSeconds) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, error.retryAfterSeconds! * 1000)
-      );
-    }
-
     setIsRetrying(false);
     onRetry();
   }, [error, onRetry]);
@@ -114,29 +106,20 @@ function DefaultErrorFallback({
           </h2>
           <p className="text-gray-600 mb-6">{error.message}</p>
 
-          {error.retryAfterSeconds && (
-            <p className="text-sm text-gray-500 mb-4">
-              Please wait {error.retryAfterSeconds} seconds before retrying.
-            </p>
-          )}
-
           <div className="flex gap-3">
             <button
               onClick={handleRetry}
               disabled={isRetrying}
               className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium py-2 px-4 rounded transition"
             >
-              {isRetrying ? "Retrying..." : error.actionLabel}
+              {isRetrying ? "Retrying..." : error.action ?? "Retry"}
             </button>
-
-            {error.isDismissible && (
-              <button
-                onClick={onRetry}
-                className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-900 font-medium py-2 px-4 rounded transition"
-              >
-                Dismiss
-              </button>
-            )}
+            <button
+              onClick={onRetry}
+              className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-900 font-medium py-2 px-4 rounded transition"
+            >
+              Dismiss
+            </button>
           </div>
         </div>
       </div>

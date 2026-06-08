@@ -80,18 +80,15 @@ export default function ChatPage({ params }: ChatPageProps) {
       );
 
       if (!response.ok) {
-        const errorData = await parseErrorResponse(response);
+        const errorData = parseErrorResponse(response);
         if (errorData) {
           const friendlyError = toFriendlyError(errorData);
           setError(friendlyError);
 
           // Auto-retry for transient errors
-          if (
-            friendlyError.type === "lambda_cold_start" ||
-            friendlyError.type === "bedrock_throttle"
-          ) {
+          if (friendlyError.retryable) {
             if (attemptNumber < 3) {
-              const delayMs = getRetryAfterDelay(response, errorData);
+              const delayMs = getRetryAfterDelay(errorData) ?? 2000;
               setTimeout(() => {
                 sendMessage(text, attemptNumber + 1);
               }, delayMs);
@@ -100,11 +97,10 @@ export default function ChatPage({ params }: ChatPageProps) {
           }
         } else {
           setError({
-            type: "unknown",
             title: "Error",
             message: `HTTP ${response.status}: ${response.statusText}`,
-            actionLabel: "Retry",
-            isDismissible: true,
+            action: "Retry",
+            retryable: true,
           });
         }
         return;
@@ -122,14 +118,13 @@ export default function ChatPage({ params }: ChatPageProps) {
       setRetryCount(0);
     } catch (err) {
       setError({
-        type: "unknown",
         title: "Connection Error",
         message:
           err instanceof Error
             ? err.message
             : "Failed to connect to the service.",
-        actionLabel: "Retry",
-        isDismissible: true,
+        action: "Retry",
+        retryable: true,
       });
     } finally {
       setIsLoading(false);
@@ -234,16 +229,14 @@ export default function ChatPage({ params }: ChatPageProps) {
                 onClick={handleRetry}
                 className="text-sm bg-yellow-600 hover:bg-yellow-700 text-white px-3 py-1 rounded"
               >
-                {error.actionLabel}
+                {error.action ?? "Retry"}
               </button>
-              {error.isDismissible && (
-                <button
-                  onClick={() => setError(null)}
-                  className="text-sm bg-gray-300 hover:bg-gray-400 text-gray-900 px-3 py-1 rounded"
-                >
-                  Dismiss
-                </button>
-              )}
+              <button
+                onClick={() => setError(null)}
+                className="text-sm bg-gray-300 hover:bg-gray-400 text-gray-900 px-3 py-1 rounded"
+              >
+                Dismiss
+              </button>
             </div>
           </div>
         )}
