@@ -65,7 +65,7 @@ python-jose[cryptography]==3.3.0
     # via twin-backend
 python-multipart==0.0.6
     # via twin-backend
-PyJWT==2.8.1
+PyJWT==2.13.0
     # via twin-backend
 requests==2.31.0
     # via botocore
