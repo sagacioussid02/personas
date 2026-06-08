@@ -108,6 +108,25 @@ Browser
   │
   └── API calls ──► FastAPI (Python)
                       Lambda in prod, uvicorn locally
+```
+
+For a detailed architecture diagram, request flow, and operational runbook, see:
+
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — End-to-end system design, Lambda + Bedrock integration, and failure modes
+- **[RUNBOOK.md](./RUNBOOK.md)** — Operational procedures for Lambda cold starts, Bedrock throttling, and S3 failures
+- **[CI_WORKFLOWS.md](./CI_WORKFLOWS.md)** — Automated workflow governance, security gates, and deployment approval rules
+
+---
+
+## Contributing
+
+We welcome contributions. See [CONTRIBUTING.md](./CONTRIBUTING.md) for:
+
+- Local setup and testing
+- Code style and standards
+- Monorepo package.json boundary (root vs. frontend)
+- PR submission and review process
+- Automated workflow gates and required status checks
                       │
                       ├─► Bedrock (Claude inference)
                       │
@@ -145,8 +164,26 @@ For CI/CD automation, see `.github/workflows/deploy.yml`.
 
 ---
 
-## Project structure
+## Deployment
 
+The project deploys to AWS Lambda + CloudFront. See the deployment workflow in `.github/workflows/deploy.yml` and operational guidance in [RUNBOOK.md](./RUNBOOK.md).
+
+**Key points:**
+
+- Frontend is built and deployed to S3 + CloudFront
+- Backend is packaged as a Lambda function
+- All deployments require human approval (no automated deploy from automated PRs)
+- See [CI_WORKFLOWS.md](./CI_WORKFLOWS.md) for deployment approval gates
+
+---
+
+## Lessons Learned
+
+We track operational incidents and known issues in [LESSONS_LEARNED.md](./LESSONS_LEARNED.md). Common failure modes include:
+
+- Lambda cold starts (mitigated with provisioned concurrency)
+- Bedrock throttling (mitigated with exponential backoff and user-friendly error messages)
+- S3 failures (mitigated with retry logic and fallback caching)
 ```
 twin/
 ├── backend/                    # FastAPI application
@@ -192,15 +229,6 @@ pytest tests/ -v
 cd frontend
 npm test
 ```
-
-### Contributing
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on:
-
-- Monorepo structure (root vs. frontend package.json)
-- TypeScript/TSX requirements
-- Branch naming and PR process
-
 ---
 
 ## Monitoring & Alerts
@@ -222,8 +250,13 @@ Alarms are configured to page on-call for:
 
 See [RUNBOOK.md](./RUNBOOK.md) for diagnosis and recovery steps.
 
+See [RUNBOOK.md](./RUNBOOK.md) for diagnosis and recovery steps.
+
 ---
 
+## Questions?
+
+Reach out to the team or open an issue. We're here to help.
 ## FAQ
 
 **Q: How do I create a new persona?**
