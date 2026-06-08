@@ -37,7 +37,7 @@ jobs:
       - name: pip-audit dependency scan
         working-directory: backend
         run: |
-          uv export --no-dev --format requirements-txt > /tmp/requirements.txt
+          uv export --no-dev --format requirements-txt --no-emit-project --no-editable --no-hashes > /tmp/requirements.txt
           pip-audit -r /tmp/requirements.txt --format json -o ../pip-audit-report.json || true
           pip-audit -r /tmp/requirements.txt  # print to console
 

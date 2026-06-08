@@ -26,7 +26,7 @@ jobs:
         working-directory: backend
         run: |
           mkdir -p lambda-package
-          uv export --no-dev --format requirements-txt | \
+          uv export --no-dev --format requirements-txt --no-emit-project --no-editable --no-hashes | \
             pip install -r /dev/stdin -t lambda-package/ --quiet
           cp *.py lambda-package/
           if [ -d agents ]; then cp -r agents lambda-package/; fi
