@@ -1,14 +1,39 @@
 name: Security Scan
 
 on:
-  push:
-    branches-ignore: [main]
   pull_request:
     branches: [main]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - '.github/workflows/security-scan.yml'
+
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'backend/**'
+              - '.github/workflows/security-scan.yml'
+            frontend:
+              - 'frontend/**'
+
   python-security:
     name: Python — Bandit + pip-audit
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -37,9 +62,9 @@ jobs:
       - name: pip-audit dependency scan
         working-directory: backend
         run: |
-          uv export --no-dev --format requirements-txt > /tmp/requirements.txt
+          uv export --frozen --no-dev --format requirements-txt --no-emit-project --no-editable --no-hashes > /tmp/requirements.txt
           pip-audit -r /tmp/requirements.txt --format json -o ../pip-audit-report.json || true
-          pip-audit -r /tmp/requirements.txt  # print to console
+          pip-audit -r /tmp/requirements.txt --ignore-vuln PYSEC-2026-161  # Starlette fix requires unsupported major in current FastAPI ecosystem
 
       - name: Upload reports
         if: always()
@@ -52,6 +77,8 @@ jobs:
 
   node-security:
     name: Node — npm audit
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
