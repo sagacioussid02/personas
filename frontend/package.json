@@ -1,1 +1,28 @@
-{"name": "twin-frontend","version": "1.0.0","description": "Next.js frontend for Personality Twin","private": true,"scripts": {"dev": "next dev","build": "next build","start": "next start","lint": "next lint","type-check": "tsc --noEmit","validate:package-json": "node scripts/validate-package-json.js","test": "jest"},"dependencies": {"next": "14.0.4","react": "18.2.0","react-dom": "18.2.0","@clerk/nextjs": "5.0.0","@clerk/shared": "^3.47.5"},"devDependencies": {"typescript": "5.3.3","@types/node": "20.10.6","@types/react": "18.2.46","@types/react-dom": "18.2.18","eslint": "8.56.0","eslint-config-next": "14.0.4","jest": "^29.7.0"},"engines": {"node": ">=20.0.0"}}
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@clerk/nextjs": "^7.3.5",
+    "lucide-react": "^0.575.0",
+    "next": "16.2.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "tailwindcss": "^4",
+    "typescript": "^5.9.3"
+  }
+}
