@@ -1,113 +1,261 @@
 # Contributing to Personality Twin
 
-## Python Dependency Management
+Welcome! This guide covers local setup, the build pipeline, and deployment for Personality Twin.
 
-### Single Source of Truth: `pyproject.toml`
+## Prerequisites
 
-The backend uses a **single source of truth** for Python dependencies:
+- **Node.js** 20+ (for frontend)
+- **Python** 3.12+ (for backend)
+- **AWS credentials** with Bedrock access (for chat features)
+- **Clerk account** (free tier works for local dev)
+- **Git** (for version control)
 
-- **`backend/pyproject.toml`** — The authoring source. Edit this file when adding, removing, or updating dependencies.
-- **`backend/requirements.txt`** — Auto-generated lock file with pinned versions and hashes. **Do not edit by hand.**
-- **`backend/requirements-dev.txt`** — Auto-generated lock file for development dependencies. **Do not edit by hand.**
+## Local Development Setup
 
-### Workflow
+### Backend (FastAPI + Python)
 
-#### Adding or updating a dependency
-
-1. Edit `backend/pyproject.toml`:
-   - Add the package to the `dependencies` list (for production) or `[project.optional-dependencies] dev` (for development only).
-   - Use a version specifier (e.g., `fastapi>=0.104.0,<0.105.0`) or pin to a specific version.
-
-2. Regenerate the lock files:
+1. **Navigate to the backend directory:**
    ```bash
    cd backend
-   pip install pip-tools
-   pip-compile --generate-hashes pyproject.toml
-   pip-compile --generate-hashes --extra dev pyproject.toml -o requirements-dev.txt
    ```
 
-3. Commit both `pyproject.toml` and the updated lock files (`requirements.txt`, `requirements-dev.txt`).
+2. **Create a Python virtual environment:**
+   ```bash
+   python3.12 -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
 
-#### Installing dependencies locally
+3. **Install dependencies from the lock file:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+   
+   > **Note:** `requirements.txt` is auto-generated from `pyproject.toml` via `pip-compile`. It is the source of truth for reproducible builds. Do not edit it directly.
 
+4. **Set up environment variables:**
+   ```bash
+   cp .env.example .env
+   ```
+   
+   Required variables:
+   - `CLERK_JWKS_URL` — From your Clerk dashboard → API Keys
+   - `SESSION_HMAC_SECRET` — 64-char hex. Generate with:
+     ```bash
+     python -c "import secrets; print(secrets.token_hex(32))"
+     ```
+   
+   Optional:
+   - `USE_S3=false` — Use local disk instead of S3 (fine for dev)
+
+5. **Run the development server:**
+   ```bash
+   uvicorn server:app --reload --port 8000
+   ```
+   
+   API is now at `http://localhost:8000`. Visit `/docs` for the auto-generated Swagger UI.
+
+### Frontend (Next.js + React)
+
+1. **Navigate to the frontend directory:**
+   ```bash
+   cd frontend
+   ```
+
+2. **Install dependencies using npm ci (enforces lock file):**
+   ```bash
+   npm ci
+   ```
+   
+   > **Note:** `package-lock.json` is committed and enforced in CI. Use `npm ci` for reproducible installs. Only use `npm install` if you intentionally update dependencies, then commit the updated lock file.
+
+3. **Set up environment variables:**
+   ```bash
+   cp .env.local.example .env.local
+   ```
+   
+   Required variables:
+   - `NEXT_PUBLIC_API_URL=http://localhost:8000`
+   - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...` (from Clerk dashboard)
+
+4. **Run the development server:**
+   ```bash
+   npm run dev
+   ```
+   
+   App is now at `http://localhost:3000`.
+
+## Build Pipeline
+
+### Python Dependency Management
+
+**Single source of truth:** `backend/pyproject.toml`
+
+- All Python dependencies are declared in `pyproject.toml`
+- `requirements.txt` is generated via `pip-compile` in CI and committed for reproducibility
+- CI enforces that `requirements.txt` matches the generated output from `pyproject.toml`
+- If you add or update a Python dependency:
+  1. Edit `backend/pyproject.toml`
+  2. Regenerate `requirements.txt` locally:
+     ```bash
+     cd backend
+     pip install pip-compile  # if not already installed
+     pip-compile pyproject.toml
+     ```
+  3. Commit both files
+
+### Node Dependency Management
+
+**Single source of truth:** `frontend/package-lock.json`
+
+- Use `npm ci` for reproducible installs (CI and local dev)
+- Use `npm install` only when intentionally updating dependencies
+- Always commit the updated `package-lock.json` after running `npm install`
+
+### Running CI Checks Locally
+
+**Backend:**
 ```bash
 cd backend
-# For production dependencies only:
-pip install -r requirements.txt
 
-# For development (includes test, lint, and type-check tools):
-pip install -r requirements-dev.txt
-```
+# Linting
+ruff check .
 
-#### Why this approach?
+# Type checking
+mypy server
 
-- **Reproducibility**: Lock files with hashes ensure every CI run and deployment installs identical versions.
-- **Supply-chain security**: Hashes prevent tampering or unexpected version changes.
-- **Single source of truth**: No more sync overhead between `pyproject.toml` and `requirements.txt`.
-- **CI enforcement**: CI can use `pip install --require-hashes` to guarantee deterministic builds.
-
-## Frontend Dependency Management
-
-### Root vs. Frontend `package.json`
-
-The project has two `package.json` files:
-
-- **`package.json`** (root) — Shared tooling and workspace configuration (12 dependencies).
-- **`frontend/package.json`** — Frontend-specific dependencies for Next.js, React, and related tools (13 dependencies).
-
-### Rule: Where to add dependencies
-
-- **Frontend code** (React components, Next.js pages, client-side utilities): Add to `frontend/package.json`.
-- **Root-level tooling** (build scripts, CI helpers, shared dev tools): Add to `package.json` (root).
-- **All new frontend code must use `.tsx` or `.ts`**: No new `.js` or `.mjs` files in the frontend.
-
-### Workflow
-
-1. Identify whether the dependency is frontend-specific or root-level.
-2. Edit the appropriate `package.json`.
-3. Run `npm install` from the root or `cd frontend && npm install` to update `package-lock.json`.
-4. Commit both the `package.json` and `package-lock.json` changes.
-
-## Code Style
-
-### Python
-
-- Format with `black` (line length: 100).
-- Type hints encouraged; use `mypy` for checking.
-- Lint with `flake8`.
-
-### TypeScript / JavaScript
-
-- Use TypeScript (`.ts`, `.tsx`) for all new frontend code.
-- Format with Prettier (via ESLint config).
-- No new `.js` or `.mjs` files in the frontend.
-
-## Testing
-
-### Python
-
-```bash
-cd backend
+# Tests
 pytest
+
+# Code formatting (check only)
+black --check .
 ```
 
-### Frontend
-
+**Frontend:**
 ```bash
 cd frontend
+
+# Linting
+npm run lint
+
+# Type checking
+npm run type-check
+
+# Tests
 npm test
 ```
 
-## Submitting a PR
+## Deployment
 
-1. Create a branch: `minions/<role>/<short-summary>`.
-2. Make your changes and test locally.
-3. Commit with a conventional commit message (e.g., `refactor: consolidate Python dependencies`).
-4. Push and open a PR targeting `main`.
-5. Ensure all CI checks pass.
-6. Request review from a peer engineer.
-7. After peer approval, the operator will review and merge.
+### Staging Deployment
 
-## Questions?
+1. **Ensure all tests pass locally:**
+   ```bash
+   # Backend
+   cd backend && pytest
+   
+   # Frontend
+   cd frontend && npm test
+   ```
 
-Refer to the `ARCHITECTURE.md` and `RUNBOOK.md` for system design and operational guidance.
+2. **Push to a feature branch:**
+   ```bash
+   git checkout -b feature/your-feature
+   git push origin feature/your-feature
+   ```
+
+3. **Open a pull request** targeting `main`
+
+4. **CI will automatically:**
+   - Run all tests
+   - Validate dependency manifests
+   - Build Lambda artifact
+   - Build frontend bundle
+
+5. **After approval and CI passes**, merge to `main` to trigger staging deployment
+
+### Production Deployment
+
+Production deployments are managed by the DevOps team via the `destroy.yml` and deployment workflows. Contact the team for production release procedures.
+
+## Project Structure
+
+```
+twin/
+├── backend/                    # FastAPI application
+│   ├── pyproject.toml         # Python dependencies (source of truth)
+│   ├── requirements.txt       # Generated lock file (auto-generated in CI)
+│   ├── server/                # FastAPI app code
+│   └── tests/                 # Backend tests
+├── frontend/                  # Next.js application
+│   ├── package.json           # Node metadata
+│   ├── package-lock.json      # Node lock file (committed, enforced in CI)
+│   ├── app/                   # Next.js app directory
+│   └── __tests__/             # Frontend tests
+├── ARCHITECTURE.md            # System architecture diagram
+├── CONTRIBUTING.md            # This file
+└── README.md                  # Project overview
+```
+
+## Common Issues
+
+### "ModuleNotFoundError" or import errors in backend
+
+**Cause:** Virtual environment not activated or dependencies not installed.
+
+**Fix:**
+```bash
+cd backend
+source venv/bin/activate  # or: venv\Scripts\activate on Windows
+pip install -r requirements.txt
+```
+
+### "Cannot find module" errors in frontend
+
+**Cause:** Dependencies not installed or lock file out of sync.
+
+**Fix:**
+```bash
+cd frontend
+rm -rf node_modules package-lock.json
+npm ci
+```
+
+### Lambda build fails with dependency errors
+
+**Cause:** `requirements.txt` out of sync with `pyproject.toml`.
+
+**Fix:**
+```bash
+cd backend
+pip-compile pyproject.toml
+git add requirements.txt
+git commit -m "chore: regenerate requirements.txt"
+```
+
+### CI validation fails: "requirements.txt does not match generated output"
+
+**Cause:** You edited `requirements.txt` directly or `pyproject.toml` changed without regenerating.
+
+**Fix:**
+```bash
+cd backend
+pip-compile pyproject.toml
+git add requirements.txt
+git commit -m "chore: regenerate requirements.txt"
+```
+
+## Getting Help
+
+- Check `ARCHITECTURE.md` for system design details
+- Review `LESSONS_LEARNED.md` for known issues and workarounds
+- Open an issue on GitHub with reproduction steps
+- Reach out to the team on Slack
+
+## Code Review Guidelines
+
+- All PRs require at least one approval before merge
+- CI must pass (tests, linting, type checks, dependency validation)
+- Dependency changes must include updated lock files
+- Documentation updates should accompany code changes
+
+Thank you for contributing to Personality Twin!
