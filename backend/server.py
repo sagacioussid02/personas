@@ -183,6 +183,7 @@ _AUTH_FEEDBACK_NOTIFY_RATE_LIMIT = _get_int_env("AUTH_FEEDBACK_NOTIFY_RATE_LIMIT
 _NOTIFY_WINDOW_SECONDS = 7 * 24 * 3600.0  # 7 days
 _anon_notify_ip_history: dict[str, deque] = defaultdict(deque)
 _anon_notify_session_seen: dict[str, float] = {}  # session_id -> timestamp; pruned on read
+_anon_notify_session_email: dict[str, str] = {}  # session_id -> last email we already notified about
 _auth_notify_user_history: dict[str, deque] = defaultdict(deque)
 _anon_notify_lock = threading.Lock()
 _auth_notify_lock = threading.Lock()
@@ -212,11 +213,16 @@ def _client_ip(req: Request) -> str:
     return req.client.host if req.client else "unknown"
 
 
-def _should_notify_anon(ip: str, session_id: str) -> bool:
+def _should_notify_anon(ip: str, session_id: str, email: Optional[str] = None) -> bool:
     """Return True iff an anonymous notification slot is available, consuming it.
 
-    Limits: per-session one-shot + per-IP rolling 7-day cap of
-    FEEDBACK_NOTIFY_RATE_LIMIT (default 3). Returns False without consuming
+    Limits: one notification per session UNLESS the message reveals a new email
+    address we haven't already notified about for this session (e.g. the user's
+    first message expresses vague interest in connecting, and a later message in
+    the same session actually leaves contact info — that second one should still
+    reach the inbox). A per-IP rolling 7-day cap of FEEDBACK_NOTIFY_RATE_LIMIT
+    (default 3) is the hard ceiling in all cases, so repeatedly "discovering" new
+    emails can't be used to bypass rate limiting. Returns False without consuming
     when the env flag is <= 0 or any cap is hit.
     """
     if _FEEDBACK_NOTIFY_RATE_LIMIT <= 0:
@@ -226,8 +232,11 @@ def _should_notify_anon(ip: str, session_id: str) -> bool:
         # Prune expired session records to prevent unbounded growth
         expired = [sid for sid, ts in _anon_notify_session_seen.items() if now - ts > _NOTIFY_WINDOW_SECONDS]
         for sid in expired:
-            del _anon_notify_session_seen[sid]
-        if session_id in _anon_notify_session_seen:
+            _anon_notify_session_seen.pop(sid, None)
+            _anon_notify_session_email.pop(sid, None)
+        already_notified = session_id in _anon_notify_session_seen
+        new_email = bool(email) and _anon_notify_session_email.get(session_id) != email
+        if already_notified and not new_email:
             return False
         history = _anon_notify_ip_history[ip]
         while history and now - history[0] > _NOTIFY_WINDOW_SECONDS:
@@ -239,6 +248,8 @@ def _should_notify_anon(ip: str, session_id: str) -> bool:
             return False
         _anon_notify_ip_history[ip].append(now)  # re-creates via defaultdict if key was just removed
         _anon_notify_session_seen[session_id] = now
+        if email:
+            _anon_notify_session_email[session_id] = email
         return True
 
 
@@ -374,11 +385,11 @@ async def _send_notify_if_intent(
         identity = f"Email: {user_email}" if user_email else f"chatter_id: {chatter_id}"
         notify_message = f"{message}\n\nFrom: {identity}"
     else:
-        should_notify = _should_notify_anon(ip, session_id)
+        name, shared_email = _extract_identity_from_history(conversation, message)
+        should_notify = _should_notify_anon(ip, session_id, email=shared_email)
         if not should_notify:
             print(f"[notify] Anon notification suppressed by rate limit (ip={ip}, session={session_id})")
             return
-        name, shared_email = _extract_identity_from_history(conversation, message)
         identity_lines = []
         if name:
             identity_lines.append(f"Name (from chat): {name}")
