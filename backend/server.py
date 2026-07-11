@@ -125,9 +125,8 @@ _CONNECT_RE = re.compile(
 # typed in title case almost always represent a proper name rather than a common
 # word.
 _NAME_IN_CHAT_RE = re.compile(
-    r"(?:my name is|call me|this is|i'?m|i am)\s+"
-    r"([A-Za-z][a-z]{1,20}(?:\s+[A-Za-z][a-z]{1,20})?)",
-    re.IGNORECASE,
+    r"(?i:my name is|call me|this is|i'?m|i am)\s+"
+    r"([A-Z][a-z]{1,20}(?:\s+[A-Z][a-z]{1,20})?)"
 )
 _EMAIL_IN_CHAT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
@@ -357,48 +356,62 @@ async def _classify_feedback_intent(message: str) -> tuple[bool, str, str]:
         return is_connect, "connect" if is_connect else "", ""
 
 
-async def _send_notify_if_intent(
+def _decide_connect_notification(
     message: str,
     session_id: str,
-    twin_name: str,
     viewer_is_authenticated: bool,
     chatter_id: Optional[str],
     user_email: Optional[str],
     ip: str,
     conversation: list,
-    is_connect: bool = False,
-    intent_type: str = "connect",
-    intent_summary: str = "",
-) -> None:
+    is_connect: bool,
+) -> tuple[bool, Optional[str]]:
     """
-    Background task: send SES notification if feedback/contact intent was detected.
-    Classification is pre-computed (is_connect) so this only handles rate limiting + send.
+    Synchronously decide whether this message earns a real SES notification, and
+    consume the rate-limit slot if so. Pure in-memory bookkeeping — no I/O — so
+    it's safe to call before building the user-facing response, which means the
+    acknowledgment we show can honestly reflect whether we're actually sending
+    something instead of always claiming success.
+
+    Returns (should_notify, notify_message). notify_message is None when
+    should_notify is False.
     """
     if not is_connect:
-        return
+        return False, None
 
     if viewer_is_authenticated:
         should_notify = _should_notify_auth(chatter_id)
         if not should_notify:
             print(f"[notify] Auth notification suppressed by rate limit (chatter_id={chatter_id})")
-            return
+            return False, None
         identity = f"Email: {user_email}" if user_email else f"chatter_id: {chatter_id}"
-        notify_message = f"{message}\n\nFrom: {identity}"
-    else:
-        name, shared_email = _extract_identity_from_history(conversation, message)
-        should_notify = _should_notify_anon(ip, session_id, email=shared_email)
-        if not should_notify:
-            print(f"[notify] Anon notification suppressed by rate limit (ip={ip}, session={session_id})")
-            return
-        identity_lines = []
-        if name:
-            identity_lines.append(f"Name (from chat): {name}")
-        if shared_email:
-            identity_lines.append(f"Email (from chat): {shared_email}")
-        identity_lines.append(f"IP: {_truncate_ip(ip)}")
-        identity_lines.append(f"Session: {session_id}")
-        notify_message = message + "\n\n" + "\n".join(identity_lines)
+        return True, f"{message}\n\nFrom: {identity}"
 
+    name, shared_email = _extract_identity_from_history(conversation, message)
+    should_notify = _should_notify_anon(ip, session_id, email=shared_email)
+    if not should_notify:
+        print(f"[notify] Anon notification suppressed by rate limit (ip={ip}, session={session_id})")
+        return False, None
+    identity_lines = []
+    if name:
+        identity_lines.append(f"Name (from chat): {name}")
+    if shared_email:
+        identity_lines.append(f"Email (from chat): {shared_email}")
+    identity_lines.append(f"IP: {_truncate_ip(ip)}")
+    identity_lines.append(f"Session: {session_id}")
+    return True, message + "\n\n" + "\n".join(identity_lines)
+
+
+async def _send_connect_notification(
+    notify_message: str,
+    session_id: str,
+    twin_name: str,
+    intent_type: str = "connect",
+    intent_summary: str = "",
+) -> None:
+    """Background task: actually send the SES alert. Rate limiting was already
+    decided (and the slot consumed) synchronously by _decide_connect_notification
+    before this was scheduled, so this only performs the network call."""
     try:
         await asyncio.wait_for(
             _notify_connect_intent(notify_message, session_id, twin_name, intent_type, intent_summary),
@@ -1083,33 +1096,49 @@ async def chat(
         )
         assistant_response = orchestration["answer"]
 
-        # If a feedback/connect intent was detected, acknowledge it in the response.
-        if is_connect:
-            ack_map = {
-                "feedback": "I've passed your feedback along to Sidd — he'll appreciate hearing it.",
-                "compliment": "I've shared your kind words with Sidd — that really means a lot.",
-                "complaint": "I've forwarded your concern to Sidd so he can look into it.",
-                "review": "I've let Sidd know you'd like to leave a review — thanks for taking the time.",
-                "connect": "I've let Sidd know you'd like to get in touch — he'll reach out.",
-            }
-            ack = ack_map.get(intent_type, ack_map["connect"])
-            assistant_response = f"{assistant_response}\n\n*{ack}*"
-
-        # Rate limiting and SES send happen in the background (classification already done).
-        background_tasks.add_task(
-            _send_notify_if_intent,
+        # Decide — synchronously, no I/O — whether this message actually earns a
+        # notification, before we say anything to the user about it. This is what
+        # makes the acknowledgment below honest instead of always claiming success.
+        should_notify, notify_message = _decide_connect_notification(
             message=request.message,
             session_id=session_id,
-            twin_name=twin_name or "Sidd",
             viewer_is_authenticated=viewer_is_authenticated,
             chatter_id=chatter_id,
             user_email=user_email,
             ip=_client_ip(http_request),
             conversation=list(conversation),
             is_connect=is_connect,
-            intent_type=intent_type,
-            intent_summary=intent_summary,
         )
+
+        # If a feedback/connect intent was detected, acknowledge it in the response.
+        if is_connect:
+            if should_notify:
+                ack_map = {
+                    "feedback": "I've passed your feedback along to Sidd — he'll appreciate hearing it.",
+                    "compliment": "I've shared your kind words with Sidd — that really means a lot.",
+                    "complaint": "I've forwarded your concern to Sidd so he can look into it.",
+                    "review": "I've let Sidd know you'd like to leave a review — thanks for taking the time.",
+                    "connect": "I've let Sidd know you'd like to get in touch — he'll reach out.",
+                }
+                ack = ack_map.get(intent_type, ack_map["connect"])
+            else:
+                ack = (
+                    "I've already flagged this conversation to Sidd, so I won't send a "
+                    "duplicate alert — it's saved here and he'll see it when he checks in."
+                )
+            assistant_response = f"{assistant_response}\n\n*{ack}*"
+
+        # The rate-limit decision (and slot consumption) already happened above;
+        # this background task only performs the actual SES network call.
+        if should_notify:
+            background_tasks.add_task(
+                _send_connect_notification,
+                notify_message,
+                session_id,
+                twin_name or "Sidd",
+                intent_type,
+                intent_summary,
+            )
 
         # Personality review step (gated — enable via PERSONALITY_REVIEW_ENABLED=true)
         if PERSONALITY_REVIEW_ENABLED:
