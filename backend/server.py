@@ -1473,47 +1473,67 @@ async def list_my_twins(user_id: str = Depends(get_current_user_id)):
     return {"twins": twins}
 
 
-@app.post("/create-twin")
-async def create_twin(request: CreateTwinRequest, user_id: str = Depends(get_current_user_id)):
-    """Synthesize submitted profile data into a structured personality model via Bedrock"""
+def synthesize_personality_model(
+    *,
+    name: str,
+    title: str,
+    bio: str,
+    skills: str = "",
+    experience: str = "",
+    achievements: str = "",
+    coreValues: str = "",
+    decisionStyle: str = "",
+    riskTolerance: str = "",
+    pastDecisions: str = "",
+    communicationStyle: str = "",
+    writingSamples: str = "",
+    blindSpots: str = "",
+) -> Dict[str, Any]:
+    """Call Bedrock to synthesize a personality_model from profile fields.
 
+    Shared by /create-twin and the default-twin migration script so both
+    produce structurally identical models from the same prompt. Raises
+    ValueError on any failure (bad Bedrock response, missing keys); callers
+    translate that into their own error handling (HTTPException for the
+    endpoint, a plain failure for the script).
+    """
     synthesis_prompt = f"""You are building a personality model for an AI twin. Your job is to deeply analyze everything provided and produce a structured JSON model that captures how this person THINKS and DECIDES — not just what they've done.
 
-This model will be used to answer questions like "What would {request.name} do?" in real situations.
+This model will be used to answer questions like "What would {name} do?" in real situations.
 
 === PROFILE DATA ===
 
-Name: {request.name}
-Title: {request.title}
-Bio: {request.bio}
+Name: {name}
+Title: {title}
+Bio: {bio}
 
-Skills: {request.skills}
+Skills: {skills}
 
 Work Experience:
-{request.experience}
+{experience}
 
 Achievements:
-{request.achievements}
+{achievements}
 
 Core Values:
-{request.coreValues}
+{coreValues}
 
 Decision-Making Style:
-{request.decisionStyle}
+{decisionStyle}
 
-Risk Tolerance: {request.riskTolerance}
+Risk Tolerance: {riskTolerance}
 
 Past Decisions & Reasoning:
-{request.pastDecisions}
+{pastDecisions}
 
 Communication Style:
-{request.communicationStyle}
+{communicationStyle}
 
 Writing Samples/Links:
-{request.writingSamples}
+{writingSamples}
 
 Blind Spots & Biases:
-{request.blindSpots}
+{blindSpots}
 
 === TASK ===
 
@@ -1542,21 +1562,44 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
             messages=[{"role": "user", "content": [{"text": synthesis_prompt}]}],
             inferenceConfig={"maxTokens": 2000, "temperature": 0.3},
         )
-        response_text = response["output"]["message"]["content"][0]["text"]
-
-        try:
-            personality_model = _extract_json_object(response_text)
-        except (ValueError, json.JSONDecodeError):
-            raise HTTPException(status_code=500, detail="Could not parse personality model from AI response")
-
-        missing = _PERSONALITY_MODEL_KEYS - personality_model.keys()
-        if missing:
-            raise HTTPException(status_code=500, detail=f"Personality model missing expected keys: {missing}")
-
-    except HTTPException:
-        raise
     except ClientError as e:
-        raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
+        raise ValueError(f"Bedrock error: {str(e)}")
+
+    response_text = response["output"]["message"]["content"][0]["text"]
+    try:
+        personality_model = _extract_json_object(response_text)
+    except (ValueError, json.JSONDecodeError):
+        raise ValueError("Could not parse personality model from AI response")
+
+    missing = _PERSONALITY_MODEL_KEYS - personality_model.keys()
+    if missing:
+        raise ValueError(f"Personality model missing expected keys: {missing}")
+
+    return personality_model
+
+
+@app.post("/create-twin")
+async def create_twin(request: CreateTwinRequest, user_id: str = Depends(get_current_user_id)):
+    """Synthesize submitted profile data into a structured personality model via Bedrock"""
+
+    try:
+        personality_model = synthesize_personality_model(
+            name=request.name,
+            title=request.title,
+            bio=request.bio,
+            skills=request.skills,
+            experience=request.experience,
+            achievements=request.achievements,
+            coreValues=request.coreValues,
+            decisionStyle=request.decisionStyle,
+            riskTolerance=request.riskTolerance,
+            pastDecisions=request.pastDecisions,
+            communicationStyle=request.communicationStyle,
+            writingSamples=request.writingSamples,
+            blindSpots=request.blindSpots,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     twin_id = uuid.uuid4().hex  # 32 hex chars (128-bit) — no truncation, no collision risk
 
