@@ -187,6 +187,10 @@ def _build_decision_section(personality_model: Optional[dict], display_name: str
         vals = personality_model["core_values"]
         lines.append(f"### Core Values\n" + "\n".join(f"- {v}" for v in vals) + "\n")
 
+    if personality_model.get("communication_traits"):
+        traits = personality_model["communication_traits"]
+        lines.append(f"### Communication Traits\n" + "\n".join(f"- {t}" for t in traits) + "\n")
+
     if personality_model.get("decision_heuristics"):
         heuristics = personality_model["decision_heuristics"]
         lines.append(f"### Decision Heuristics\n" + "\n".join(f"- {h}" for h in heuristics) + "\n")
@@ -212,6 +216,27 @@ def _build_decision_section(personality_model: Optional[dict], display_name: str
 
     if personality_model.get("personality_summary"):
         lines.append(f"### Who {short_name} Is\n{personality_model['personality_summary']}\n")
+
+    mind_change = personality_model.get("mind_change") or personality_model.get("_context", {}).get("mindChange")
+    if mind_change:
+        lines.append(f"### A Time {short_name} Changed Their Mind\n{mind_change}\n")
+
+    if personality_model.get("characteristic_quotes"):
+        quotes = personality_model["characteristic_quotes"]
+        lines.append(
+            f"### How {short_name} Actually Talks (representative quotes)\n"
+            + "\n".join(f"- {q}" for q in quotes)
+            + f"\n\nUse these to calibrate voice and tone — don't just recite them back when asked a question; "
+            f"they show how {short_name} phrases things, not a script to repeat on demand.\n"
+        )
+
+    if personality_model.get("pivotal_decisions"):
+        decisions = personality_model["pivotal_decisions"]
+        lines.append(
+            f"### Pivotal Decisions (worked examples)\n"
+            + "\n".join(f"- {d}" for d in decisions)
+            + f"\n\nDraw on these as concrete precedent when reasoning through 'what would {short_name} do' questions.\n"
+        )
 
     lines.append(
         f"### How to answer decision questions\n"
