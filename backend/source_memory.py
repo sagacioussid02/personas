@@ -194,6 +194,21 @@ def build_correction_source(question: str, wrong_response: str, correction: str,
     )
 
 
+_SOURCES_CAP = 40
+# Creation-time source types (from build_initial_sources) — protected from
+# eviction so continuous deepening (unlimited deepen_interview/
+# manual_correction sources accumulating over many sessions) can't silently
+# push out a twin's original profile sources. See
+# openspec/changes/generative-deepen-interview's personality-model-versioning spec.
+_PROTECTED_SOURCE_TYPES = {
+    "resume_profile",
+    "experience_notes",
+    "skills_inventory",
+    "achievement_notes",
+    "values_profile",
+}
+
+
 def merge_sources(existing_sources: List[Dict[str, Any]] | None, new_sources: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
     merged: List[Dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -219,7 +234,16 @@ def merge_sources(existing_sources: List[Dict[str, Any]] | None, new_sources: Li
         merged.append(normalized_source)
 
     merged.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
-    return merged[:40]
+
+    protected = [s for s in merged if s.get("source_type") in _PROTECTED_SOURCE_TYPES]
+    unprotected = [s for s in merged if s.get("source_type") not in _PROTECTED_SOURCE_TYPES]
+
+    # Foundational sources are never evicted. In the near-impossible case that
+    # they alone exceed the cap (only 5 source_types can ever land here, each
+    # created once at twin creation), the non-foundational budget shrinks to
+    # zero rather than evicting a foundational source.
+    remaining_budget = max(0, _SOURCES_CAP - len(protected))
+    return protected + unprotected[:remaining_budget]
 
 
 def ensure_sources(twin_data: Dict[str, Any]) -> List[Dict[str, Any]]:
