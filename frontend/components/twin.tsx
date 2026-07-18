@@ -28,6 +28,11 @@ const WELCOME_MESSAGE_ID = 'welcome-message';
 const WELCOME_TEXT = "Hi, I'm Sidd's twin — ask me anything.";
 const FEEDBACK_HINT = 'I want to give feedback';
 const CONTACT_HINT = 'Contact Sidd';
+// Fixed twin_id for Sidd's default twin (openspec/changes/migrate-default-twin-to-record).
+// Public so backend-side anon rate limiting (PUBLIC_PERSONA_ANON_LIMIT) actually
+// applies to this chat, same as any other public persona.
+const DEFAULT_TWIN_ID = 'e973bc0da2f251428b6acba2026f05f9';
+const ANON_SESSION_STORAGE_KEY = `anon_session_${DEFAULT_TWIN_ID}`;
 
 export default function Twin() {
     const { isSignedIn, getToken } = useAuth();
@@ -40,9 +45,14 @@ export default function Twin() {
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [sessionId, setSessionId] = useState<string>('');
+    const [anonLimitReached, setAnonLimitReached] = useState(false);
     const MAX_ANON_EXCHANGES = 5;
     const userMessageCount = messages.filter(m => m.role === 'user').length;
-    const limitReached = !isSignedIn && userMessageCount >= MAX_ANON_EXCHANGES;
+    // Client-side count is a fast-path UX guard; the 402 from the backend
+    // (anonLimitReached) is the actual enforcement and always wins, since a
+    // page reload resets this component's local message count but not the
+    // server-side, localStorage-backed session_id below.
+    const limitReached = !isSignedIn && (userMessageCount >= MAX_ANON_EXCHANGES || anonLimitReached);
     const showHints = input.trim().length === 0
         && userMessageCount === 0
         && messages.length === 1
@@ -57,6 +67,28 @@ export default function Twin() {
     useEffect(() => {
         scrollToBottom();
     }, [messages]);
+
+    // Rehydrate (or create) the anonymous session_id from localStorage, so the
+    // backend's anon question limit survives page reloads instead of resetting
+    // every time (mirrors frontend/app/twin/page.tsx's pattern for public personas).
+    useEffect(() => {
+        if (isSignedIn) return;
+        try {
+            const stored = localStorage.getItem(ANON_SESSION_STORAGE_KEY);
+            if (stored) {
+                setSessionId(stored);
+            } else {
+                const newId = crypto.randomUUID();
+                localStorage.setItem(ANON_SESSION_STORAGE_KEY, newId);
+                setSessionId(newId);
+            }
+        } catch {
+            // localStorage unavailable (e.g. private browsing) — fall back to an
+            // in-memory UUID so the session still works for this visit, just
+            // without surviving a reload.
+            setSessionId(crypto.randomUUID());
+        }
+    }, [isSignedIn]);
 
     const sendMessage = async (messageOverride?: string) => {
         const messageText = (messageOverride ?? input).trim();
@@ -78,20 +110,51 @@ export default function Twin() {
             const headers: Record<string, string> = { 'Content-Type': 'application/json' };
             if (token) headers['Authorization'] = `Bearer ${token}`;
 
+            // For anonymous callers, ensure a stable session_id before the request
+            // even if the rehydration effect above hasn't resolved yet (race
+            // condition on first render) — mirrors app/twin/page.tsx's pattern.
+            let anonSid = sessionId;
+            if (!isSignedIn && !anonSid) {
+                try {
+                    anonSid = localStorage.getItem(ANON_SESSION_STORAGE_KEY) || '';
+                    if (!anonSid) {
+                        anonSid = crypto.randomUUID();
+                        localStorage.setItem(ANON_SESSION_STORAGE_KEY, anonSid);
+                    }
+                } catch {
+                    anonSid = crypto.randomUUID();
+                }
+                setSessionId(anonSid);
+            }
+
             const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/chat`, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({
                     message: messageText,
-                    session_id: sessionId || undefined,
+                    twin_id: DEFAULT_TWIN_ID,
+                    ...(isSignedIn ? {} : { session_id: anonSid || undefined }),
                 }),
             });
 
+            if (response.status === 402) {
+                setAnonLimitReached(true);
+                setMessages(prev => [
+                    ...prev,
+                    {
+                        id: (Date.now() + 1).toString(),
+                        role: 'assistant',
+                        content: "You've reached the free anonymous limit — sign up to keep chatting.",
+                        timestamp: new Date(),
+                    },
+                ]);
+                return;
+            }
             if (!response.ok) throw new Error('Failed to send message');
 
             const data = await response.json();
 
-            if (!sessionId) {
+            if (!isSignedIn && !sessionId) {
                 setSessionId(data.session_id);
             }
 

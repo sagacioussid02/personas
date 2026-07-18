@@ -1,25 +1,31 @@
 ## 1. Migration script
 
-- [ ] 1.1 Write `backend/scripts/migrate_default_twin.py`: read `backend/data/*` via the existing `resources.py` loaders (or duplicate the minimal reads needed), map onto `CreateTwinRequest`-shaped fields
-- [ ] 1.2 Reuse `create_twin`'s synthesis call path (extract the synthesis prompt + Bedrock call + `_extract_json_object` + `_PERSONALITY_MODEL_KEYS` validation into a shared helper if not already reusable, so the script and `create_twin` don't diverge)
-- [ ] 1.3 Assign a fixed, well-known `twin_id` (constant, documented alongside public persona IDs)
-- [ ] 1.4 Build `sources` via `build_initial_sources`, same as `create_twin` does
-- [ ] 1.5 Write the resulting JSON to `twins/{twin_id}.json` (local filesystem or S3, matching `USE_S3` config) with no `user_id` prefix, matching public-persona storage convention
+- [x] 1.1 Write `backend/scripts/migrate_default_twin.py`: read `backend/data/*` via the existing `resources.py` loaders (or duplicate the minimal reads needed), map onto `CreateTwinRequest`-shaped fields (reads files directly rather than via `resources.py` — see finding below)
+- [x] 1.2 Reuse `create_twin`'s synthesis call path (extract the synthesis prompt + Bedrock call + `_extract_json_object` + `_PERSONALITY_MODEL_KEYS` validation into a shared helper if not already reusable, so the script and `create_twin` don't diverge) — extracted as `server.synthesize_personality_model()`
+- [x] 1.3 Assign a fixed, well-known `twin_id` (constant, documented alongside public persona IDs) — `e973bc0da2f251428b6acba2026f05f9`, deterministic via `uuid.uuid5(NAMESPACE_DNS, "default-twin.sidd.personas")`
+- [x] 1.4 Build `sources` via `build_initial_sources`, same as `create_twin` does
+- [x] 1.5 Write the resulting JSON to `twins/{twin_id}.json` (local filesystem or S3, matching `USE_S3` config) with no `user_id` prefix, matching public-persona storage convention
+
+**Finding during 1.1**: `resources.py`'s `load_markdown_file()` loaders look for `bio.md`/`achievements.md`/`work_experience.md`/`interests.md`/`communication_style.md`, but the actual files in `backend/data/` are `.txt` (`bio.txt`, `communication.txt`, `interests.txt`). None of those five loaders have ever matched a real file — `bio`, `achievements`, `work_experience`, `interests`, `communication_guide` are always `None` today, and `extra_markdown_files`' `*.md` glob also finds nothing. Only `summary.txt`, `style.txt`, `facts.json`, `skills.json`, and `linkedin.pdf` (read via explicit exact-name opens) have ever reached the live default-twin prompt. Additionally, `bio.txt` still contains its unfilled template placeholder text (literal `[Company]`, `[2-3 paragraph overview...]`) and `communication.txt` is empty — neither had real content to lose. The migration script reads `summary.txt`/`style.txt`/`interests.txt`/`facts.json`/`skills.json` directly and intentionally skips `bio.txt`/`communication.txt` (documented in the script's module docstring).
 
 ## 2. Review and verification (pre-cutover)
 
-- [ ] 2.1 Run the migration script; manually review the synthesized `personality_model` against current default-twin behavior (compare `_build_from_data_files` output vs. `_build_from_personality_model` + `_build_decision_section` output side by side)
-- [ ] 2.2 Chat-test the new twin record via an explicit `twin_id` query (bypassing the default path) for parity with today's default-twin answers on a fixed set of test questions
-- [ ] 2.3 Confirm the connect-notify flow (feedback/contact intent detection, SES notification) still works correctly when reached via the new `twin_id` path
+- [x] 2.1 Run the migration script; manually review the synthesized `personality_model` against current default-twin behavior (compare `_build_from_data_files` output vs. `_build_from_personality_model` + `_build_decision_section` output side by side) — confirmed better than parity: the old path leaked a raw Python dict repr (`{'full_name': 'Sidd', ...}`) into the prompt and had no decision section at all; the new path has neither problem
+- [x] 2.2 Chat-test the new twin record via an explicit `twin_id` query (bypassing the default path) for parity with today's default-twin answers on a fixed set of test questions — ran 2 live Bedrock calls via `run_chat_orchestration`; factual question answered at high confidence with 2 sources retrieved, advisory hypothetical correctly flagged low-confidence/uncertain (exactly the signal the future gap-ledger change is meant to capture)
+- [x] 2.3 Confirm the connect-notify flow (feedback/contact intent detection, SES notification) still works correctly when reached via the new `twin_id` path — confirmed by code inspection (no live call needed): `_classify_feedback_intent`/`_decide_connect_notification` operate purely on message text and are twin-agnostic; `twin_name` still resolves to "Sidd" via `twin_data.get("name")`
+
+**Finding during 2.3 / additive fix**: setting `is_public: True` (see task 3 below) makes `PUBLIC_PERSONA_ANON_LIMIT` apply to this twin for the first time — closing a real gap where the twin_id-less path had zero server-side anonymous rate limiting (only a client-side, trivially-bypassed cap in the old `twin.tsx`). Verified this is safe: unlike `frontend/components/twin-chat.tsx` (which has a pre-existing, apparently-unused bug — never pre-generates a `session_id`, so it would 400 on a public persona's first anonymous message if it were ever wired up), the actually-used `frontend/app/twin/page.tsx` already generates and localStorage-persists a `session_id` before sending, so this is not currently an issue in production. `twin.tsx` needed the same pattern added (see task 3.2) since it previously relied on the server to mint a session_id, which doesn't satisfy the anon-limit check's `request.session_id` requirement.
 
 ## 3. Frontend cutover
 
-- [ ] 3.1 Add the default twin's fixed `twin_id` as a frontend constant (env var or hardcoded, matching how public persona IDs are referenced)
-- [ ] 3.2 Update `frontend/components/twin.tsx`'s `/chat` request body to include `twin_id`
-- [ ] 3.3 Deploy and smoke-test the live homepage chat end-to-end
+- [x] 3.1 Add the default twin's fixed `twin_id` as a frontend constant (env var or hardcoded, matching how public persona IDs are referenced) — `DEFAULT_TWIN_ID` in `twin.tsx`
+- [x] 3.2 Update `frontend/components/twin.tsx`'s `/chat` request body to include `twin_id` — also added: `is_public: True` on the migrated twin record (closes the rate-limit gap above), localStorage-backed anon `session_id` persistence (mirroring `app/twin/page.tsx`'s pattern — required for the anon-limit check to pass on the first message), and explicit 402 handling with a sign-up prompt (previously fell through to a generic "Sorry, I encountered an error" message). Verified: `npx tsc --noEmit` clean, `npx eslint components/twin.tsx` clean (pre-existing `<img>` warnings only), `npm run build` succeeds.
+- [ ] 3.3 Deploy and smoke-test the live homepage chat end-to-end — **not done**: requires an actual deploy, out of reach from this environment. Local build/typecheck/lint verified; live smoke test is the next real-world step before/after merging.
+
+**Bonus finding**: this cutover also fixes an existing (if minor) issue for authenticated homepage users — previously, since `twin_id` was never sent, `chatter_id and request.twin_id` was always false server-side, so authenticated users chatting via the homepage never got the stable HMAC-derived session (`_derive_session_id`) that every other twin's authenticated chat gets; they got a fresh random session every page load. Sending `twin_id` now fixes this as a side effect.
 
 ## 4. Post-cutover monitoring
 
-- [ ] 4.1 Monitor chat behavior and error rates for one release cycle after cutover
-- [ ] 4.2 File a follow-up change to delete `_build_from_data_files` (context.py) and retire `resources.py`'s live file-loading, once stability is confirmed
-- [ ] 4.3 Update `CLAUDE.md`'s Key Files section to reflect the new source of truth for Sidd's twin (twin record vs. static data files)
+- [ ] 4.1 Monitor chat behavior and error rates for one release cycle after cutover — **not done**: depends on an actual deploy and time passing; do this after merging and deploying.
+- [ ] 4.2 File a follow-up change to delete `_build_from_data_files` (context.py) and retire `resources.py`'s live file-loading, once stability is confirmed — **not done**: deliberately deferred per design.md's rollback-safety margin (do this only after 4.1 confirms stability).
+- [x] 4.3 Update `CLAUDE.md`'s Key Files section to reflect the new source of truth for Sidd's twin (twin record vs. static data files) — also corrected two other stale entries found while editing: `resources.py`'s description, and `frontend/components/twin-chat.tsx`, which is not imported anywhere in `frontend/app/` today (`frontend/app/twin/page.tsx` has its own inline chat implementation instead).

@@ -50,12 +50,14 @@ Browser → CloudFront → API Gateway → Lambda (FastAPI/Mangum) → Bedrock +
 - `backend/lambda_handler.py` — Mangum wrapper that adapts FastAPI for Lambda
 - `backend/context.py` — System prompt construction for Bedrock calls; redacts PII from injected text
 - `backend/personality_agent.py` — Archetype detection and optional per-response tone review
-- `backend/resources.py` — Loads default twin data from `backend/data/`
+- `backend/resources.py` — Loads `backend/data/*` at import time; legacy path, superseded by the twin record below. Kept for one release cycle as a rollback fallback (see `migrate-default-twin-to-record` in `openspec/changes/archive/`) — do not add new fields here, edit `backend/data/*` and re-run `backend/scripts/migrate_default_twin.py` instead
+- `backend/scripts/migrate_default_twin.py` — Synthesizes Sidd's default twin (fixed `twin_id`, see the frontend constant in `twin.tsx`) from `backend/data/*` into a proper twin record at `twins/{twin_id}.json`, using the same synthesis path as `/create-twin`. Re-run after editing `backend/data/*` — it's the source of truth for Sidd's own twin now, not the static files directly
 - `backend/public_personas/` — Static JSON files for public personas (Gandhi, Chaplin, Warren Buffett); served without auth
 - `backend/personalities/archetypes.json` — Role archetypes used to nudge twin tone (e.g. "engineer", "executive")
 - `frontend/app/` — Next.js App Router pages
-- `frontend/components/twin.tsx` — Unauthenticated chat component
-- `frontend/components/twin-chat.tsx` — Authenticated chat for user-created twins
+- `frontend/app/twin/page.tsx` — Chat page for any `twin_id` (public personas, user-created twins); handles anon session persistence and the 402 sign-up wall
+- `frontend/components/twin.tsx` — Homepage chat for Sidd's default twin (anonymous or signed-in); sends the fixed default `twin_id`
+- `frontend/components/twin-chat.tsx` — Not currently imported/used anywhere in `frontend/app/` (`frontend/app/twin/page.tsx` has its own inline implementation instead) — confirm before building on it
 
 ### Authentication
 - Clerk provides JWTs (RS256) to the frontend
