@@ -137,6 +137,7 @@ def build_initial_sources(fields: Dict[str, Any], linkedin_parsed: Dict[str, Any
         ("decision_notes", "Decision-making style", [fields.get("decisionStyle"), fields.get("pastDecisions")], "high"),
         ("communication_profile", "Communication style", [fields.get("communicationStyle"), fields.get("verbalQuirks")], "medium"),
         ("self_reported_blind_spots", "Blind spots", fields.get("blindSpots"), "medium"),
+        ("writing_samples", "Writing samples", fields.get("writingSamples"), "medium"),
     ]
     for source_type, title, content, confidence in mappings:
         item = make_source_item(
