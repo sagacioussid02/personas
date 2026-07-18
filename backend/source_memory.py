@@ -223,6 +223,75 @@ def merge_sources(existing_sources: List[Dict[str, Any]] | None, new_sources: Li
     return merged[:40]
 
 
+# ── Knowledge-gap ledger ───────────────────────────────────────────────────
+# Tracks which topics chat repeatedly can't answer well, so a future deepen
+# session (or owner-facing report) knows what's actually worth asking about,
+# instead of a fixed generic questionnaire. See openspec/changes/add-persona-gap-ledger.
+_KNOWLEDGE_GAPS_CAP = 40  # mirrors merge_sources' cap convention
+
+
+def topic_tags_for_question(message: str) -> List[str]:
+    """Derive topic tags for a user question, reusing the same keyword
+    taxonomy _infer_tags already uses for sources, so gap topics and source
+    tags share one vocabulary instead of a second, competing classifier."""
+    tags = _infer_tags(source_type="", title="", content=message)
+    return tags or ["general"]
+
+
+def record_knowledge_gap(
+    twin_data: Dict[str, Any],
+    topic_tags: List[str],
+    source: str = "inferred",
+    question_snippet: str = "",
+) -> Dict[str, Any]:
+    """Record (or increment) a knowledge-gap entry on twin_data in place.
+
+    `source` is "inferred" for critic-flagged low-confidence/ungrounded chat
+    turns, or "correction" for explicit user corrections — corrections are
+    weighted higher (protected from eviction ahead of inferred entries; see
+    the sort key below) since they're an explicit signal, not a guess.
+
+    Returns twin_data for convenience (also mutated in place).
+    """
+    topic_key = tuple(sorted({t.lower() for t in topic_tags})) or ("general",)
+    gaps = list(twin_data.get("knowledge_gaps") or [])
+
+    now = _utcnow_iso()
+    for gap in gaps:
+        if tuple(sorted(gap.get("topic_tags", []))) == topic_key:
+            gap["count"] = int(gap.get("count", 0)) + 1
+            gap["updated_at"] = now
+            if source == "correction":
+                gap["source"] = "correction"
+            if question_snippet:
+                gap["last_question"] = question_snippet[:200]
+            break
+    else:
+        gaps.append({
+            "topic_tags": list(topic_key),
+            "count": 1,
+            "source": source,
+            "created_at": now,
+            "updated_at": now,
+            "last_question": question_snippet[:200] if question_snippet else "",
+        })
+
+    if len(gaps) > _KNOWLEDGE_GAPS_CAP:
+        # Ascending sort: correction-sourced entries last (never evicted ahead
+        # of inferred ones), then by count, then by recency — keeping the tail
+        # after truncation means the lowest-count, least-recent, non-correction
+        # entries are evicted first.
+        gaps.sort(key=lambda g: (
+            g.get("source") == "correction",
+            int(g.get("count", 0)),
+            g.get("updated_at", ""),
+        ))
+        gaps = gaps[-_KNOWLEDGE_GAPS_CAP:]
+
+    twin_data["knowledge_gaps"] = gaps
+    return twin_data
+
+
 def ensure_sources(twin_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     existing = twin_data.get("sources")
     if isinstance(existing, list) and existing:
