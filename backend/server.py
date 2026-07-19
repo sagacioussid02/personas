@@ -34,6 +34,8 @@ from source_memory import (
     build_initial_sources,
     ensure_sources,
     merge_sources,
+    record_knowledge_gap,
+    topic_tags_for_question,
 )
 
 # Load environment variables
@@ -1140,6 +1142,18 @@ async def chat(
                 intent_summary,
             )
 
+        # Knowledge-gap ledger: record topics this twin answered weakly, so a
+        # future deepen session can target what's actually worth asking about
+        # instead of a fixed generic questionnaire. Pure, twin-agnostic check
+        # here; the actual read-modify-write is deferred to a background task.
+        if twin_data and request.twin_id and _is_gap_worthy(orchestration):
+            background_tasks.add_task(
+                _record_chat_gap,
+                request.twin_id,
+                topic_tags_for_question(request.message),
+                request.message[:200],
+            )
+
         # Personality review step (gated — enable via PERSONALITY_REVIEW_ENABLED=true)
         if PERSONALITY_REVIEW_ENABLED:
             archetype_id = twin_data.get("archetype_id") if request.twin_id and twin_data else None
@@ -1473,47 +1487,67 @@ async def list_my_twins(user_id: str = Depends(get_current_user_id)):
     return {"twins": twins}
 
 
-@app.post("/create-twin")
-async def create_twin(request: CreateTwinRequest, user_id: str = Depends(get_current_user_id)):
-    """Synthesize submitted profile data into a structured personality model via Bedrock"""
+def synthesize_personality_model(
+    *,
+    name: str,
+    title: str,
+    bio: str,
+    skills: str = "",
+    experience: str = "",
+    achievements: str = "",
+    coreValues: str = "",
+    decisionStyle: str = "",
+    riskTolerance: str = "",
+    pastDecisions: str = "",
+    communicationStyle: str = "",
+    writingSamples: str = "",
+    blindSpots: str = "",
+) -> Dict[str, Any]:
+    """Call Bedrock to synthesize a personality_model from profile fields.
 
+    Shared by /create-twin and the default-twin migration script so both
+    produce structurally identical models from the same prompt. Raises
+    ValueError on any failure (bad Bedrock response, missing keys); callers
+    translate that into their own error handling (HTTPException for the
+    endpoint, a plain failure for the script).
+    """
     synthesis_prompt = f"""You are building a personality model for an AI twin. Your job is to deeply analyze everything provided and produce a structured JSON model that captures how this person THINKS and DECIDES — not just what they've done.
 
-This model will be used to answer questions like "What would {request.name} do?" in real situations.
+This model will be used to answer questions like "What would {name} do?" in real situations.
 
 === PROFILE DATA ===
 
-Name: {request.name}
-Title: {request.title}
-Bio: {request.bio}
+Name: {name}
+Title: {title}
+Bio: {bio}
 
-Skills: {request.skills}
+Skills: {skills}
 
 Work Experience:
-{request.experience}
+{experience}
 
 Achievements:
-{request.achievements}
+{achievements}
 
 Core Values:
-{request.coreValues}
+{coreValues}
 
 Decision-Making Style:
-{request.decisionStyle}
+{decisionStyle}
 
-Risk Tolerance: {request.riskTolerance}
+Risk Tolerance: {riskTolerance}
 
 Past Decisions & Reasoning:
-{request.pastDecisions}
+{pastDecisions}
 
 Communication Style:
-{request.communicationStyle}
+{communicationStyle}
 
 Writing Samples/Links:
-{request.writingSamples}
+{writingSamples}
 
 Blind Spots & Biases:
-{request.blindSpots}
+{blindSpots}
 
 === TASK ===
 
@@ -1542,21 +1576,44 @@ Be specific and concrete. Avoid generic statements. Infer from the data even whe
             messages=[{"role": "user", "content": [{"text": synthesis_prompt}]}],
             inferenceConfig={"maxTokens": 2000, "temperature": 0.3},
         )
-        response_text = response["output"]["message"]["content"][0]["text"]
-
-        try:
-            personality_model = _extract_json_object(response_text)
-        except (ValueError, json.JSONDecodeError):
-            raise HTTPException(status_code=500, detail="Could not parse personality model from AI response")
-
-        missing = _PERSONALITY_MODEL_KEYS - personality_model.keys()
-        if missing:
-            raise HTTPException(status_code=500, detail=f"Personality model missing expected keys: {missing}")
-
-    except HTTPException:
-        raise
     except ClientError as e:
-        raise HTTPException(status_code=500, detail=f"Bedrock error: {str(e)}")
+        raise ValueError(f"Bedrock error: {str(e)}")
+
+    response_text = response["output"]["message"]["content"][0]["text"]
+    try:
+        personality_model = _extract_json_object(response_text)
+    except (ValueError, json.JSONDecodeError):
+        raise ValueError("Could not parse personality model from AI response")
+
+    missing = _PERSONALITY_MODEL_KEYS - personality_model.keys()
+    if missing:
+        raise ValueError(f"Personality model missing expected keys: {missing}")
+
+    return personality_model
+
+
+@app.post("/create-twin")
+async def create_twin(request: CreateTwinRequest, user_id: str = Depends(get_current_user_id)):
+    """Synthesize submitted profile data into a structured personality model via Bedrock"""
+
+    try:
+        personality_model = synthesize_personality_model(
+            name=request.name,
+            title=request.title,
+            bio=request.bio,
+            skills=request.skills,
+            experience=request.experience,
+            achievements=request.achievements,
+            coreValues=request.coreValues,
+            decisionStyle=request.decisionStyle,
+            riskTolerance=request.riskTolerance,
+            pastDecisions=request.pastDecisions,
+            communicationStyle=request.communicationStyle,
+            writingSamples=request.writingSamples,
+            blindSpots=request.blindSpots,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
     twin_id = uuid.uuid4().hex  # 32 hex chars (128-bit) — no truncation, no collision risk
 
@@ -1693,6 +1750,70 @@ def _save_twin(twin_id: str, user_id: str, twin_data: dict) -> None:
             json.dump(twin_data, f, indent=2)
 
 
+def _save_twin_flat(twin_id: str, twin_data: dict) -> None:
+    """Persist twin_data to only the flat twins/{twin_id}.json key.
+
+    Used for background writes (e.g. the knowledge-gap ledger) that can be
+    triggered by a chat turn against any twin, including ones with no owning
+    user_id (public personas, the migrated default twin) — _save_twin's
+    per-user key would break as twins/None/{twin_id}.json in that case. The
+    per-user copy is read only by list_my_twins, a lightweight listing, so
+    skipping it here just means that copy's knowledge_gaps can trail the
+    flat copy slightly; nothing reads knowledge_gaps from the per-user copy.
+    """
+    if USE_S3:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=f"{TWINS_S3_PREFIX}{twin_id}.json",
+            Body=json.dumps(twin_data, indent=2),
+            ContentType="application/json",
+        )
+    else:
+        os.makedirs(TWINS_DIR, exist_ok=True)
+        with open(os.path.join(TWINS_DIR, f"{twin_id}.json"), "w") as f:
+            json.dump(twin_data, f, indent=2)
+
+
+def _is_gap_worthy(orchestration: dict) -> bool:
+    """Pure computation, no I/O — decides whether a chat turn's grounding
+    signal is weak enough to be worth recording as a knowledge gap.
+
+    True when the critic flagged the answer as uncertain or low-confidence,
+    or when a factual/mixed query retrieved zero sources at all (advisory-only
+    questions are expected to lean on inference per build_grounding_summary,
+    so a thin advisory answer alone doesn't count)."""
+    grounding = orchestration.get("grounding")
+    query_type = orchestration.get("route", {}).get("query_type", "")
+    retrieved_sources = orchestration.get("retrieved_sources") or []
+
+    if grounding:
+        if grounding.get("grounding_mode") == "uncertain":
+            return True
+        if grounding.get("confidence_label") == "low":
+            return True
+    if query_type in {"factual", "mixed"} and not retrieved_sources:
+        return True
+    return False
+
+
+async def _record_chat_gap(twin_id: str, topic_tags: list, question_snippet: str) -> None:
+    """Background task: load the twin fresh, record the gap, save it back.
+
+    Reloading here (rather than reusing the twin_data already in the request's
+    memory) narrows the race window on concurrent writes to the same twin —
+    approximate counts under heavy concurrency are an accepted trade-off (see
+    design.md), not a correctness guarantee this aims to provide.
+    """
+    try:
+        twin_data = load_twin(twin_id)
+        if not twin_data:
+            return
+        record_knowledge_gap(twin_data, topic_tags, source="inferred", question_snippet=question_snippet)
+        _save_twin_flat(twin_id, twin_data)
+    except Exception as exc:
+        print(f"[gap-ledger] Failed to record gap for twin {twin_id}: {exc}")
+
+
 class AddCorrectionRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=500)
     wrong_response: str = Field(..., min_length=1, max_length=500)
@@ -1738,6 +1859,16 @@ async def add_correction(
     twin_data["sources"] = merge_sources(
         twin_data.get("sources", []),
         [correction_source] if correction_source else [],
+    )
+    # Corrections are an explicit "the twin got this wrong" signal — stronger
+    # than an inferred low-confidence chat turn, so they're recorded at
+    # higher priority in the knowledge-gap ledger (see record_knowledge_gap's
+    # source="correction" handling).
+    record_knowledge_gap(
+        twin_data,
+        topic_tags_for_question(request.question),
+        source="correction",
+        question_snippet=request.question[:200],
     )
     _save_twin(twin_id, user_id, twin_data)
     return {"status": "ok", "corrections_count": len(twin_data["corrections"])}
