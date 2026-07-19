@@ -2472,27 +2472,23 @@ _DEEPEN_SYSTEM_TEMPLATE = """\
 You are helping someone deepen their AI twin. They already built a basic version; now you're \
 uncovering the nuance that makes reasoning feel real instead of generic.
 
-Your job: ask exactly 3 focused questions, one per turn, to surface depth data most twins lack.
+Your job: ask one focused question per turn, working through the topics below. Skip any already \
+covered. Adapt each hint into your own natural phrasing — don't read it verbatim.
 
-TOPICS (ask in this order, skip already-covered ones):
-1. PAST_DECISIONS  → "Walk me through 2-3 decisions you've made that were genuinely hard — \
-what you chose, what you gave up, and whether you'd do it again."
-2. NON_NEGOTIABLES → "What would you flat-out refuse to do even under real pressure? \
-And what would you bend on if the trade-off was right?"
-3. MIND_CHANGE     → "Tell me about a time you changed your mind on something you'd held \
-strongly. What actually moved you?"
+TOPICS TO COVER THIS SESSION (priority order):
+{topics_block}
 
 RULES — follow exactly:
 - One question per turn. 2-4 sentences max. Be direct and warm.
 - CRITICAL: Every message MUST end with a question, except the final closing when done is true.
 - If an answer is too vague, push back once with a concrete prompt ("Can you give me a specific \
 example?"), then accept whatever they say.
-- After a rich answer, acknowledge in one short phrase and immediately ask the next topic.
-- When all 3 topics are covered, close naturally and set done to true.
+- After a rich answer, acknowledge in one short phrase and immediately ask about the next topic.
+- When every topic listed above is covered, close naturally and set done to true.
 - Never sound like a form — no "Question 1 of 3", no "Moving on to".
 
 CURRENT STATE:
-Topics remaining: {topics_remaining}
+Topic IDs remaining this session: {topic_ids_remaining}
 Existing twin context (for reference — do NOT repeat back to them):
 {existing_context}
 
@@ -2500,17 +2496,218 @@ RETURN ONLY valid JSON — no markdown, no text outside the JSON:
 {{
   "message": "your question or closing as natural prose",
   "field_updates": {{
-    "pastDecisions": "extracted from their answer — omit key if not in this message",
-    "nonNegotiables": "what they won't bend on — omit if not in this message",
-    "softPreferences": "what they would compromise on — omit if not in this message",
-    "mindChange": "the story of changing their mind — omit if not in this message"
+    "pastDecisions": "only if the PAST_DECISIONS topic is in this session and answered — omit otherwise",
+    "nonNegotiables": "only if NON_NEGOTIABLES is in this session and answered — omit otherwise",
+    "softPreferences": "what they'd compromise on, if mentioned — omit otherwise",
+    "mindChange": "only if MIND_CHANGE is in this session and answered — omit otherwise",
+    "topicAnswer": "for any GAP:* or FIELD:* topic — the raw synthesized answer content — omit if not applicable this message"
   }},
-  "topics_covered": ["PAST_DECISIONS"],
+  "topics_covered": ["<topic id from the list above that this message's answer addressed>"],
   "done": false
 }}
 """
 
-_ALL_DEEPEN_TOPICS = ["PAST_DECISIONS", "NON_NEGOTIABLES", "MIND_CHANGE"]
+# ── Deepen topic library ──────────────────────────────────────────────────
+# Static topics (evergreen fallback + thin-field prompts) with known question
+# hints and which personality_model fields they should sharpen. GAP:* topics
+# are dynamic (derived from a twin's knowledge_gaps ledger at request time)
+# and aren't in this dict — see _target_fields_for_topics' GAP: branch.
+_EVERGREEN_DEEPEN_TOPICS: Dict[str, Dict[str, Any]] = {
+    "PAST_DECISIONS": {
+        "question_hint": (
+            "Walk me through 2-3 decisions you've made that were genuinely hard — "
+            "what you chose, what you gave up, and whether you'd do it again."
+        ),
+        "target_fields": ["decision_heuristics", "blind_spots", "decision_framework", "pivotal_decisions"],
+        "field_update_key": "pastDecisions",
+    },
+    "NON_NEGOTIABLES": {
+        "question_hint": (
+            "What would you flat-out refuse to do even under real pressure? "
+            "And what would you bend on if the trade-off was right?"
+        ),
+        "target_fields": ["blind_spots", "what_they_avoid", "decision_framework"],
+        "field_update_key": "nonNegotiables",
+    },
+    "MIND_CHANGE": {
+        "question_hint": (
+            "Tell me about a time you changed your mind on something you'd held "
+            "strongly. What actually moved you?"
+        ),
+        "target_fields": ["mind_change", "personality_summary"],
+        "field_update_key": "mindChange",
+    },
+}
+
+_THIN_FIELD_DEEPEN_TOPICS: Dict[str, Dict[str, Any]] = {
+    "FIELD:pivotal_decisions": {
+        "question_hint": "Tell me about 1-2 pivotal moments or turning-point decisions in your career or life.",
+        "target_fields": ["pivotal_decisions"],
+        "min_items": 2,
+    },
+    "FIELD:characteristic_quotes": {
+        "question_hint": (
+            "Give me a couple of things you actually say often, in your own words — "
+            "phrases or lines that sound like you."
+        ),
+        "target_fields": ["characteristic_quotes"],
+        "min_items": 2,
+    },
+}
+
+_GAP_TOPIC_DEFAULT_TARGET_FIELDS = ["decision_heuristics", "blind_spots", "personality_summary"]
+_MAX_DEEPEN_TOPICS_PER_SESSION = 3
+_CONSOLIDATION_EVERY_N_PATCHES = 5
+_MODEL_VERSIONS_CAP = 10
+
+
+def _is_field_thin(personality_model: dict, field: str, min_items: int = 2) -> bool:
+    val = personality_model.get(field)
+    if not val:
+        return True
+    if isinstance(val, list):
+        return len(val) < min_items
+    if isinstance(val, str):
+        return len(val.strip()) < 20
+    return False
+
+
+def _select_deepen_topics(
+    twin_data: dict, covered: List[str], limit: int = _MAX_DEEPEN_TOPICS_PER_SESSION
+) -> List[Dict[str, Any]]:
+    """Priority chain: gap ledger -> thin personality_model fields -> evergreen
+    fallback bank. Returns up to `limit` topics not already in `covered` and
+    not otherwise already answered (evergreen/thin-field topics re-check
+    their underlying field's actual state, not just `covered`, so this is
+    self-correcting across sessions rather than relying on the caller to
+    track it). A twin with nothing left across all three tiers returns [] —
+    this never writes a permanent "fully deepened" marker; the next call
+    simply recomputes against whatever's changed since (new gaps, edited
+    fields, etc.)."""
+    pm = twin_data.get("personality_model", {}) or {}
+    ctx = pm.get("_context", {}) if isinstance(pm, dict) else {}
+    covered_set = set(covered)
+    selected: List[Dict[str, Any]] = []
+
+    gaps = sorted(
+        (twin_data.get("knowledge_gaps") or []),
+        key=lambda g: int(g.get("count", 0)),
+        reverse=True,
+    )
+    for gap in gaps:
+        if len(selected) >= limit:
+            break
+        if int(gap.get("count", 0)) <= 0:
+            continue
+        tags = gap.get("topic_tags") or []
+        topic_id = "GAP:" + "|".join(sorted(tags))
+        if topic_id in covered_set:
+            continue
+        tag_text = ", ".join(tags) if tags else "a topic"
+        selected.append({
+            "id": topic_id,
+            "question_hint": (
+                f"People keep asking about {tag_text} and the twin's answers have been weak or "
+                f"ungrounded — ask a focused question that would give the twin real material here."
+            ),
+            "target_fields": _GAP_TOPIC_DEFAULT_TARGET_FIELDS,
+        })
+
+    if len(selected) < limit:
+        for topic_id, meta in _THIN_FIELD_DEEPEN_TOPICS.items():
+            if len(selected) >= limit:
+                break
+            if topic_id in covered_set:
+                continue
+            if any(_is_field_thin(pm, f, meta.get("min_items", 2)) for f in meta["target_fields"]):
+                selected.append({
+                    "id": topic_id,
+                    "question_hint": meta["question_hint"],
+                    "target_fields": meta["target_fields"],
+                })
+
+    if len(selected) < limit:
+        for topic_id, meta in _EVERGREEN_DEEPEN_TOPICS.items():
+            if len(selected) >= limit:
+                break
+            if topic_id in covered_set:
+                continue
+            field_key = meta.get("field_update_key")
+            if field_key and isinstance(ctx, dict) and ctx.get(field_key):
+                continue  # already answered in a prior session
+            selected.append({
+                "id": topic_id,
+                "question_hint": meta["question_hint"],
+                "target_fields": meta["target_fields"],
+            })
+
+    return selected
+
+
+def _target_fields_for_topics(topic_ids: List[str]) -> List[str]:
+    fields: set[str] = set()
+    for tid in topic_ids:
+        if tid in _EVERGREEN_DEEPEN_TOPICS:
+            fields.update(_EVERGREEN_DEEPEN_TOPICS[tid]["target_fields"])
+        elif tid in _THIN_FIELD_DEEPEN_TOPICS:
+            fields.update(_THIN_FIELD_DEEPEN_TOPICS[tid]["target_fields"])
+        elif tid.startswith("GAP:"):
+            fields.update(_GAP_TOPIC_DEFAULT_TARGET_FIELDS)
+    return sorted(fields) if fields else list(_GAP_TOPIC_DEFAULT_TARGET_FIELDS)
+
+
+def _decay_addressed_gaps(twin_data: dict, addressed_topic_ids: List[str]) -> None:
+    """Reset the count of any gap-ledger entry this session directly
+    addressed, so it stops dominating topic selection until it re-accumulates
+    from new chat activity (task 1.5)."""
+    addressed_tag_sets = {
+        tuple(sorted(tid[len("GAP:"):].split("|")))
+        for tid in addressed_topic_ids
+        if tid.startswith("GAP:")
+    }
+    if not addressed_tag_sets:
+        return
+    for gap in (twin_data.get("knowledge_gaps") or []):
+        tags_key = tuple(sorted(gap.get("topic_tags", [])))
+        if tags_key in addressed_tag_sets:
+            gap["count"] = 0
+
+
+def _append_model_version(twin_data: dict, model_snapshot: dict, trigger: str) -> None:
+    """Append a personality_model snapshot to the twin's version history,
+    always retaining version 1 (the origin) even under cap eviction."""
+    versions = list(twin_data.get("personality_model_versions") or [])
+    next_version_num = (versions[-1]["version"] + 1) if versions else 1
+    versions.append({
+        "version": next_version_num,
+        "model_snapshot": copy.deepcopy(model_snapshot),
+        "created_at": datetime.now().isoformat(),
+        "trigger": trigger,
+    })
+    if len(versions) > _MODEL_VERSIONS_CAP:
+        origin = versions[0] if versions[0].get("version") == 1 else None
+        rest = versions[1:] if origin else versions
+        keep = _MODEL_VERSIONS_CAP - (1 if origin else 0)
+        rest = rest[-keep:] if keep > 0 else []
+        versions = ([origin] if origin else []) + rest
+    twin_data["personality_model_versions"] = versions
+
+
+def restore_personality_model_version(twin_data: dict, version: int) -> bool:
+    """Restore twin_data's active personality_model to a previously recorded
+    version. Snapshots the current (about-to-be-discarded) model first, then
+    records the rollback itself as a new version entry. Returns False if the
+    requested version doesn't exist."""
+    versions = twin_data.get("personality_model_versions") or []
+    match = next((v for v in versions if v.get("version") == version), None)
+    if not match:
+        return False
+    current_model = twin_data.get("personality_model", {})
+    _append_model_version(twin_data, current_model, trigger="pre-rollback")
+    restored = copy.deepcopy(match["model_snapshot"])
+    twin_data["personality_model"] = restored
+    _append_model_version(twin_data, restored, trigger=f"rollback_to_v{version}")
+    return True
 
 
 class DeepenHistoryItem(BaseModel):
@@ -2523,6 +2720,9 @@ class DeepenFieldUpdates(BaseModel):
     nonNegotiables: Optional[str] = None
     softPreferences: Optional[str] = None
     mindChange: Optional[str] = None
+    # Raw answer content for GAP:*/FIELD:* topics, which don't map to one of
+    # the four named fields above.
+    topicAnswer: Optional[str] = None
 
     model_config = {"extra": "ignore"}
 
@@ -2565,27 +2765,73 @@ class DeepenResponse(BaseModel):
         return False
 
 
-async def _deepen_and_save(twin_id: str, user_id: str, twin_data: dict, new_fields: dict) -> None:
-    """Merge new depth data into the twin's personality_model._context and re-synthesize the personality model."""
+async def _patch_personality_model(twin_data: dict, ctx: dict, addressed_topic_ids: List[str]) -> None:
+    """Targeted, additive update: ask Bedrock to return ONLY the fields
+    relevant to the topics addressed this session, then merge just those
+    fields into the existing model — everything else is left byte-for-byte
+    unchanged, unlike the old full-model regeneration."""
     existing_model = twin_data.get("personality_model", {})
-    # context.py reads depth fields from personality_model["_context"], so persist there
-    ctx = dict(existing_model.get("_context", {}))
+    target_fields = _target_fields_for_topics(addressed_topic_ids)
 
-    for key in ("pastDecisions", "nonNegotiables", "softPreferences", "mindChange"):
-        if new_fields.get(key):
-            if key == "pastDecisions" and ctx.get(key):
-                ctx[key] = ctx[key].strip() + "\n\n" + new_fields[key].strip()
-            else:
-                ctx[key] = new_fields[key]
+    new_data_lines = []
+    if ctx.get("pastDecisions"):
+        new_data_lines.append(f"Past decisions: {ctx['pastDecisions'][-800:]}")
+    if ctx.get("nonNegotiables"):
+        new_data_lines.append(f"Non-negotiables: {ctx['nonNegotiables']}")
+    if ctx.get("softPreferences"):
+        new_data_lines.append(f"What they'd compromise on: {ctx['softPreferences']}")
+    if ctx.get("mindChange"):
+        new_data_lines.append(f"Changed their mind: {ctx['mindChange']}")
+    if ctx.get("topicAnswer"):
+        new_data_lines.append(f"New answer: {ctx['topicAnswer']}")
+    new_data_text = "\n".join(new_data_lines) or "N/A"
 
-    # Write the updated _context back into personality_model so prompt building picks it up
+    synthesis_prompt = f"""You are updating specific fields of an AI twin's personality model with new depth \
+data. Do NOT regenerate the whole model — return ONLY the fields listed below, updated to incorporate the \
+new data.
+
+EXISTING MODEL (for context only — do not repeat fields not listed below):
+{json.dumps(existing_model, indent=2)}
+
+NEW DEPTH DATA:
+{new_data_text}
+
+FIELDS TO UPDATE (return ONLY these keys, each with its full updated value in the same shape as the \
+existing model):
+{", ".join(target_fields)}
+
+Return ONLY a valid JSON object containing exactly these keys. No markdown, no extra text, no other fields."""
+
+    try:
+        response = await asyncio.to_thread(
+            bedrock_client.converse,
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": synthesis_prompt}],
+            messages=[{"role": "user", "content": [{"text": "Update the listed fields with the new depth data."}]}],
+            inferenceConfig={"maxTokens": 800, "temperature": 0.5, "topP": 0.9},
+        )
+        raw = response["output"]["message"]["content"][0]["text"].strip()
+        patch = _extract_json_object(raw)
+        if isinstance(patch, dict):
+            for field in target_fields:
+                if field in patch and patch[field]:
+                    existing_model[field] = patch[field]
+    except Exception as exc:
+        print(f"Deepen targeted patch failed (non-fatal): {exc}")
+        # _context is already merged into existing_model by the caller, so
+        # the raw depth data is saved even if this patch fails.
+
     existing_model["_context"] = ctx
     twin_data["personality_model"] = existing_model
-    twin_data["sources"] = merge_sources(
-        twin_data.get("sources", []),
-        build_deepen_sources(new_fields),
-    )
 
+
+async def _consolidate_personality_model(twin_data: dict, ctx: dict) -> None:
+    """Periodic full re-synthesis pass (every _CONSOLIDATION_EVERY_N_PATCHES
+    accepted targeted patches) to resolve any drift those incremental patches
+    introduced between fields. This is the same full-regeneration prompt the
+    old always-on path used — a version snapshot is taken by the caller
+    before this runs, so a worse regeneration here is always recoverable."""
+    existing_model = twin_data.get("personality_model", {})
     synthesis_prompt = f"""You are updating an AI twin's personality model with new depth data.
 
 EXISTING MODEL:
@@ -2597,7 +2843,8 @@ Non-negotiables (won't bend on): {ctx.get("nonNegotiables", "N/A")}
 What they'd compromise on: {ctx.get("softPreferences", "N/A")}
 Changed their mind: {ctx.get("mindChange", "N/A")}
 
-Using the existing model as a base, return an improved JSON model that incorporates the new data.
+Using the existing model as a base, return an improved JSON model that incorporates the new data and \
+resolves any inconsistencies between fields that may have built up over incremental updates.
 The new data should sharpen: decision_heuristics, blind_spots, what_they_avoid, decision_framework, personality_summary.
 Preserve fields unaffected by this data: core_values, communication_traits, risk_profile, what_they_optimize_for.
 Return ONLY valid JSON with the same structure as the existing model. No markdown, no extra text."""
@@ -2613,12 +2860,56 @@ Return ONLY valid JSON with the same structure as the existing model. No markdow
         raw = response["output"]["message"]["content"][0]["text"].strip()
         updated_model = _extract_json_object(raw)
         if isinstance(updated_model, dict) and updated_model:
-            # Always carry the updated _context into the re-synthesized model
             updated_model["_context"] = ctx
             twin_data["personality_model"] = updated_model
     except Exception as exc:
-        print(f"Deepen re-synthesis failed (non-fatal): {exc}")
-        # Depth data is already merged into personality_model["_context"] above, so it will be saved even if synthesis fails
+        print(f"Deepen consolidation re-synthesis failed (non-fatal): {exc}")
+
+
+async def _deepen_and_save(
+    twin_id: str,
+    user_id: str,
+    twin_data: dict,
+    new_fields: dict,
+    addressed_topic_ids: List[str],
+) -> None:
+    """Merge new depth data into the twin's personality_model._context, then
+    apply either a targeted field patch or (periodically) a full
+    consolidation pass — see _patch_personality_model / _consolidate_personality_model.
+    Snapshots a version before mutating, and decays any gap-ledger entries
+    this session addressed."""
+    existing_model = twin_data.get("personality_model", {})
+    # context.py reads depth fields from personality_model["_context"], so persist there
+    ctx = dict(existing_model.get("_context", {}))
+
+    for key in ("pastDecisions", "nonNegotiables", "softPreferences", "mindChange", "topicAnswer"):
+        if new_fields.get(key):
+            if key == "pastDecisions" and ctx.get(key):
+                ctx[key] = ctx[key].strip() + "\n\n" + new_fields[key].strip()
+            else:
+                ctx[key] = new_fields[key]
+
+    # Write the updated _context back into personality_model so prompt building picks it up
+    existing_model["_context"] = ctx
+    twin_data["personality_model"] = existing_model
+    twin_data["sources"] = merge_sources(
+        twin_data.get("sources", []),
+        build_deepen_sources(new_fields),
+    )
+
+    _decay_addressed_gaps(twin_data, addressed_topic_ids)
+
+    # Snapshot before mutating — on a twin's very first deepen update, this
+    # also seeds version 1 (the origin) with the pre-deepen model.
+    _append_model_version(twin_data, existing_model, trigger="pre-deepen-update")
+
+    patch_count = int(twin_data.get("deepen_patch_count", 0)) + 1
+    twin_data["deepen_patch_count"] = patch_count
+
+    if patch_count % _CONSOLIDATION_EVERY_N_PATCHES == 0:
+        await _consolidate_personality_model(twin_data, ctx)
+    else:
+        await _patch_personality_model(twin_data, ctx, addressed_topic_ids)
 
     twin_data["deepen_completed_at"] = datetime.now().isoformat()
     try:
@@ -2634,36 +2925,34 @@ async def deepen_message(
     request: DeepenRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Run one turn of the deepen interview for a twin the caller owns."""
+    """Run one turn of the deepen interview for a twin the caller owns.
+
+    Topic selection is gap-driven (see openspec/changes/generative-deepen-interview):
+    unresolved knowledge-gap ledger entries first, then thin personality_model
+    fields, then the original evergreen questions as a cold-start fallback.
+    A session ending (done=true) never permanently closes the twin to future
+    deepening — _select_deepen_topics recomputes against current state every
+    call, so a twin can always be deepened again once new gaps or thin fields
+    exist.
+    """
     twin_data = load_twin(twin_id)
     if not twin_data or twin_data.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Twin not found")
 
     covered = list(request.topics_covered)
-
-    # Build a short existing-context summary to orient the LLM
     pm = twin_data.get("personality_model", {})
     ctx_data = pm.get("_context", {}) if isinstance(pm, dict) else {}
 
-    # Auto-mark topics that are already persisted in the twin's context so that
-    # re-deepen sessions don't re-ask questions the user already answered.
-    if isinstance(ctx_data, dict):
-        if ctx_data.get("pastDecisions") and "PAST_DECISIONS" not in covered:
-            covered.append("PAST_DECISIONS")
-        if ctx_data.get("nonNegotiables") and "NON_NEGOTIABLES" not in covered:
-            covered.append("NON_NEGOTIABLES")
-        if ctx_data.get("mindChange") and "MIND_CHANGE" not in covered:
-            covered.append("MIND_CHANGE")
+    remaining = _select_deepen_topics(twin_data, covered)
 
-    remaining = [t for t in _ALL_DEEPEN_TOPICS if t not in covered]
-
-    # If all topics are already captured in the twin's context, skip the LLM
-    # entirely and return done=True so the frontend shows the completion screen.
+    # If nothing is selectable right now, say so honestly without writing any
+    # permanent "fully deepened" state — a future call (once new gaps or thin
+    # fields exist) will find something again.
     if not remaining:
         return {
             "message": (
-                f"You've already deepened {twin_data.get('name', 'this twin')} across all three areas. "
-                "Head to your dashboard to see the updated profile."
+                f"Nothing new to deepen for {twin_data.get('name', 'this twin')} right now — "
+                "check back after a few more conversations, or once there's new context to draw on."
             ),
             "field_updates": {},
             "topics_covered": covered,
@@ -2691,8 +2980,12 @@ async def deepen_message(
             ctx_lines.append(f"Mind change (already captured): {ctx_data['mindChange'][:200]}")
     existing_context = "\n".join(ctx_lines) if ctx_lines else "No existing context."
 
+    topics_block = "\n".join(f"- {t['id']}: {t['question_hint']}" for t in remaining)
+    topic_ids_remaining = ", ".join(t["id"] for t in remaining)
+
     system_prompt = _DEEPEN_SYSTEM_TEMPLATE.format(
-        topics_remaining=", ".join(remaining) if remaining else "ALL COVERED",
+        topics_block=topics_block,
+        topic_ids_remaining=topic_ids_remaining,
         existing_context=existing_context,
     )
 
@@ -2726,33 +3019,32 @@ async def deepen_message(
 
         validated = DeepenResponse.model_validate(data)
 
-        # Ensure topics_covered remains cumulative across turns by unioning
-        # the topics from the request with the topics returned by the model,
-        # and ordering them according to the canonical _ALL_DEEPEN_TOPICS list.
-        request_topics = set(covered)  # already includes auto-populated topics
-        model_topics = set(validated.topics_covered or [])
+        # Only accept topic ids we actually offered this turn (plus whatever
+        # was already covered) — the LLM shouldn't be able to claim a topic
+        # id it made up. Cumulative across turns, like the old fixed-list logic.
+        request_topics = set(covered)
+        offered_ids = {t["id"] for t in remaining}
+        model_topics = set(validated.topics_covered or []) & (offered_ids | request_topics)
         merged_topics_set = request_topics | model_topics
-        if merged_topics_set:
-            merged_topics_ordered: List[str] = [
-                topic for topic in _ALL_DEEPEN_TOPICS if topic in merged_topics_set
-            ]
-            validated.topics_covered = merged_topics_ordered
+        validated.topics_covered = sorted(merged_topics_set)
         result = validated.model_dump(exclude_none=True)
 
-        # Guard: if the LLM covered all topics but forgot to set done=true, force it.
-        all_topics_covered = set(_ALL_DEEPEN_TOPICS).issubset(merged_topics_set)
-        if all_topics_covered and not result.get("done"):
+        # Guard: if the LLM covered everything offered this turn but forgot to
+        # set done=true, force it — re-checked via _select_deepen_topics (not
+        # a fixed list), so this stays correct as topics became dynamic.
+        still_remaining = _select_deepen_topics(twin_data, list(merged_topics_set))
+        if not still_remaining and not result.get("done"):
             result["done"] = True
 
         # If done, merge new fields and re-synthesize synchronously before returning
         if result.get("done"):
             all_fields = dict(request.fields_collected or {})
             fu = validated.field_updates
-            for key in ("pastDecisions", "nonNegotiables", "softPreferences", "mindChange"):
+            for key in ("pastDecisions", "nonNegotiables", "softPreferences", "mindChange", "topicAnswer"):
                 val = getattr(fu, key, None)
                 if val:
                     all_fields[key] = val
-            await _deepen_and_save(twin_id, user_id, twin_data, all_fields)
+            await _deepen_and_save(twin_id, user_id, twin_data, all_fields, list(merged_topics_set))
 
         return result
 
@@ -2786,8 +3078,10 @@ async def deepen_message(
             # In the fallback path JSON parsing failed, so we can't reliably extract
             # field updates from the current turn.  Persist whatever the frontend has
             # already accumulated across previous turns via request.fields_collected.
+            # Topic ids addressed are unknown here too, so patch/decay against
+            # whatever was already covered coming into this turn.
             all_fields = dict(request.fields_collected or {})
-            await _deepen_and_save(twin_id, user_id, twin_data, all_fields)
+            await _deepen_and_save(twin_id, user_id, twin_data, all_fields, covered)
 
         return {
             "message": fallback_message,
@@ -2798,6 +3092,36 @@ async def deepen_message(
     except Exception as exc:
         print(f"Unexpected error in /twin/{{twin_id}}/deepen/message: {exc}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
+
+
+class PersonalityRollbackRequest(BaseModel):
+    version: int
+
+
+@app.patch("/twin/{twin_id}/personality/rollback")
+async def rollback_personality_model(
+    twin_id: str,
+    request: PersonalityRollbackRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Restore a twin's personality_model to a previously recorded version.
+
+    Targeted deepen patches and periodic consolidation passes can degrade a
+    field instead of improving it; this lets an owner undo a specific update
+    without losing everything since — see personality_model_versions."""
+    twin_data = load_twin(twin_id)
+    if not twin_data or twin_data.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    if not restore_personality_model_version(twin_data, request.version):
+        raise HTTPException(status_code=404, detail=f"Version {request.version} not found")
+
+    _save_twin(twin_id, user_id, twin_data)
+    return {
+        "status": "ok",
+        "active_version": twin_data["personality_model_versions"][-1]["version"],
+        "versions_available": [v["version"] for v in twin_data["personality_model_versions"]],
+    }
 
 
 # ── Resume Builder ─────────────────────────────────────────────────────────────
