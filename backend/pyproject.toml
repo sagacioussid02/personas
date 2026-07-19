@@ -44,8 +44,8 @@ dev = [
     "types-aiofiles>=23.0.0",
 ]
 
-[tool.setuptools]
-packages = ["backend"]
+[tool.uv]
+package = false
 
 [tool.black]
 line-length = 100
