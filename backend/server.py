@@ -2194,6 +2194,15 @@ class DebateTurnResponse(BaseModel):
     text: str
 
 
+def _is_debate_authorized(twin_data: dict, user_id: str) -> bool:
+    """A twin may be used in a debate if the caller owns it, or if it has no
+    owner at all — public personas and the default twin (before
+    DEFAULT_TWIN_OWNER_USER_ID is configured) never have a user_id, and are
+    meant to be usable by any signed-in user as a debate partner."""
+    owner = twin_data.get("user_id")
+    return owner is None or owner == user_id
+
+
 @app.post("/debate/turn", response_model=DebateTurnResponse)
 async def debate_turn(
     request: DebateTurnRequest,
@@ -2207,7 +2216,7 @@ async def debate_turn(
     requiring Lambda response streaming.
     """
     twin_data = load_twin(request.twin_id)
-    if not twin_data or twin_data.get("user_id") != user_id:
+    if not twin_data or not _is_debate_authorized(twin_data, user_id):
         raise HTTPException(status_code=404, detail="Twin not found")
 
     agent = DebateAgent(twin_data)
@@ -2258,7 +2267,8 @@ async def debate(
     request: DebateRequest,
     user_id: str = Depends(get_current_user_id),
 ):
-    """Run a structured debate between two user-owned twins.
+    """Run a structured debate between two twins — either the caller's own,
+    or a public persona (which has no owner and is usable by any signed-in user).
 
     Each twin is instantiated as an independent DebateAgent with its own
     persona and conversation context. The orchestrator alternates calls for
@@ -2269,16 +2279,22 @@ async def debate(
     True token-level streaming requires Lambda Function URL response streaming
     and is a planned future upgrade.
     """
-    # Load and authorise both twins — only owner may use their twins in a debate
     twin_a_data = load_twin(request.twin_id_a)
     twin_b_data = load_twin(request.twin_id_b)
 
-    if not twin_a_data or twin_a_data.get("user_id") != user_id:
+    if not twin_a_data or not _is_debate_authorized(twin_a_data, user_id):
         raise HTTPException(status_code=404, detail="Twin A not found")
-    if not twin_b_data or twin_b_data.get("user_id") != user_id:
+    if not twin_b_data or not _is_debate_authorized(twin_b_data, user_id):
         raise HTTPException(status_code=404, detail="Twin B not found")
     if request.twin_id_a == request.twin_id_b:
         raise HTTPException(status_code=400, detail="Debate requires two different twins")
+    # Public personas have no owner and are usable by anyone signed in, but at
+    # least one side must be the caller's own twin — otherwise any two signed-in
+    # users could rack up public-persona-vs-public-persona debates with nothing
+    # of their own involved, which isn't the intended "debate your own twin
+    # against a public persona" use case.
+    if twin_a_data.get("user_id") != user_id and twin_b_data.get("user_id") != user_id:
+        raise HTTPException(status_code=400, detail="At least one twin in the debate must be your own")
 
     agent_a = DebateAgent(twin_a_data)
     agent_b = DebateAgent(twin_b_data)
