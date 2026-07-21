@@ -39,6 +39,7 @@ export default function DebatePage() {
   const router = useRouter();
 
   const [twins, setTwins] = useState<Twin[]>([]);
+  const [personas, setPersonas] = useState<Twin[]>([]);
   const [twinsLoading, setTwinsLoading] = useState(true);
   const [twinsError, setTwinsError] = useState('');
 
@@ -78,7 +79,10 @@ export default function DebatePage() {
     if (isLoaded && !isSignedIn) router.push('/sign-in');
   }, [isLoaded, isSignedIn, router]);
 
-  // Load user's twins
+  // Load user's own twins and the public personas (debate opponents don't
+  // have to be twins the user created — any signed-in user can debate their
+  // own twin against a public persona, as long as at least one side is theirs;
+  // enforced server-side in /chat/debate and /debate/turn).
   useEffect(() => {
     if (!isLoaded) return;
     if (!isSignedIn) {
@@ -89,12 +93,17 @@ export default function DebatePage() {
       try {
         const token = await getToken();
         if (!token) { setTwinsError('Unable to retrieve auth token.'); return; }
-        const res = await fetch(`${API}/users/me/twins`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (!res.ok) throw new Error(`${res.status}`);
-        const data = await res.json();
-        setTwins(data.twins || []);
+        const [twinsRes, personasRes] = await Promise.all([
+          fetch(`${API}/users/me/twins`, { headers: { Authorization: `Bearer ${token}` } }),
+          fetch(`${API}/public-personas`),
+        ]);
+        if (!twinsRes.ok) throw new Error(`${twinsRes.status}`);
+        const twinsData = await twinsRes.json();
+        setTwins(twinsData.twins || []);
+        if (personasRes.ok) {
+          const personasData = await personasRes.json();
+          setPersonas(personasData.personas || []);
+        }
       } catch {
         setTwinsError('Failed to load your twins.');
       } finally {
@@ -109,9 +118,13 @@ export default function DebatePage() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [completedTurns.length, animating?.turnIndex]);
 
-  const twinA = twins.find(t => t.twin_id === twinIdA);
-  const twinB = twins.find(t => t.twin_id === twinIdB);
-  const canStart = twinIdA && twinIdB && twinIdA !== twinIdB && topic.trim();
+  const opponentPool = [...twins, ...personas];
+  const twinA = opponentPool.find(t => t.twin_id === twinIdA);
+  const twinB = opponentPool.find(t => t.twin_id === twinIdB);
+  const isOwnTwin = (id: string) => twins.some(t => t.twin_id === id);
+  const canStart =
+    !!twinIdA && !!twinIdB && twinIdA !== twinIdB && !!topic.trim() &&
+    (isOwnTwin(twinIdA) || isOwnTwin(twinIdB));
 
   // Returns a promise that resolves once all characters have been typed out
   const animateText = useCallback(
@@ -312,7 +325,7 @@ export default function DebatePage() {
             </div>
             <div>
               <h1 className="text-2xl font-bold text-gray-900">Persona vs Persona</h1>
-              <p className="text-sm text-gray-500">Put two of your twins in a debate</p>
+              <p className="text-sm text-gray-500">Debate your twin against another of your twins — or a public persona</p>
             </div>
           </div>
         </div>
@@ -323,12 +336,12 @@ export default function DebatePage() {
           </div>
         )}
 
-        {twins.length < 2 ? (
+        {twins.length < 1 ? (
           <div className="text-center py-16 text-gray-500">
-            <p className="mb-3">You need at least 2 twins to start a debate.</p>
+            <p className="mb-3">You need at least 1 twin of your own to start a debate.</p>
             <button onClick={() => router.push('/create')}
               className="text-sm text-purple-600 hover:text-purple-800 underline">
-              Create another twin
+              Create a twin
             </button>
           </div>
         ) : (
@@ -345,9 +358,16 @@ export default function DebatePage() {
                       className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500"
                     >
                       <option value="">Select twin…</option>
-                      {twins.filter(t => t.twin_id !== twinIdB).map(t => (
-                        <option key={t.twin_id} value={t.twin_id}>{t.name}</option>
-                      ))}
+                      <optgroup label="Your twins">
+                        {twins.filter(t => t.twin_id !== twinIdB).map(t => (
+                          <option key={t.twin_id} value={t.twin_id}>{t.name}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Public personas">
+                        {personas.filter(t => t.twin_id !== twinIdB).map(t => (
+                          <option key={t.twin_id} value={t.twin_id}>{t.name}</option>
+                        ))}
+                      </optgroup>
                     </select>
                   </div>
                   <div>
@@ -358,9 +378,16 @@ export default function DebatePage() {
                       className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm text-gray-800 focus:outline-none focus:ring-2 focus:ring-purple-500"
                     >
                       <option value="">Select twin…</option>
-                      {twins.filter(t => t.twin_id !== twinIdA).map(t => (
-                        <option key={t.twin_id} value={t.twin_id}>{t.name}</option>
-                      ))}
+                      <optgroup label="Your twins">
+                        {twins.filter(t => t.twin_id !== twinIdA).map(t => (
+                          <option key={t.twin_id} value={t.twin_id}>{t.name}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="Public personas">
+                        {personas.filter(t => t.twin_id !== twinIdA).map(t => (
+                          <option key={t.twin_id} value={t.twin_id}>{t.name}</option>
+                        ))}
+                      </optgroup>
                     </select>
                   </div>
                 </div>
@@ -376,6 +403,10 @@ export default function DebatePage() {
                     onKeyDown={e => e.key === 'Enter' && startDebate()}
                   />
                 </div>
+
+                {twinIdA && twinIdB && twinIdA !== twinIdB && !isOwnTwin(twinIdA) && !isOwnTwin(twinIdB) && (
+                  <p className="text-sm text-amber-600 mb-3">At least one side must be one of your own twins — pick a public persona for the other side.</p>
+                )}
 
                 {debateError && (
                   <p className="text-sm text-red-500 mb-3">{debateError}</p>
