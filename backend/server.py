@@ -164,6 +164,23 @@ def _extract_identity_from_history(
     return name, email
 
 
+def _recent_transcript(conversation: list, current_message: str, max_messages: int = 8) -> str:
+    """Render the last few turns as readable 'User: ... / Twin: ...' lines, plus
+    the current triggering message. A connect/feedback notification quoting a
+    single out-of-context line (e.g. "can I connect with you?") tells the twin
+    owner nothing about what was actually discussed - this gives them the real
+    conversation instead."""
+    recent = conversation[-max_messages:]
+    lines = []
+    for msg in recent:
+        role = "User" if msg.get("role") == "user" else "Twin"
+        content = (msg.get("content") or "").strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    lines.append(f"User: {current_message}")
+    return "\n".join(lines)
+
+
 # ── Feedback notification rate limiting ───────────────────────────────────────
 # Both anonymous and authenticated callers are capped on a rolling 7-day window
 # to deter bot/DDoS abuse of the SES path. State lives in the warm Lambda
@@ -302,7 +319,7 @@ async def _notify_connect_intent(
             f"Persona: {twin_name}\n"
             f"Session: {session_id}\n"
             f"Time: {datetime.utcnow().isoformat()}Z\n\n"
-            f"Message:\n{user_message}\n"
+            f"{user_message}\n"
         )
         await asyncio.to_thread(
             _ses_client.send_email,
@@ -387,7 +404,8 @@ def _decide_connect_notification(
             print(f"[notify] Auth notification suppressed by rate limit (chatter_id={chatter_id})")
             return False, None
         identity = f"Email: {user_email}" if user_email else f"chatter_id: {chatter_id}"
-        return True, f"{message}\n\nFrom: {identity}"
+        transcript = _recent_transcript(conversation, message)
+        return True, f"Conversation:\n{transcript}\n\nContact info:\n{identity}"
 
     name, shared_email = _extract_identity_from_history(conversation, message)
     should_notify = _should_notify_anon(ip, session_id, email=shared_email)
@@ -397,11 +415,14 @@ def _decide_connect_notification(
     identity_lines = []
     if name:
         identity_lines.append(f"Name (from chat): {name}")
-    if shared_email:
-        identity_lines.append(f"Email (from chat): {shared_email}")
+    identity_lines.append(
+        f"Email (from chat): {shared_email}" if shared_email
+        else "Email: not shared yet — the twin should ask for this if the conversation continues"
+    )
     identity_lines.append(f"IP: {_truncate_ip(ip)}")
     identity_lines.append(f"Session: {session_id}")
-    return True, message + "\n\n" + "\n".join(identity_lines)
+    transcript = _recent_transcript(conversation, message)
+    return True, f"Conversation:\n{transcript}\n\nContact info:\n" + "\n".join(identity_lines)
 
 
 async def _send_connect_notification(
@@ -1181,12 +1202,16 @@ async def chat(
         effective_chatter_id = chatter_id or stored_chatter_id
         save_conversation(session_id, conversation, chatter_id=effective_chatter_id, twin_owner_id=twin_owner_id)
 
-        # Source snippets and grounding may contain sensitive onboarding/correction
-        # content. Only return them to the twin owner, or for built-in/public twins
-        # that do not have an owner.
-        is_public_twin = twin_data is not None and not twin_owner_id
-        can_view_source_details = is_public_twin or (
-            chatter_id is not None and chatter_id == twin_owner_id
+        # Grounding/confidence badges and source snippets are an internal
+        # transparency aid for whoever manages the twin, not end-user-facing
+        # chat UI - a visitor (signed in or anonymous) shouldn't see raw
+        # "medium confidence / grounded / Based on Profile summary" scaffolding
+        # while talking to what should read as the person themselves. Visible
+        # only to the twin's authenticated owner; nobody sees it for twins
+        # with no owner configured (public personas, the default twin before
+        # DEFAULT_TWIN_OWNER_USER_ID is set).
+        can_view_source_details = (
+            chatter_id is not None and twin_owner_id is not None and chatter_id == twin_owner_id
         )
 
         return ChatResponse(
