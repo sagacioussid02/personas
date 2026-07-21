@@ -324,12 +324,40 @@ def _should_notify_auth(chatter_id: str) -> bool:
         return True
 
 
+_NOTIFY_SUMMARY_MODEL_ID = "amazon.nova-micro-v1:0"
+_NOTIFY_SUMMARY_PROMPT = (
+    "In 1-3 sentences, in third person, summarize what this person wants to convey "
+    "to the creator (Sidd) - their actual request, feedback, or message. Do not "
+    "describe the conversation mechanics or repeat contact info (it's included "
+    "separately). If there isn't much to summarize, say so plainly.\n\nConversation:\n"
+)
+
+
+async def _summarize_for_notification(transcript: str) -> str:
+    """Generate a short, readable summary of the transcript for the notification
+    email - replaces relying on the single-message intent classifier's optional
+    one-liner, which is empty whenever the notification is resolved from a
+    pending intent-only opener (that turn's classification was NO/INTENT, not
+    CONTENT, so it never produced a summary)."""
+    try:
+        response = await asyncio.to_thread(
+            bedrock_client.converse,
+            modelId=_NOTIFY_SUMMARY_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": _NOTIFY_SUMMARY_PROMPT + transcript}]}],
+            inferenceConfig={"maxTokens": 120, "temperature": 0},
+        )
+        return response["output"]["message"]["content"][0]["text"].strip()
+    except Exception as exc:
+        print(f"[notify] Summary generation failed: {exc}")
+        return ""
+
+
 async def _notify_connect_intent(
-    user_message: str,
+    transcript: str,
+    identity_block: str,
     session_id: str,
     twin_name: str,
     intent_type: str = "connect",
-    intent_summary: str = "",
 ) -> None:
     """Fire-and-forget SES email when a user asks to connect with the creator."""
     if not _ses_client or not _ADMIN_EMAILS:
@@ -342,14 +370,16 @@ async def _notify_connect_intent(
             "review": "Review request",
             "connect": "Connect request",
         }.get(intent_type, "Connect request")
-        summary_line = f"Summary: {intent_summary}\n" if intent_summary else ""
+        summary = await _summarize_for_notification(transcript)
+        summary_line = f"Summary: {summary}\n" if summary else ""
         body = (
             f"{type_label} received via {twin_name}\n\n"
             f"{summary_line}"
             f"Persona: {twin_name}\n"
             f"Session: {session_id}\n"
             f"Time: {datetime.utcnow().isoformat()}Z\n\n"
-            f"{user_message}\n"
+            f"Contact info:\n{identity_block}\n\n"
+            f"Full conversation:\n{transcript}\n"
         )
         await asyncio.to_thread(
             _ses_client.send_email,
@@ -431,7 +461,7 @@ def _decide_connect_notification(
     is_connect: bool,
     has_content: bool,
     intent_type: str,
-) -> tuple[bool, Optional[str], str, str]:
+) -> tuple[bool, Optional[str], Optional[str], str, str]:
     """
     Synchronously decide whether this message earns a real SES notification, and
     consume the rate-limit slot if so. Pure in-memory bookkeeping — no I/O — so
@@ -439,56 +469,60 @@ def _decide_connect_notification(
     acknowledgment we show can honestly reflect whether we're actually sending
     something instead of always claiming success.
 
-    Returns (should_notify, notify_message, status, effective_intent_type).
+    Returns (should_notify, transcript, identity_block, status, effective_intent_type).
+    transcript/identity_block are None when should_notify is False.
     status is one of:
       "none"       — not connect-related, and no earlier turn is pending either;
                      no acknowledgment should be shown.
       "awaiting"   — intent expressed but this message carries no content yet;
                      pending state recorded, no acknowledgment should be shown
                      (the twin's own reply already asks what they'd like to share).
-      "notified"   — real content present (either this message, or a follow-up
-                     resolving an earlier pending intent-only opener); should_notify
-                     reflects whether the rate limit actually allowed sending it.
+      "notified"   — real content present (either this message, or the very next
+                     message resolving an earlier pending intent-only opener);
+                     should_notify reflects whether the rate limit actually
+                     allowed sending it.
       "suppressed" — real content present but rate-limited; no email sent.
     effective_intent_type is intent_type when content arrived this turn, or the
-    pending entry's type when resolving a previously-deferred intent-only opener
-    (whose own intent_type is "" this turn, since the classifier said NO).
+    pending entry's type when resolving a previously-deferred intent-only opener.
+
+    Once a pending entry exists, the very next user message always resolves it —
+    the user was just asked "what would you like to share?", so whatever they
+    say next is treated as the answer regardless of how this message classifies
+    on its own. Relying on the classifier to independently re-recognize the
+    follow-up as CONTENT is what let a real answer ("...add more public
+    personas... I am Alex") get re-classified as another content-less INTENT,
+    silently deferring the notification an extra turn.
     """
     pending = _pop_pending_connect(session_id)
 
-    if is_connect and not has_content:
+    if pending:
+        effective_intent_type = pending["intent_type"]
+    elif is_connect and not has_content:
         # Wants to connect/give feedback, but hasn't said what about yet — don't
         # notify (and don't consume the rate-limit slot) on a vague opener like
-        # "I want to reach out to say something". Wait for the follow-up that
-        # actually says something, so the notification has real content instead
-        # of a bare transcript with nothing to relay.
+        # "I want to reach out to say something". Wait for the very next message,
+        # which resolves unconditionally above on the next call.
         _set_pending_connect(session_id, message, intent_type)
-        return False, None, "awaiting", intent_type
-
-    if not is_connect and not pending:
-        return False, None, "none", ""
-
-    # Either this message carries real content, or a prior turn was intent-only
-    # and this message is the answer to "what would you like to share?" —
-    # either way there's something real to relay now. _recent_transcript already
-    # pulls in the earlier intent-only turn from conversation history, so no
-    # manual stitching of the two messages is needed here.
-    effective_intent_type = intent_type if is_connect else pending["intent_type"]
+        return False, None, None, "awaiting", intent_type
+    elif is_connect and has_content:
+        effective_intent_type = intent_type
+    else:
+        return False, None, None, "none", ""
 
     if viewer_is_authenticated:
         should_notify = _should_notify_auth(chatter_id)
         if not should_notify:
             print(f"[notify] Auth notification suppressed by rate limit (chatter_id={chatter_id})")
-            return False, None, "suppressed", effective_intent_type
+            return False, None, None, "suppressed", effective_intent_type
         identity = f"Email: {user_email}" if user_email else f"chatter_id: {chatter_id}"
         transcript = _recent_transcript(conversation, message)
-        return True, f"Conversation:\n{transcript}\n\nContact info:\n{identity}", "notified", effective_intent_type
+        return True, transcript, identity, "notified", effective_intent_type
 
     name, shared_email = _extract_identity_from_history(conversation, message)
     should_notify = _should_notify_anon(ip, session_id, email=shared_email)
     if not should_notify:
         print(f"[notify] Anon notification suppressed by rate limit (ip={ip}, session={session_id})")
-        return False, None, "suppressed", effective_intent_type
+        return False, None, None, "suppressed", effective_intent_type
     identity_lines = []
     if name:
         identity_lines.append(f"Name (from chat): {name}")
@@ -499,23 +533,24 @@ def _decide_connect_notification(
     identity_lines.append(f"IP: {_truncate_ip(ip)}")
     identity_lines.append(f"Session: {session_id}")
     transcript = _recent_transcript(conversation, message)
-    return True, f"Conversation:\n{transcript}\n\nContact info:\n" + "\n".join(identity_lines), "notified", effective_intent_type
+    return True, transcript, "\n".join(identity_lines), "notified", effective_intent_type
 
 
 async def _send_connect_notification(
-    notify_message: str,
+    transcript: str,
+    identity_block: str,
     session_id: str,
     twin_name: str,
     intent_type: str = "connect",
-    intent_summary: str = "",
 ) -> None:
-    """Background task: actually send the SES alert. Rate limiting was already
-    decided (and the slot consumed) synchronously by _decide_connect_notification
-    before this was scheduled, so this only performs the network call."""
+    """Background task: actually send the SES alert (including the summary
+    generation, itself a Bedrock call). Rate limiting was already decided (and
+    the slot consumed) synchronously by _decide_connect_notification before
+    this was scheduled, so nothing here affects the user-facing response."""
     try:
         await asyncio.wait_for(
-            _notify_connect_intent(notify_message, session_id, twin_name, intent_type, intent_summary),
-            timeout=5.0,
+            _notify_connect_intent(transcript, identity_block, session_id, twin_name, intent_type),
+            timeout=8.0,
         )
     except Exception:
         pass
@@ -1176,7 +1211,11 @@ async def chat(
         # Run intent classification concurrently with chat orchestration.
         # Nova Micro (~300 ms) finishes well before Nova Lite (~2 s), so there
         # is no perceptible latency increase.
-        (is_connect, intent_type, intent_summary, has_content), orchestration = await asyncio.gather(
+        # intent_summary is unused now — the notification email generates its own
+        # summary from the full transcript at send time (see _summarize_for_notification),
+        # since the per-message classifier's summary is empty whenever notification
+        # is resolved from a pending intent-only opener rather than this exact turn.
+        (is_connect, intent_type, _intent_summary, has_content), orchestration = await asyncio.gather(
             _classify_feedback_intent(request.message),
             asyncio.to_thread(
                 run_chat_orchestration,
@@ -1199,7 +1238,7 @@ async def chat(
         # Decide — synchronously, no I/O — whether this message actually earns a
         # notification, before we say anything to the user about it. This is what
         # makes the acknowledgment below honest instead of always claiming success.
-        should_notify, notify_message, notify_status, effective_intent_type = _decide_connect_notification(
+        should_notify, notify_transcript, notify_identity, notify_status, effective_intent_type = _decide_connect_notification(
             message=request.message,
             session_id=session_id,
             viewer_is_authenticated=viewer_is_authenticated,
@@ -1239,11 +1278,11 @@ async def chat(
         if should_notify:
             background_tasks.add_task(
                 _send_connect_notification,
-                notify_message,
+                notify_transcript,
+                notify_identity,
                 session_id,
                 twin_name or "Sidd",
                 effective_intent_type,
-                intent_summary,
             )
 
         # Knowledge-gap ledger: record topics this twin answered weakly, so a
