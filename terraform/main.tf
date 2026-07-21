@@ -594,3 +594,57 @@ resource "aws_apigatewayv2_route" "post_resume_generate" {
   route_key = "POST /resume/generate"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
+
+resource "aws_apigatewayv2_route" "patch_twin_personality_rollback" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "PATCH /twin/{twin_id}/personality/rollback"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "delete_twin" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "DELETE /twin/{twin_id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "post_twin_share" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /twin/{twin_id}/share"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "delete_twin_share" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "DELETE /twin/{twin_id}/share"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_shared_twins" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /users/me/shared-twins"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "post_twin_request_public" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /twin/{twin_id}/request-public"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "get_admin_pending_public_personas" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /admin/pending-public-personas"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "post_admin_approve_public_persona" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /admin/public-personas/{twin_id}/approve"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "post_admin_reject_public_persona" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /admin/public-personas/{twin_id}/reject"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
