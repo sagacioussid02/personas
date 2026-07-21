@@ -206,6 +206,36 @@ _auth_notify_user_history: dict[str, deque] = defaultdict(deque)
 _anon_notify_lock = threading.Lock()
 _auth_notify_lock = threading.Lock()
 
+# Session-scoped "awaiting content" state: set when a message expresses
+# connect/feedback intent with no substantive content yet (e.g. "I want to
+# reach out to say something"), so the notification waits for the follow-up
+# that actually says what — instead of firing immediately on the vague opener
+# and burning the one-shot-per-session rate-limit slot before there's anything
+# real to tell the twin owner. Short TTL since this should be answered in the
+# same sitting; not the multi-day window the rate limiters use.
+_PENDING_CONNECT_TTL_SECONDS = 30 * 60.0  # 30 minutes
+_pending_connect_intent: dict[str, dict] = {}  # session_id -> {"message": str, "intent_type": str, "timestamp": float}
+_pending_connect_lock = threading.Lock()
+
+
+def _pop_pending_connect(session_id: str) -> Optional[dict]:
+    """Return and clear this session's pending connect-intent entry, if any and not expired."""
+    with _pending_connect_lock:
+        now = time.time()
+        expired = [sid for sid, entry in _pending_connect_intent.items() if now - entry["timestamp"] > _PENDING_CONNECT_TTL_SECONDS]
+        for sid in expired:
+            _pending_connect_intent.pop(sid, None)
+        return _pending_connect_intent.pop(session_id, None)
+
+
+def _set_pending_connect(session_id: str, message: str, intent_type: str) -> None:
+    with _pending_connect_lock:
+        _pending_connect_intent[session_id] = {
+            "message": message,
+            "intent_type": intent_type,
+            "timestamp": time.time(),
+        }
+
 
 def _truncate_ip(ip: str) -> str:
     """Return a /24-truncated IPv4 address (last octet zeroed) for reduced PII.
@@ -338,41 +368,56 @@ async def _notify_connect_intent(
 # Intent classification model — cheapest/fastest
 _INTENT_MODEL_ID = "amazon.nova-micro-v1:0"
 _INTENT_PROMPT = (
-    "Classify the following message. If the user is expressing intent to give feedback, "
-    "leave a review, share a compliment, lodge a complaint, contact or connect with "
-    "the creator, or pass along a message — reply in this exact format:\n"
-    "YES|<type>|<one-sentence summary>\n"
-    "where <type> is one of: feedback, compliment, complaint, review, connect\n"
-    "If none of the above, reply with only: NO\n\nMessage: "
+    "Classify the following message about the user's intent toward the creator. "
+    "Reply in exactly one of these formats:\n"
+    "INTENT|<type>|<one-sentence summary>\n"
+    "  — the user wants to give feedback, leave a review, share a compliment, "
+    "lodge a complaint, or connect/contact the creator, but THIS message does not "
+    "itself contain the actual content to relay (e.g. \"can I connect with you?\", "
+    "\"I want to reach out to say something\", \"how do I contact you?\").\n"
+    "CONTENT|<type>|<one-sentence summary>\n"
+    "  — THIS message itself contains the substantive point, feedback, or request "
+    "the user wants passed along (e.g. \"tell Sidd I'm impressed by his work\", "
+    "\"I loved the AI safety talk\", a description of a job opportunity).\n"
+    "NO\n"
+    "  — none of the above.\n"
+    "<type> is one of: feedback, compliment, complaint, review, connect\n\nMessage: "
 )
 
 
-async def _classify_feedback_intent(message: str) -> tuple[bool, str, str]:
+async def _classify_feedback_intent(message: str) -> tuple[bool, str, str, bool]:
     """
-    Returns (is_connect, intent_type, summary).
-    Uses a Bedrock Nova Micro classifier (temperature=0, maxTokens=30).
-    Falls back to _CONNECT_RE if the Bedrock call fails.
+    Returns (is_connect, intent_type, summary, has_content).
+    has_content distinguishes "wants to connect, hasn't said what about yet"
+    (INTENT) from "this message is the actual thing to relay" (CONTENT) - see
+    _decide_connect_notification, which only ever notifies once has_content
+    is True for some message in the exchange.
+    Uses a Bedrock Nova Micro classifier (temperature=0, maxTokens=40).
+    Falls back to _CONNECT_RE (treated as CONTENT, preserving prior behavior)
+    if the Bedrock call fails.
     """
     try:
         response = await asyncio.to_thread(
             bedrock_client.converse,
             modelId=_INTENT_MODEL_ID,
             messages=[{"role": "user", "content": [{"text": _INTENT_PROMPT + message}]}],
-            inferenceConfig={"maxTokens": 30, "temperature": 0},
+            inferenceConfig={"maxTokens": 40, "temperature": 0},
         )
         answer = response["output"]["message"]["content"][0]["text"].strip()
-        if answer.upper().startswith("YES"):
+        upper = answer.upper()
+        if upper.startswith("INTENT") or upper.startswith("CONTENT"):
+            has_content = upper.startswith("CONTENT")
             parts = answer.split("|", 2)
             intent_type = parts[1].strip().lower() if len(parts) > 1 else "connect"
             summary = parts[2].strip() if len(parts) > 2 else ""
-            print(f"[intent] LLM classified message as CONNECT (type={intent_type})")
-            return True, intent_type, summary
+            print(f"[intent] LLM classified message as {'CONTENT' if has_content else 'INTENT'} (type={intent_type})")
+            return True, intent_type, summary, has_content
         print("[intent] LLM classified message as NORMAL")
-        return False, "", ""
+        return False, "", "", False
     except Exception as exc:
         print(f"[intent] LLM classification failed, falling back to regex: {exc}")
         is_connect = bool(_CONNECT_RE.search(message))
-        return is_connect, "connect" if is_connect else "", ""
+        return is_connect, "connect" if is_connect else "", "", is_connect
 
 
 def _decide_connect_notification(
@@ -384,7 +429,9 @@ def _decide_connect_notification(
     ip: str,
     conversation: list,
     is_connect: bool,
-) -> tuple[bool, Optional[str]]:
+    has_content: bool,
+    intent_type: str,
+) -> tuple[bool, Optional[str], str, str]:
     """
     Synchronously decide whether this message earns a real SES notification, and
     consume the rate-limit slot if so. Pure in-memory bookkeeping — no I/O — so
@@ -392,26 +439,56 @@ def _decide_connect_notification(
     acknowledgment we show can honestly reflect whether we're actually sending
     something instead of always claiming success.
 
-    Returns (should_notify, notify_message). notify_message is None when
-    should_notify is False.
+    Returns (should_notify, notify_message, status, effective_intent_type).
+    status is one of:
+      "none"       — not connect-related, and no earlier turn is pending either;
+                     no acknowledgment should be shown.
+      "awaiting"   — intent expressed but this message carries no content yet;
+                     pending state recorded, no acknowledgment should be shown
+                     (the twin's own reply already asks what they'd like to share).
+      "notified"   — real content present (either this message, or a follow-up
+                     resolving an earlier pending intent-only opener); should_notify
+                     reflects whether the rate limit actually allowed sending it.
+      "suppressed" — real content present but rate-limited; no email sent.
+    effective_intent_type is intent_type when content arrived this turn, or the
+    pending entry's type when resolving a previously-deferred intent-only opener
+    (whose own intent_type is "" this turn, since the classifier said NO).
     """
-    if not is_connect:
-        return False, None
+    pending = _pop_pending_connect(session_id)
+
+    if is_connect and not has_content:
+        # Wants to connect/give feedback, but hasn't said what about yet — don't
+        # notify (and don't consume the rate-limit slot) on a vague opener like
+        # "I want to reach out to say something". Wait for the follow-up that
+        # actually says something, so the notification has real content instead
+        # of a bare transcript with nothing to relay.
+        _set_pending_connect(session_id, message, intent_type)
+        return False, None, "awaiting", intent_type
+
+    if not is_connect and not pending:
+        return False, None, "none", ""
+
+    # Either this message carries real content, or a prior turn was intent-only
+    # and this message is the answer to "what would you like to share?" —
+    # either way there's something real to relay now. _recent_transcript already
+    # pulls in the earlier intent-only turn from conversation history, so no
+    # manual stitching of the two messages is needed here.
+    effective_intent_type = intent_type if is_connect else pending["intent_type"]
 
     if viewer_is_authenticated:
         should_notify = _should_notify_auth(chatter_id)
         if not should_notify:
             print(f"[notify] Auth notification suppressed by rate limit (chatter_id={chatter_id})")
-            return False, None
+            return False, None, "suppressed", effective_intent_type
         identity = f"Email: {user_email}" if user_email else f"chatter_id: {chatter_id}"
         transcript = _recent_transcript(conversation, message)
-        return True, f"Conversation:\n{transcript}\n\nContact info:\n{identity}"
+        return True, f"Conversation:\n{transcript}\n\nContact info:\n{identity}", "notified", effective_intent_type
 
     name, shared_email = _extract_identity_from_history(conversation, message)
     should_notify = _should_notify_anon(ip, session_id, email=shared_email)
     if not should_notify:
         print(f"[notify] Anon notification suppressed by rate limit (ip={ip}, session={session_id})")
-        return False, None
+        return False, None, "suppressed", effective_intent_type
     identity_lines = []
     if name:
         identity_lines.append(f"Name (from chat): {name}")
@@ -422,7 +499,7 @@ def _decide_connect_notification(
     identity_lines.append(f"IP: {_truncate_ip(ip)}")
     identity_lines.append(f"Session: {session_id}")
     transcript = _recent_transcript(conversation, message)
-    return True, f"Conversation:\n{transcript}\n\nContact info:\n" + "\n".join(identity_lines)
+    return True, f"Conversation:\n{transcript}\n\nContact info:\n" + "\n".join(identity_lines), "notified", effective_intent_type
 
 
 async def _send_connect_notification(
@@ -1099,7 +1176,7 @@ async def chat(
         # Run intent classification concurrently with chat orchestration.
         # Nova Micro (~300 ms) finishes well before Nova Lite (~2 s), so there
         # is no perceptible latency increase.
-        (is_connect, intent_type, intent_summary), orchestration = await asyncio.gather(
+        (is_connect, intent_type, intent_summary, has_content), orchestration = await asyncio.gather(
             _classify_feedback_intent(request.message),
             asyncio.to_thread(
                 run_chat_orchestration,
@@ -1122,7 +1199,7 @@ async def chat(
         # Decide — synchronously, no I/O — whether this message actually earns a
         # notification, before we say anything to the user about it. This is what
         # makes the acknowledgment below honest instead of always claiming success.
-        should_notify, notify_message = _decide_connect_notification(
+        should_notify, notify_message, notify_status, effective_intent_type = _decide_connect_notification(
             message=request.message,
             session_id=session_id,
             viewer_is_authenticated=viewer_is_authenticated,
@@ -1131,24 +1208,30 @@ async def chat(
             ip=_client_ip(http_request),
             conversation=list(conversation),
             is_connect=is_connect,
+            has_content=has_content,
+            intent_type=intent_type,
         )
 
-        # If a feedback/connect intent was detected, acknowledge it in the response.
-        if is_connect:
-            if should_notify:
-                ack_map = {
-                    "feedback": "I've passed your feedback along to Sidd — he'll appreciate hearing it.",
-                    "compliment": "I've shared your kind words with Sidd — that really means a lot.",
-                    "complaint": "I've forwarded your concern to Sidd so he can look into it.",
-                    "review": "I've let Sidd know you'd like to leave a review — thanks for taking the time.",
-                    "connect": "I've let Sidd know you'd like to get in touch — he'll reach out.",
-                }
-                ack = ack_map.get(intent_type, ack_map["connect"])
-            else:
-                ack = (
-                    "I've already flagged this conversation to Sidd, so I won't send a "
-                    "duplicate alert — it's saved here and he'll see it when he checks in."
-                )
+        # Acknowledge in the response only once there's something real to say —
+        # "awaiting" (intent expressed, no content yet) gets no system-appended
+        # acknowledgment; the twin's own reply already asks what they'd like to
+        # share (see context.py's critical rules), so adding one here would
+        # prematurely claim Sidd's been notified before there's anything to notify.
+        if notify_status == "notified":
+            ack_map = {
+                "feedback": "I've passed your feedback along to Sidd — he'll appreciate hearing it.",
+                "compliment": "I've shared your kind words with Sidd — that really means a lot.",
+                "complaint": "I've forwarded your concern to Sidd so he can look into it.",
+                "review": "I've let Sidd know you'd like to leave a review — thanks for taking the time.",
+                "connect": "I've let Sidd know you'd like to get in touch — he'll reach out.",
+            }
+            ack = ack_map.get(effective_intent_type, ack_map["connect"])
+            assistant_response = f"{assistant_response}\n\n*{ack}*"
+        elif notify_status == "suppressed":
+            ack = (
+                "I've already flagged this conversation to Sidd, so I won't send a "
+                "duplicate alert — it's saved here and he'll see it when he checks in."
+            )
             assistant_response = f"{assistant_response}\n\n*{ack}*"
 
         # The rate-limit decision (and slot consumption) already happened above;
@@ -1159,7 +1242,7 @@ async def chat(
                 notify_message,
                 session_id,
                 twin_name or "Sidd",
-                intent_type,
+                effective_intent_type,
                 intent_summary,
             )
 
