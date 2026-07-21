@@ -114,6 +114,45 @@ resource "aws_s3_bucket_policy" "frontend" {
   depends_on = [aws_s3_bucket_public_access_block.frontend]
 }
 
+# S3 bucket for Lambda deployment artifacts
+#
+# aws_lambda_function's `filename` upload path sends the zip inline (base64
+# in the API request body), which AWS caps at ~50MB compressed - our package
+# (pillow, cryptography, lxml, boto3, etc.) exceeds that. S3-based deployment
+# has no such request-size limit (up to Lambda's 250MB unzipped ceiling).
+resource "aws_s3_bucket" "lambda_artifacts" {
+  bucket = "${local.name_prefix}-lambda-artifacts-${data.aws_caller_identity.current.account_id}"
+  tags   = local.common_tags
+}
+
+resource "aws_s3_bucket_public_access_block" "lambda_artifacts" {
+  bucket = aws_s3_bucket.lambda_artifacts.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "lambda_artifacts" {
+  bucket = aws_s3_bucket.lambda_artifacts.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "aws:kms"
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_object" "lambda_zip" {
+  bucket = aws_s3_bucket.lambda_artifacts.id
+  key    = "lambda-deployment-${filemd5("${path.module}/../backend/lambda-deployment.zip")}.zip"
+  source = "${path.module}/../backend/lambda-deployment.zip"
+  etag   = filemd5("${path.module}/../backend/lambda-deployment.zip")
+  tags   = local.common_tags
+}
+
 # IAM role for Lambda
 resource "aws_iam_role" "lambda_role" {
   name = "${local.name_prefix}-lambda-role"
@@ -214,7 +253,8 @@ resource "aws_iam_role_policy" "lambda_ses" {
 
 # Lambda function
 resource "aws_lambda_function" "api" {
-  filename         = "${path.module}/../backend/lambda-deployment.zip"
+  s3_bucket        = aws_s3_bucket.lambda_artifacts.id
+  s3_key           = aws_s3_object.lambda_zip.key
   function_name    = "${local.name_prefix}-api"
   role             = aws_iam_role.lambda_role.arn
   handler          = "lambda_handler.handler"
@@ -242,8 +282,8 @@ resource "aws_lambda_function" "api" {
     mode = "Active"
   }
 
-  # Ensure Lambda waits for the distribution to exist
-  depends_on = [aws_cloudfront_distribution.main]
+  # Ensure Lambda waits for the distribution to exist and the code package to be uploaded
+  depends_on = [aws_cloudfront_distribution.main, aws_s3_object.lambda_zip]
 }
 
 # API Gateway HTTP API
