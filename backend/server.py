@@ -97,7 +97,18 @@ _IN_LAMBDA = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
 TWINS_DIR = "/tmp/twins" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "twins")  # nosec B108 — /tmp is the only writable path in Lambda; S3 is used when USE_S3=true
 TWINS_S3_PREFIX = "twins/"
 
+# Small per-recipient/per-twin marker objects for sharing and public-feature
+# requests — same scoped-prefix pattern as TWINS_S3_PREFIX's per-user twin
+# listing, so lookups stay O(1)-ish instead of scanning the whole bucket.
+SHARES_DIR = "/tmp/shares" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "shares")  # nosec B108
+SHARES_S3_PREFIX = "shares/"  # shares/{email}/{twin_id}.json
+PUBLIC_SHARE_REQUESTS_DIR = "/tmp/public_share_requests" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "public_share_requests")  # nosec B108
+PUBLIC_SHARE_REQUESTS_S3_PREFIX = "public_share_requests/"  # public_share_requests/{twin_id}.json
+FEATURED_DIR = "/tmp/featured" if _IN_LAMBDA else os.path.join(os.path.dirname(__file__), "featured")  # nosec B108
+FEATURED_S3_PREFIX = "featured/"  # featured/{twin_id}.json — marker that a twin is community-featured
+
 _TWIN_ID_RE = re.compile(r'^[a-f0-9]{32}$')
+_EMAIL_RE_FULL = re.compile(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
 
 # ── Connect-to-creator notifications (AWS SES — no passwords, uses IAM role) ──
 _SES_FROM_EMAIL = os.getenv("SES_FROM_EMAIL", "").strip()
@@ -723,6 +734,34 @@ async def get_current_user_id(
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
     return user_id
+
+
+async def get_current_user_email(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> str:
+    """Strict auth — raises 401 if token is missing/invalid, 400 if the token's
+    Clerk account has no email claim (shouldn't happen in practice, but the
+    sharing feature depends on it)."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    _user_id, email = await _decode_user_claims(credentials)
+    if not _user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not email:
+        raise HTTPException(status_code=400, detail="Account has no email on file")
+    return _normalize_email(email)
+
+
+async def get_current_admin_email(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> str:
+    """Admin-only endpoints: reuses ADMIN_EMAILS (already the SES notification
+    destination list) as the authorization source, rather than introducing a
+    separate role system for what is, today, a single-admin app."""
+    email = await get_current_user_email(credentials)
+    if email not in {e.lower() for e in _ADMIN_EMAILS}:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return email
 
 # Expected keys for the personality model returned by /create-twin
 _PERSONALITY_MODEL_KEYS = {
@@ -1557,31 +1596,44 @@ async def get_twin(twin_id: str):
     }
 
 
+def _public_persona_summary(p: dict) -> dict:
+    return {
+        "twin_id": p["twin_id"],
+        "persona_id": p.get("persona_id"),
+        "name": p["name"],
+        "title": p.get("title", ""),
+        "tagline": p.get("tagline", ""),
+        "era": p.get("era", ""),
+        "image_url": p.get("image_url"),
+        "personality_summary": p.get("personality_model", {}).get("personality_summary", ""),
+        "chat_url": f"/twin?id={p['twin_id']}",
+    }
+
+
 @app.get("/public-personas")
 async def list_public_personas():
-    """Return the list of built-in public personas available to all users."""
-    return {
-        "personas": [
-            {
-                "twin_id": p["twin_id"],
-                "persona_id": p.get("persona_id"),
-                "name": p["name"],
-                "title": p.get("title", ""),
-                "tagline": p.get("tagline", ""),
-                "era": p.get("era", ""),
-                "image_url": p.get("image_url"),
-                "personality_summary": p.get("personality_model", {}).get("personality_summary", ""),
-                "chat_url": f"/twin?id={p['twin_id']}",
-            }
-            for p in sorted(
-                _PUBLIC_PERSONAS.values(),
-                key=lambda persona: (
-                    str(persona.get("persona_id") or ""),
-                    str(persona.get("name") or ""),
-                ),
-            )
-        ]
-    }
+    """Return the built-in public personas plus any user-created twin that has
+    been approved for public featuring (see /twin/{id}/request-public and
+    /admin/public-personas/{id}/approve)."""
+    built_in = [
+        _public_persona_summary(p)
+        for p in sorted(
+            _PUBLIC_PERSONAS.values(),
+            key=lambda persona: (
+                str(persona.get("persona_id") or ""),
+                str(persona.get("name") or ""),
+            ),
+        )
+    ]
+    featured_markers = _small_object_list(FEATURED_S3_PREFIX, FEATURED_DIR)
+    featured = []
+    for marker in featured_markers:
+        twin_data = load_twin(marker.get("twin_id", ""))
+        if twin_data and twin_data.get("public_share_status") == "approved":
+            summary = _public_persona_summary(twin_data)
+            summary["persona_id"] = summary["persona_id"] or twin_data["twin_id"]
+            featured.append(summary)
+    return {"personas": built_in + featured}
 
 
 @app.get("/users/me/twins")
@@ -1632,6 +1684,192 @@ async def list_my_twins(user_id: str = Depends(get_current_user_id)):
                     continue
     twins.sort(key=lambda t: t["created_at"], reverse=True)
     return {"twins": twins}
+
+
+def _twin_summary(twin_data: dict) -> dict:
+    """Shared shape for a twin summary row — used by list_my_twins-adjacent
+    endpoints (shared-twins listing, share record snapshots)."""
+    return {
+        "twin_id": twin_data["twin_id"],
+        "name": twin_data["name"],
+        "title": twin_data.get("title", ""),
+        "archetype_display_name": twin_data.get("archetype_display_name"),
+        "created_at": twin_data.get("created_at", ""),
+        "chat_url": twin_data.get("chat_url", f"/twin?id={twin_data['twin_id']}"),
+    }
+
+
+@app.delete("/twin/{twin_id}")
+async def delete_twin(twin_id: str, user_id: str = Depends(get_current_user_id)):
+    """Delete a twin the caller owns. Also revokes any outstanding shares and
+    withdraws a pending/approved public-share so no dangling references to a
+    now-deleted twin remain in the shares/public_share_requests/featured indexes."""
+    twin_data = load_twin(twin_id)
+    if not twin_data or twin_data.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    for email in twin_data.get("shared_with", []):
+        _small_object_delete(SHARES_S3_PREFIX, SHARES_DIR, f"{email}/{twin_id}.json")
+    _small_object_delete(PUBLIC_SHARE_REQUESTS_S3_PREFIX, PUBLIC_SHARE_REQUESTS_DIR, f"{twin_id}.json")
+    _small_object_delete(FEATURED_S3_PREFIX, FEATURED_DIR, f"{twin_id}.json")
+
+    _delete_twin_storage(twin_id, user_id)
+    return {"status": "deleted", "twin_id": twin_id}
+
+
+@app.get("/users/me/shared-twins")
+async def list_shared_twins(email: str = Depends(get_current_user_email)):
+    """List twins that have been shared with the caller's account email."""
+    records = _small_object_list(SHARES_S3_PREFIX, SHARES_DIR, sub_prefix=f"{email}/")
+    records.sort(key=lambda r: r.get("shared_at", ""), reverse=True)
+    return {"twins": records}
+
+
+class ShareTwinRequest(BaseModel):
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def email_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not _EMAIL_RE_FULL.match(v):
+            raise ValueError("Invalid email address")
+        return v
+
+
+@app.post("/twin/{twin_id}/share")
+async def share_twin(
+    twin_id: str,
+    request: ShareTwinRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Share a twin the caller owns with another user by email. That user
+    will see it under /users/me/shared-twins once they sign in — no
+    invitation/acceptance step, matching the "just works when they log in"
+    behavior asked for."""
+    twin_data = load_twin(twin_id)
+    if not twin_data or twin_data.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    email = _normalize_email(request.email)
+    shared_with = list(twin_data.get("shared_with", []))
+    if email not in shared_with:
+        shared_with.append(email)
+        twin_data["shared_with"] = shared_with
+        _save_twin(twin_id, user_id, twin_data)
+
+    record = _twin_summary(twin_data)
+    record["shared_at"] = datetime.now().isoformat()
+    record["shared_by"] = user_id
+    _small_object_put(SHARES_S3_PREFIX, SHARES_DIR, f"{email}/{twin_id}.json", record)
+    return {"status": "shared", "twin_id": twin_id, "email": email, "shared_with": shared_with}
+
+
+@app.delete("/twin/{twin_id}/share")
+async def unshare_twin(
+    twin_id: str,
+    request: ShareTwinRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Revoke a twin share."""
+    twin_data = load_twin(twin_id)
+    if not twin_data or twin_data.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    email = _normalize_email(request.email)
+    shared_with = [e for e in twin_data.get("shared_with", []) if e != email]
+    twin_data["shared_with"] = shared_with
+    _save_twin(twin_id, user_id, twin_data)
+    _small_object_delete(SHARES_S3_PREFIX, SHARES_DIR, f"{email}/{twin_id}.json")
+    return {"status": "unshared", "twin_id": twin_id, "email": email, "shared_with": shared_with}
+
+
+@app.post("/twin/{twin_id}/request-public")
+async def request_public_feature(twin_id: str, user_id: str = Depends(get_current_user_id)):
+    """Request that a twin the caller owns be featured on the public homepage.
+    Takes effect only once an admin approves it via /admin/public-personas/{id}/approve -
+    this just files the request and notifies the admin."""
+    twin_data = load_twin(twin_id)
+    if not twin_data or twin_data.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Twin not found")
+    if twin_data.get("public_share_status") == "pending":
+        return {"status": "pending", "twin_id": twin_id}
+    if twin_data.get("public_share_status") == "approved":
+        return {"status": "approved", "twin_id": twin_id}
+
+    twin_data["public_share_status"] = "pending"
+    _save_twin(twin_id, user_id, twin_data)
+
+    record = _twin_summary(twin_data)
+    record["requested_by"] = user_id
+    record["requested_at"] = datetime.now().isoformat()
+    _small_object_put(PUBLIC_SHARE_REQUESTS_S3_PREFIX, PUBLIC_SHARE_REQUESTS_DIR, f"{twin_id}.json", record)
+
+    if _ses_client and _ADMIN_EMAILS:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    _ses_client.send_email,
+                    Source=_SES_FROM_EMAIL,
+                    Destination={"ToAddresses": _ADMIN_EMAILS},
+                    Message={
+                        "Subject": {"Data": f"[Personas] Public-feature request: {twin_data.get('name')}"},
+                        "Body": {"Text": {"Data": (
+                            f"{twin_data.get('name')} ({twin_data.get('title', '')}) has been requested "
+                            f"for public featuring.\n\nTwin ID: {twin_id}\nRequested by user: {user_id}\n\n"
+                            f"Review at /admin.\n"
+                        )}},
+                    },
+                ),
+                timeout=5.0,
+            )
+        except Exception as exc:
+            print(f"[notify] Failed to send public-feature request alert: {exc}")
+
+    return {"status": "pending", "twin_id": twin_id}
+
+
+@app.get("/admin/pending-public-personas")
+async def list_pending_public_personas(_admin_email: str = Depends(get_current_admin_email)):
+    records = _small_object_list(PUBLIC_SHARE_REQUESTS_S3_PREFIX, PUBLIC_SHARE_REQUESTS_DIR)
+    records.sort(key=lambda r: r.get("requested_at", ""))
+    return {"requests": records}
+
+
+@app.post("/admin/public-personas/{twin_id}/approve")
+async def approve_public_persona(twin_id: str, _admin_email: str = Depends(get_current_admin_email)):
+    twin_data = load_twin(twin_id)
+    if not twin_data:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    twin_data["public_share_status"] = "approved"
+    twin_data["is_public"] = True
+    owner_id = twin_data.get("user_id")
+    if owner_id:
+        _save_twin(twin_id, owner_id, twin_data)
+    else:
+        _save_twin_flat(twin_id, twin_data)
+
+    _small_object_delete(PUBLIC_SHARE_REQUESTS_S3_PREFIX, PUBLIC_SHARE_REQUESTS_DIR, f"{twin_id}.json")
+    _small_object_put(FEATURED_S3_PREFIX, FEATURED_DIR, f"{twin_id}.json", {"twin_id": twin_id, "approved_at": datetime.now().isoformat()})
+    return {"status": "approved", "twin_id": twin_id}
+
+
+@app.post("/admin/public-personas/{twin_id}/reject")
+async def reject_public_persona(twin_id: str, _admin_email: str = Depends(get_current_admin_email)):
+    twin_data = load_twin(twin_id)
+    if not twin_data:
+        raise HTTPException(status_code=404, detail="Twin not found")
+
+    twin_data["public_share_status"] = "rejected"
+    owner_id = twin_data.get("user_id")
+    if owner_id:
+        _save_twin(twin_id, owner_id, twin_data)
+    else:
+        _save_twin_flat(twin_id, twin_data)
+
+    _small_object_delete(PUBLIC_SHARE_REQUESTS_S3_PREFIX, PUBLIC_SHARE_REQUESTS_DIR, f"{twin_id}.json")
+    return {"status": "rejected", "twin_id": twin_id}
 
 
 def synthesize_personality_model(
@@ -1919,6 +2157,87 @@ def _save_twin_flat(twin_id: str, twin_data: dict) -> None:
         os.makedirs(TWINS_DIR, exist_ok=True)
         with open(os.path.join(TWINS_DIR, f"{twin_id}.json"), "w") as f:
             json.dump(twin_data, f, indent=2)
+
+
+def _delete_twin_storage(twin_id: str, user_id: str) -> None:
+    """Delete both S3 keys (flat + per-user) or the local file for a twin."""
+    if USE_S3:
+        for key in (
+            f"{TWINS_S3_PREFIX}{twin_id}.json",
+            f"{TWINS_S3_PREFIX}{user_id}/{twin_id}.json",
+        ):
+            try:
+                s3_client.delete_object(Bucket=S3_BUCKET, Key=key)
+            except ClientError as e:
+                print(f"Warning: failed to delete {key}: {e}")
+    else:
+        path = os.path.join(TWINS_DIR, f"{twin_id}.json")
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _small_object_put(prefix: str, local_dir: str, subpath: str, data: dict) -> None:
+    """Write a small JSON marker/record object — shares, public-share requests,
+    featured markers. Mirrors _save_twin_flat's S3-vs-local branching."""
+    payload = json.dumps(data, indent=2)
+    if USE_S3:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=f"{prefix}{subpath}",
+            Body=payload,
+            ContentType="application/json",
+        )
+    else:
+        full_path = os.path.join(local_dir, subpath)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w") as f:
+            f.write(payload)
+
+
+def _small_object_delete(prefix: str, local_dir: str, subpath: str) -> None:
+    if USE_S3:
+        try:
+            s3_client.delete_object(Bucket=S3_BUCKET, Key=f"{prefix}{subpath}")
+        except ClientError as e:
+            print(f"Warning: failed to delete {prefix}{subpath}: {e}")
+    else:
+        full_path = os.path.join(local_dir, subpath)
+        if os.path.exists(full_path):
+            os.remove(full_path)
+
+
+def _small_object_list(prefix: str, local_dir: str, sub_prefix: str = "") -> List[dict]:
+    """List and parse all JSON objects under prefix + sub_prefix. Used for
+    scoped listings (shares for one recipient email) and small unscoped
+    listings (all pending public-share requests, all featured personas) —
+    all expected to be low-volume, so a full listing under the prefix is fine."""
+    results: List[dict] = []
+    if USE_S3:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{prefix}{sub_prefix}"):
+            for obj in page.get("Contents", []):
+                try:
+                    resp = s3_client.get_object(Bucket=S3_BUCKET, Key=obj["Key"])
+                    results.append(json.loads(resp["Body"].read()))
+                except Exception as e:
+                    print(f"Warning: could not read {obj['Key']}: {e}")
+    else:
+        scan_dir = os.path.join(local_dir, sub_prefix)
+        if os.path.isdir(scan_dir):
+            for root, _dirs, files in os.walk(scan_dir):
+                for fname in files:
+                    if not fname.endswith(".json"):
+                        continue
+                    try:
+                        with open(os.path.join(root, fname)) as f:
+                            results.append(json.load(f))
+                    except Exception as e:
+                        print(f"Warning: could not read {fname}: {e}")
+    return results
+
+
+def _normalize_email(email: str) -> str:
+    return email.strip().lower()
 
 
 def _is_gap_worthy(orchestration: dict) -> bool:
