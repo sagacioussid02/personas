@@ -3114,15 +3114,16 @@ def _is_field_thin(personality_model: dict, field: str, min_items: int = 2) -> b
 def _select_deepen_topics(
     twin_data: dict, covered: List[str], limit: int = _MAX_DEEPEN_TOPICS_PER_SESSION
 ) -> List[Dict[str, Any]]:
-    """Priority chain: gap ledger -> thin personality_model fields -> evergreen
-    fallback bank. Returns up to `limit` topics not already in `covered` and
-    not otherwise already answered (evergreen/thin-field topics re-check
-    their underlying field's actual state, not just `covered`, so this is
-    self-correcting across sessions rather than relying on the caller to
-    track it). A twin with nothing left across all three tiers returns [] —
-    this never writes a permanent "fully deepened" marker; the next call
-    simply recomputes against whatever's changed since (new gaps, edited
-    fields, etc.)."""
+    """Priority chain: gap ledger -> research-agent candidates -> thin
+    personality_model fields -> evergreen fallback bank. Returns up to
+    `limit` topics not already in `covered` and not otherwise already
+    answered (evergreen/thin-field topics re-check their underlying field's
+    actual state, not just `covered`, so this is self-correcting across
+    sessions rather than relying on the caller to track it). A twin with
+    nothing left across all four tiers returns [] — this never writes a
+    permanent "fully deepened" marker; the next call simply recomputes
+    against whatever's changed since (new gaps, edited fields, a fresh
+    research-agent pass, etc.)."""
     pm = twin_data.get("personality_model", {}) or {}
     ctx = pm.get("_context", {}) if isinstance(pm, dict) else {}
     covered_set = set(covered)
@@ -3151,6 +3152,23 @@ def _select_deepen_topics(
             ),
             "target_fields": _GAP_TOPIC_DEFAULT_TARGET_FIELDS,
         })
+
+    if len(selected) < limit:
+        # Novel angles proposed by the periodic research agent (see
+        # run_research_agent) — curated, persona-specific questions beyond
+        # the fixed taxonomy below. Consumed (removed) once answered and
+        # saved, via _consume_research_candidates.
+        for candidate in (twin_data.get("research_candidate_topics") or []):
+            if len(selected) >= limit:
+                break
+            topic_id = candidate.get("id", "")
+            if not topic_id or topic_id in covered_set:
+                continue
+            selected.append({
+                "id": topic_id,
+                "question_hint": candidate.get("question_hint", ""),
+                "target_fields": candidate.get("target_fields") or _GAP_TOPIC_DEFAULT_TARGET_FIELDS,
+            })
 
     if len(selected) < limit:
         for topic_id, meta in _THIN_FIELD_DEEPEN_TOPICS.items():
@@ -3183,8 +3201,11 @@ def _select_deepen_topics(
     return selected
 
 
-def _target_fields_for_topics(topic_ids: List[str]) -> List[str]:
+def _target_fields_for_topics(topic_ids: List[str], twin_data: Optional[dict] = None) -> List[str]:
     fields: set[str] = set()
+    research_candidates = {
+        c["id"]: c for c in (twin_data.get("research_candidate_topics") or [])
+    } if twin_data else {}
     for tid in topic_ids:
         if tid in _EVERGREEN_DEEPEN_TOPICS:
             fields.update(_EVERGREEN_DEEPEN_TOPICS[tid]["target_fields"])
@@ -3192,6 +3213,8 @@ def _target_fields_for_topics(topic_ids: List[str]) -> List[str]:
             fields.update(_THIN_FIELD_DEEPEN_TOPICS[tid]["target_fields"])
         elif tid.startswith("GAP:"):
             fields.update(_GAP_TOPIC_DEFAULT_TARGET_FIELDS)
+        elif tid.startswith("RESEARCH:") and tid in research_candidates:
+            fields.update(research_candidates[tid].get("target_fields") or _GAP_TOPIC_DEFAULT_TARGET_FIELDS)
     return sorted(fields) if fields else list(_GAP_TOPIC_DEFAULT_TARGET_FIELDS)
 
 
@@ -3210,6 +3233,185 @@ def _decay_addressed_gaps(twin_data: dict, addressed_topic_ids: List[str]) -> No
         tags_key = tuple(sorted(gap.get("topic_tags", [])))
         if tags_key in addressed_tag_sets:
             gap["count"] = 0
+
+
+def _consume_research_candidates(twin_data: dict, addressed_topic_ids: List[str]) -> None:
+    """Remove a research-agent candidate topic once it's been answered and
+    saved, so it doesn't linger in the backlog alongside the now-real data."""
+    addressed = {tid for tid in addressed_topic_ids if tid.startswith("RESEARCH:")}
+    if not addressed:
+        return
+    candidates = twin_data.get("research_candidate_topics") or []
+    twin_data["research_candidate_topics"] = [c for c in candidates if c.get("id") not in addressed]
+
+
+# ── Research agent (periodic, not per-request) ──────────────────────────────
+# Analyzes a twin's full profile and proposes novel deepen-interview angles
+# beyond the fixed taxonomy above — the "what haven't we thought to ask"
+# half of the deepen redesign, run on a schedule (see run_research_agent_batch
+# and the twice-monthly EventBridge Scheduler in terraform) rather than on
+# every chat/deepen request, since it's exploratory and doesn't need to be
+# fresh turn-to-turn.
+_MAX_RESEARCH_CANDIDATE_TOPICS = 15
+
+_RESEARCH_AGENT_PROMPT_TEMPLATE = """You are a research strategist helping build the most complete, \
+accurate AI twin possible for {name}{title_suffix}.
+
+You MUST propose exactly 3 to 5 new interview angles, even if the current profile looks reasonably \
+complete — there is always something more specific or surprising worth exploring for a real person. \
+Do not return an empty list under any circumstance.
+
+Study everything captured about them so far:
+{personality_model_json}
+
+RECENT KNOWLEDGE GAPS (topics people have asked the twin about where its answers were weak):
+{knowledge_gaps_summary}
+
+ALREADY-PROPOSED CANDIDATE TOPICS (do not repeat these or anything substantially similar):
+{existing_candidates_summary}
+
+Propose angles that go beyond generic questions — tie each one to specifics already in the profile \
+above, not a template. Example of a GOOD angle for someone whose decision framework mentions weighing \
+team impact heavily: "Describe a time you had to choose between a teammate's growth opportunity and \
+hitting a deadline — what did you do?" Example of a BAD angle (too generic, don't do this): "What are \
+your values?"
+
+Return ONLY a valid JSON array, no markdown, no other text:
+[
+  {{"question_hint": "a natural, specific interview question", "target_fields": ["personality_model field(s) this would sharpen"], "rationale": "one sentence on why this angle matters for this specific person"}}
+]
+"""
+
+
+async def run_research_agent(twin_id: str) -> int:
+    """Analyze one twin and append new candidate deepen topics. Returns the
+    number of candidates added (0 if the twin already has a healthy backlog,
+    the model call failed, or nothing usable was returned — all non-fatal,
+    since this always runs as part of a best-effort batch, never inline in a
+    user-facing request)."""
+    twin_data = load_twin(twin_id)
+    if not twin_data:
+        return 0
+    pm = twin_data.get("personality_model", {})
+    if not isinstance(pm, dict) or not pm:
+        return 0
+
+    existing_candidates = list(twin_data.get("research_candidate_topics") or [])
+    if len(existing_candidates) >= _MAX_RESEARCH_CANDIDATE_TOPICS:
+        return 0
+
+    gaps = twin_data.get("knowledge_gaps") or []
+    gaps_summary = "\n".join(
+        f"- {', '.join(g.get('topic_tags', []))} (asked {g.get('count', 0)}x)"
+        for g in sorted(gaps, key=lambda g: int(g.get("count", 0)), reverse=True)[:10]
+    ) or "None recorded."
+
+    existing_summary = "\n".join(f"- {c.get('question_hint', '')}" for c in existing_candidates) or "None yet."
+
+    # _context holds raw onboarding/deepen answer text, often long — excluded
+    # to keep the prompt focused on the synthesized model itself.
+    pm_for_prompt = {k: v for k, v in pm.items() if k != "_context"}
+    title = twin_data.get("title", "")
+
+    prompt_text = _RESEARCH_AGENT_PROMPT_TEMPLATE.format(
+        name=twin_data.get("name", "this person"),
+        title_suffix=f" ({title})" if title else "",
+        personality_model_json=json.dumps(pm_for_prompt, indent=2)[:6000],
+        knowledge_gaps_summary=gaps_summary,
+        existing_candidates_summary=existing_summary,
+    )
+
+    try:
+        response = await asyncio.to_thread(
+            bedrock_client.converse,
+            modelId=BEDROCK_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": prompt_text}]}],
+            inferenceConfig={"maxTokens": 800, "temperature": 0.9, "topP": 0.95},
+        )
+        raw = response["output"]["message"]["content"][0]["text"].strip()
+        proposals = _extract_json_array(raw)
+    except Exception as exc:
+        print(f"[research-agent] Failed for twin {twin_id}: {exc}")
+        return 0
+
+    if not isinstance(proposals, list):
+        return 0
+
+    now = datetime.now().isoformat()
+    added = 0
+    for p in proposals:
+        if not isinstance(p, dict) or not p.get("question_hint"):
+            continue
+        existing_candidates.append({
+            "id": "RESEARCH:" + uuid.uuid4().hex[:12],
+            "question_hint": str(p["question_hint"])[:400],
+            "target_fields": (
+                [f for f in (p.get("target_fields") or []) if isinstance(f, str)]
+                or _GAP_TOPIC_DEFAULT_TARGET_FIELDS
+            ),
+            "rationale": str(p.get("rationale", ""))[:300],
+            "added_at": now,
+        })
+        added += 1
+
+    if added == 0:
+        return 0
+
+    if len(existing_candidates) > _MAX_RESEARCH_CANDIDATE_TOPICS:
+        existing_candidates = existing_candidates[-_MAX_RESEARCH_CANDIDATE_TOPICS:]
+
+    twin_data["research_candidate_topics"] = existing_candidates
+    owner_id = twin_data.get("user_id")
+    if owner_id:
+        _save_twin(twin_id, owner_id, twin_data)
+    else:
+        _save_twin_flat(twin_id, twin_data)
+
+    return added
+
+
+def _list_all_twin_ids() -> List[str]:
+    """Enumerate every twin record — user-created twins plus the migrated
+    default twin, whichever storage backend is active. Built-in public
+    personas (Gandhi et al.) are static files, not S3/local twin records, so
+    they never appear here — nothing to research-agent for those anyway."""
+    if USE_S3:
+        ids = []
+        paginator = s3_client.get_paginator("list_objects_v2")
+        # Delimiter="/" returns only the flat twins/{twin_id}.json keys in
+        # Contents, treating twins/{user_id}/ as a "folder" collapsed into
+        # CommonPrefixes (ignored) — avoids double-counting each twin via its
+        # per-user listing copy.
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=TWINS_S3_PREFIX, Delimiter="/"):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.startswith(TWINS_S3_PREFIX) and key.endswith(".json"):
+                    ids.append(key[len(TWINS_S3_PREFIX):-len(".json")])
+        return ids
+    twins_path = Path(TWINS_DIR)
+    if not twins_path.exists():
+        return []
+    return [f.stem for f in twins_path.glob("*.json")]
+
+
+async def run_research_agent_batch() -> dict:
+    """Run the research agent for every twin. Invoked on a schedule (twice
+    monthly — see terraform's aws_scheduler_schedule), not per-request, since
+    this is exploratory analysis that doesn't need to be fresh turn-to-turn.
+    Each twin is isolated in its own try/except so one bad twin record can't
+    abort the batch."""
+    twin_ids = _list_all_twin_ids()
+    total_added = 0
+    failures = 0
+    for twin_id in twin_ids:
+        try:
+            total_added += await run_research_agent(twin_id)
+        except Exception as exc:
+            failures += 1
+            print(f"[research-agent-batch] Failed for twin {twin_id}: {exc}")
+    result = {"twins_processed": len(twin_ids), "candidates_added": total_added, "failures": failures}
+    print(f"[research-agent-batch] {result}")
+    return result
 
 
 def _append_model_version(twin_data: dict, model_snapshot: dict, trigger: str) -> None:
@@ -3289,7 +3491,7 @@ async def _patch_personality_model(twin_data: dict, ctx: dict, addressed_topic_i
     fields into the existing model — everything else is left byte-for-byte
     unchanged, unlike the old full-model regeneration."""
     existing_model = twin_data.get("personality_model", {})
-    target_fields = _target_fields_for_topics(addressed_topic_ids)
+    target_fields = _target_fields_for_topics(addressed_topic_ids, twin_data)
 
     new_data_lines = []
     if ctx.get("pastDecisions"):
@@ -3416,6 +3618,7 @@ async def _deepen_and_save(
     )
 
     _decay_addressed_gaps(twin_data, addressed_topic_ids)
+    _consume_research_candidates(twin_data, addressed_topic_ids)
 
     # Snapshot before mutating — on a twin's very first deepen update, this
     # also seeds version 1 (the origin) with the pre-deepen model.
