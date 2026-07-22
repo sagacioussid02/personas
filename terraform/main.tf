@@ -648,3 +648,57 @@ resource "aws_apigatewayv2_route" "post_admin_reject_public_persona" {
   route_key = "POST /admin/public-personas/{twin_id}/reject"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
+
+# ── Research agent scheduler ─────────────────────────────────────────────────
+# Twice-monthly (1st and 15th) direct Lambda invocation — bypasses API Gateway
+# entirely, since this isn't an HTTP request. lambda_handler.py checks the
+# event payload for {"task": "run_research_agent_batch"} before falling
+# through to the normal Mangum/FastAPI path, so this can never collide with a
+# real API Gateway request (which never carries that key).
+resource "aws_iam_role" "scheduler" {
+  name = "${local.name_prefix}-research-agent-scheduler-role"
+  tags = local.common_tags
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "scheduler.amazonaws.com"
+        }
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "scheduler_invoke_lambda" {
+  name = "${local.name_prefix}-research-agent-scheduler-invoke"
+  role = aws_iam_role.scheduler.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "lambda:InvokeFunction"
+        Resource = aws_lambda_function.api.arn
+      }
+    ]
+  })
+}
+
+resource "aws_scheduler_schedule" "research_agent" {
+  name                = "${local.name_prefix}-research-agent"
+  schedule_expression = "cron(0 9 1,15 * ? *)" # 09:00 UTC on the 1st and 15th of each month
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = aws_lambda_function.api.arn
+    role_arn = aws_iam_role.scheduler.arn
+    input    = jsonencode({ task = "run_research_agent_batch" })
+  }
+}
