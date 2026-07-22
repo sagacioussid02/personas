@@ -2950,44 +2950,68 @@ async def onboard_message(
         raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
 
 
-_DEEPEN_SYSTEM_TEMPLATE = """\
-You are helping someone deepen their AI twin. They already built a basic version; now you're \
+_DEEPEN_TOPIC_SYSTEM_TEMPLATE = """\
+You are interviewing someone to deepen one specific trait of their AI twin's personality model — \
 uncovering the nuance that makes reasoning feel real instead of generic.
 
-Your job: ask one focused question per turn, working through the topics below. Skip any already \
-covered. Adapt each hint into your own natural phrasing — don't read it verbatim.
+CURRENT TOPIC: {topic_hint}
 
-TOPICS TO COVER THIS SESSION (priority order):
-{topics_block}
-
-RULES — follow exactly:
-- One question per turn. 2-4 sentences max. Be direct and warm.
-- CRITICAL: Every message MUST end with a question, except the final closing when done is true.
-- If an answer is too vague, push back once with a concrete prompt ("Can you give me a specific \
-example?"), then accept whatever they say.
-- After a rich answer, acknowledge in one short phrase and immediately ask about the next topic.
-- When every topic listed above is covered, close naturally and set done to true.
-- Never sound like a form — no "Question 1 of 3", no "Moving on to".
-
-CURRENT STATE:
-Topic IDs remaining this session: {topic_ids_remaining}
 Existing twin context (for reference — do NOT repeat back to them):
 {existing_context}
 
+Your job this turn:
+- If there's no prior conversation on this topic yet, ask an engaging opening question based on the \
+topic above — adapt it into your own natural phrasing, don't read it verbatim.
+- Otherwise, ask ONE natural, specific follow-up that would surface something concrete you don't have \
+yet. Don't repeat a question you already asked. Push for specifics over platitudes.
+- Do NOT judge or acknowledge whether the answer is "enough" — a separate process decides that. Just \
+keep the conversation moving forward with a good next question, as if you don't yet know whether \
+you'll need to ask more.
+- Extract the user's actual answer content from their latest message into "answer_delta" — their \
+words/content, not your own questions. Leave it empty if there's no new user answer yet (e.g. this \
+is the opening question).
+- 2-4 sentences max. Be direct and warm. Never sound like a form ("Question 1 of 3").
+
 RETURN ONLY valid JSON — no markdown, no text outside the JSON:
 {{
-  "message": "your question or closing as natural prose",
-  "field_updates": {{
-    "pastDecisions": "only if the PAST_DECISIONS topic is in this session and answered — omit otherwise",
-    "nonNegotiables": "only if NON_NEGOTIABLES is in this session and answered — omit otherwise",
-    "softPreferences": "what they'd compromise on, if mentioned — omit otherwise",
-    "mindChange": "only if MIND_CHANGE is in this session and answered — omit otherwise",
-    "topicAnswer": "for any GAP:* or FIELD:* topic — the raw synthesized answer content — omit if not applicable this message"
-  }},
-  "topics_covered": ["<topic id from the list above that this message's answer addressed>"],
-  "done": false
+  "message": "your question, as natural prose",
+  "answer_delta": "the user's new answer content this turn, or empty string"
 }}
 """
+
+_DEEPEN_CRITIC_MODEL_ID = "amazon.nova-micro-v1:0"
+_DEEPEN_CRITIC_PROMPT = (
+    "You are judging whether an interview answer is specific and concrete enough to meaningfully "
+    "update someone's personality profile, as opposed to vague, generic, or incomplete.\n\n"
+    "Topic being explored: {topic_hint}\n\n"
+    "Accumulated answer so far:\n{answer}\n\n"
+    "Reply in exactly this format: YES|<one-sentence reason> or NO|<what's still missing>"
+)
+
+
+async def _judge_topic_sufficiency(topic_hint: str, answer: str) -> tuple[bool, str]:
+    """Cheap-model critic call deciding whether the accumulated answer for the
+    current deepen topic is concrete enough to save, or needs another
+    follow-up. Short-circuits on trivially-empty answers to avoid a wasted
+    Bedrock call on the topic's opening turn."""
+    if not answer or len(answer.strip()) < 15:
+        return False, "No substantive answer yet."
+    try:
+        response = await asyncio.to_thread(
+            bedrock_client.converse,
+            modelId=_DEEPEN_CRITIC_MODEL_ID,
+            messages=[{"role": "user", "content": [
+                {"text": _DEEPEN_CRITIC_PROMPT.format(topic_hint=topic_hint, answer=answer)}
+            ]}],
+            inferenceConfig={"maxTokens": 60, "temperature": 0},
+        )
+        text = response["output"]["message"]["content"][0]["text"].strip()
+        is_sufficient = text.upper().startswith("YES")
+        reason = text.split("|", 1)[1].strip() if "|" in text else ""
+        return is_sufficient, reason
+    except Exception as exc:
+        print(f"[deepen] Critic judgment failed, defaulting to insufficient: {exc}")
+        return False, ""
 
 # ── Deepen topic library ──────────────────────────────────────────────────
 # Static topics (evergreen fallback + thin-field prompts) with known question
@@ -3034,6 +3058,39 @@ _THIN_FIELD_DEEPEN_TOPICS: Dict[str, Dict[str, Any]] = {
         ),
         "target_fields": ["characteristic_quotes"],
         "min_items": 2,
+    },
+    "FIELD:core_values": {
+        "question_hint": (
+            "What 3-5 values genuinely drive your decisions — not aspirational ones, "
+            "ones you actually act on when it's inconvenient to?"
+        ),
+        "target_fields": ["core_values"],
+        "min_items": 3,
+    },
+    "FIELD:what_they_optimize_for": {
+        "question_hint": "When you're weighing a real tradeoff, what are you actually optimizing for?",
+        "target_fields": ["what_they_optimize_for"],
+        "min_items": 3,
+    },
+    "FIELD:what_they_avoid": {
+        "question_hint": "What do you actively steer away from in how you work or decide things?",
+        "target_fields": ["what_they_avoid"],
+        "min_items": 3,
+    },
+    "FIELD:communication_traits": {
+        "question_hint": "How would people who've worked closely with you describe the way you communicate?",
+        "target_fields": ["communication_traits"],
+        "min_items": 3,
+    },
+    "FIELD:blind_spots": {
+        "question_hint": "What's a blind spot or weakness you're aware of in how you work or decide things?",
+        "target_fields": ["blind_spots"],
+        "min_items": 2,
+    },
+    "FIELD:risk_profile": {
+        "question_hint": "How do you actually behave under risk or uncertainty — cautious, calculated, or comfortable with ambiguity?",
+        "target_fields": ["risk_profile"],
+        "min_items": 1,
     },
 }
 
@@ -3197,54 +3254,33 @@ class DeepenHistoryItem(BaseModel):
     content: str
 
 
-class DeepenFieldUpdates(BaseModel):
-    pastDecisions: Optional[str] = None
-    nonNegotiables: Optional[str] = None
-    softPreferences: Optional[str] = None
-    mindChange: Optional[str] = None
-    # Raw answer content for GAP:*/FIELD:* topics, which don't map to one of
-    # the four named fields above.
-    topicAnswer: Optional[str] = None
-
-    model_config = {"extra": "ignore"}
-
-
 class DeepenRequest(BaseModel):
     history: List[DeepenHistoryItem] = Field(default_factory=list)
-    topics_covered: List[str] = Field(default_factory=list)
-    fields_collected: Optional[Dict[str, Any]] = None
+    # Accumulated raw answer text for whatever topic the previous response's
+    # topic_id was about — echoed back so the endpoint can keep building on it
+    # across turns until the critic judges it sufficient. Reset to "" by the
+    # frontend whenever a response comes back with a different topic_id (or
+    # topic_just_saved=true) signaling the topic changed.
+    topic_answer_so_far: str = ""
 
     model_config = {"extra": "ignore"}
 
 
 class DeepenResponse(BaseModel):
     message: str
-    field_updates: DeepenFieldUpdates = Field(default_factory=DeepenFieldUpdates)
-    topics_covered: List[str] = Field(default_factory=list)
+    topic_id: Optional[str] = None
+    topic_question_hint: Optional[str] = None
+    topic_answer_so_far: str = ""
+    topic_just_saved: bool = False
+    topics_remaining_estimate: int = 0
     done: bool = False
 
     model_config = {"extra": "ignore"}
 
-    @field_validator("field_updates", mode="before")
+    @field_validator("done", "topic_just_saved", mode="before")
     @classmethod
-    def _coerce_field_updates(cls, v: Any) -> Any:
-        if not isinstance(v, dict):
-            return {}
-        return v
-
-    @field_validator("topics_covered", mode="before")
-    @classmethod
-    def _coerce_topics_covered(cls, v: Any) -> Any:
-        if not isinstance(v, list):
-            return []
-        return [item for item in v if isinstance(item, str)]
-
-    @field_validator("done", mode="before")
-    @classmethod
-    def _coerce_done(cls, v: Any) -> Any:
-        if isinstance(v, bool):
-            return v
-        return False
+    def _coerce_bool(cls, v: Any) -> Any:
+        return v if isinstance(v, bool) else False
 
 
 async def _patch_personality_model(twin_data: dict, ctx: dict, addressed_topic_ids: List[str]) -> None:
@@ -3401,7 +3437,7 @@ async def _deepen_and_save(
         raise
 
 
-@app.post("/twin/{twin_id}/deepen/message")
+@app.post("/twin/{twin_id}/deepen/message", response_model=DeepenResponse)
 async def deepen_message(
     twin_id: str,
     request: DeepenRequest,
@@ -3409,37 +3445,53 @@ async def deepen_message(
 ):
     """Run one turn of the deepen interview for a twin the caller owns.
 
-    Topic selection is gap-driven (see openspec/changes/generative-deepen-interview):
-    unresolved knowledge-gap ledger entries first, then thin personality_model
-    fields, then the original evergreen questions as a cold-start fallback.
-    A session ending (done=true) never permanently closes the twin to future
-    deepening — _select_deepen_topics recomputes against current state every
-    call, so a twin can always be deepened again once new gaps or thin fields
-    exist.
+    Single-topic focused: instead of offering a batch of topics and waiting
+    until an entire session is "done" to save anything, each call focuses on
+    exactly one topic (_select_deepen_topics()[0]) and keeps following up on
+    it — via a separate critic judgment (_judge_topic_sufficiency) — until the
+    accumulated answer is judged concrete enough. The moment that happens, the
+    field is patched and saved immediately (_deepen_and_save), before moving
+    to the next topic. This means navigating away mid-session only loses
+    progress on whatever topic is currently in flight, not everything covered
+    so far — and because saved topics stop being thin/gapped, they're
+    naturally never re-offered on a later call without needing any separate
+    "already covered" ledger.
+
+    Topic selection is gap-driven and covers the whole personality model, not
+    a fixed list (see openspec/changes/generative-deepen-interview and the
+    broadened _THIN_FIELD_DEEPEN_TOPICS). A session ending (done=true) never
+    permanently closes the twin to future deepening — recomputed fresh every
+    call, so a twin can always be deepened again once new gaps, thin fields,
+    or research-agent candidate topics exist.
     """
     twin_data = load_twin(twin_id)
     if not twin_data or twin_data.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Twin not found")
 
-    covered = list(request.topics_covered)
     pm = twin_data.get("personality_model", {})
     ctx_data = pm.get("_context", {}) if isinstance(pm, dict) else {}
 
-    remaining = _select_deepen_topics(twin_data, covered)
+    remaining = _select_deepen_topics(twin_data, [], limit=10)
 
     # If nothing is selectable right now, say so honestly without writing any
     # permanent "fully deepened" state — a future call (once new gaps or thin
-    # fields exist) will find something again.
+    # fields exist, or the twice-monthly research agent adds candidates) will
+    # find something again.
     if not remaining:
         return {
             "message": (
                 f"Nothing new to deepen for {twin_data.get('name', 'this twin')} right now — "
                 "check back after a few more conversations, or once there's new context to draw on."
             ),
-            "field_updates": {},
-            "topics_covered": covered,
+            "topic_id": None,
+            "topic_answer_so_far": "",
+            "topic_just_saved": False,
+            "topics_remaining_estimate": 0,
             "done": True,
         }
+
+    current_topic = remaining[0]
+    topics_remaining_estimate = len(remaining)
 
     ctx_lines = []
     if twin_data.get("name"):
@@ -3451,8 +3503,6 @@ async def deepen_message(
             ctx_lines.append(f"Personality: {pm['personality_summary']}")
         if pm.get("decision_framework"):
             ctx_lines.append(f"Decision framework: {pm['decision_framework']}")
-    # Include any depth data already captured so the LLM doesn't repeat those topics.
-    # Values are truncated to keep the system prompt concise.
     if isinstance(ctx_data, dict):
         if ctx_data.get("pastDecisions"):
             ctx_lines.append(f"Past decisions (already captured): {ctx_data['pastDecisions'][:300]}")
@@ -3462,12 +3512,8 @@ async def deepen_message(
             ctx_lines.append(f"Mind change (already captured): {ctx_data['mindChange'][:200]}")
     existing_context = "\n".join(ctx_lines) if ctx_lines else "No existing context."
 
-    topics_block = "\n".join(f"- {t['id']}: {t['question_hint']}" for t in remaining)
-    topic_ids_remaining = ", ".join(t["id"] for t in remaining)
-
-    system_prompt = _DEEPEN_SYSTEM_TEMPLATE.format(
-        topics_block=topics_block,
-        topic_ids_remaining=topic_ids_remaining,
+    system_prompt = _DEEPEN_TOPIC_SYSTEM_TEMPLATE.format(
+        topic_hint=current_topic["question_hint"],
         existing_context=existing_context,
     )
 
@@ -3479,19 +3525,17 @@ async def deepen_message(
             if item.role not in ("user", "assistant"):
                 raise HTTPException(status_code=400, detail=f"Invalid role: {item.role!r}")
             messages.append({"role": item.role, "content": [{"text": item.content}]})
-        # Bedrock requires the conversation to start with a user turn.
-        # When history only contains the bot's opening question (assistant), prepend
-        # the synthetic opener so the first message is always from "user".
         if messages and messages[0]["role"] != "user":
             messages.insert(0, {"role": "user", "content": [{"text": "hi, let's start"}]})
 
+    fallback_message = "Got it — let me keep going. Could you tell me more?"
     try:
         response = await asyncio.to_thread(
             bedrock_client.converse,
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=messages,
-            inferenceConfig={"maxTokens": 600, "temperature": 0.9, "topP": 0.95},
+            inferenceConfig={"maxTokens": 400, "temperature": 0.9, "topP": 0.95},
         )
         raw = response["output"]["message"]["content"][0]["text"].strip()
         data = _extract_json_object(raw, required_key="message")
@@ -3499,81 +3543,65 @@ async def deepen_message(
         if not isinstance(data, dict) or "message" not in data:
             raise ValueError("Invalid deepen JSON structure")
 
-        validated = DeepenResponse.model_validate(data)
-
-        # Only accept topic ids we actually offered this turn (plus whatever
-        # was already covered) — the LLM shouldn't be able to claim a topic
-        # id it made up. Cumulative across turns, like the old fixed-list logic.
-        request_topics = set(covered)
-        offered_ids = {t["id"] for t in remaining}
-        model_topics = set(validated.topics_covered or []) & (offered_ids | request_topics)
-        merged_topics_set = request_topics | model_topics
-        validated.topics_covered = sorted(merged_topics_set)
-        result = validated.model_dump(exclude_none=True)
-
-        # Guard: if the LLM covered everything offered this turn but forgot to
-        # set done=true, force it — re-checked via _select_deepen_topics (not
-        # a fixed list), so this stays correct as topics became dynamic.
-        still_remaining = _select_deepen_topics(twin_data, list(merged_topics_set))
-        if not still_remaining and not result.get("done"):
-            result["done"] = True
-
-        # If done, merge new fields and re-synthesize synchronously before returning
-        if result.get("done"):
-            all_fields = dict(request.fields_collected or {})
-            fu = validated.field_updates
-            for key in ("pastDecisions", "nonNegotiables", "softPreferences", "mindChange", "topicAnswer"):
-                val = getattr(fu, key, None)
-                if val:
-                    all_fields[key] = val
-            await _deepen_and_save(twin_id, user_id, twin_data, all_fields, list(merged_topics_set))
-
-        return result
+        reply_message = str(data.get("message") or fallback_message)
+        answer_delta = str(data.get("answer_delta") or "").strip()
 
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"Deepen JSON parse error: {exc!r}")
-        done_msg = "Got it — I've gathered enough to deepen your twin. Saving now."
-        cont_msg = "Got it — let me keep going. Could you tell me more?"
-
-        done_fallback = False
-        fallback_message = raw if "raw" in locals() else cont_msg
-
-        if "raw" in locals():
-            if raw.strip().startswith("{") or raw.strip().startswith("```"):
-                # Entire output looks like a JSON blob — substitute a canned message.
-                fallback_message = cont_msg
-            else:
-                last_brace = raw.rfind('{')
-                if last_brace > len(raw) // 2:
-                    try:
-                        fragment = json.loads(raw[last_brace:])
-                        if isinstance(fragment, dict) and "done" in fragment:
-                            if fragment.get("done") is True:
-                                done_fallback = True
-                            fallback_message = raw[:last_brace].strip()
-                    except json.JSONDecodeError:
-                        pass
-                if not fallback_message:
-                    fallback_message = done_msg if done_fallback else cont_msg
-
-        if done_fallback:
-            # In the fallback path JSON parsing failed, so we can't reliably extract
-            # field updates from the current turn.  Persist whatever the frontend has
-            # already accumulated across previous turns via request.fields_collected.
-            # Topic ids addressed are unknown here too, so patch/decay against
-            # whatever was already covered coming into this turn.
-            all_fields = dict(request.fields_collected or {})
-            await _deepen_and_save(twin_id, user_id, twin_data, all_fields, covered)
-
-        return {
-            "message": fallback_message,
-            "field_updates": {},
-            "topics_covered": covered,
-            "done": done_fallback,
-        }
+        reply_message = raw if "raw" in locals() and raw.strip() and not raw.strip().startswith("{") else fallback_message
+        answer_delta = ""
     except Exception as exc:
         print(f"Unexpected error in /twin/{{twin_id}}/deepen/message: {exc}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred. Please try again.")
+
+    accumulated_answer = (
+        (request.topic_answer_so_far.strip() + "\n" + answer_delta).strip()
+        if answer_delta else request.topic_answer_so_far.strip()
+    )
+
+    is_sufficient, _reason = await _judge_topic_sufficiency(current_topic["question_hint"], accumulated_answer)
+
+    if not is_sufficient:
+        return {
+            "message": reply_message,
+            "topic_id": current_topic["id"],
+            "topic_question_hint": current_topic["question_hint"],
+            "topic_answer_so_far": accumulated_answer,
+            "topic_just_saved": False,
+            "topics_remaining_estimate": topics_remaining_estimate,
+            "done": False,
+        }
+
+    # Sufficient — save this single topic's field(s) immediately rather than
+    # waiting for the whole session to end. This is the fix for the data-loss
+    # bug: whatever's saved here survives a navigate-away, refresh, or crash.
+    evergreen_meta = _EVERGREEN_DEEPEN_TOPICS.get(current_topic["id"])
+    field_key = evergreen_meta["field_update_key"] if evergreen_meta else "topicAnswer"
+    new_fields = {field_key: accumulated_answer}
+    await _deepen_and_save(twin_id, user_id, twin_data, new_fields, [current_topic["id"]])
+
+    next_remaining = _select_deepen_topics(twin_data, [], limit=10)
+    if next_remaining:
+        next_topic = next_remaining[0]
+        transition_message = f"Got it — that's genuinely useful.\n\n{next_topic['question_hint']}"
+        return {
+            "message": transition_message,
+            "topic_id": next_topic["id"],
+            "topic_question_hint": next_topic["question_hint"],
+            "topic_answer_so_far": "",
+            "topic_just_saved": True,
+            "topics_remaining_estimate": len(next_remaining),
+            "done": False,
+        }
+
+    return {
+        "message": f"Got it — that's genuinely useful. That's everything worth covering for {twin_data.get('name', 'this twin')} right now — nice work.",
+        "topic_id": None,
+        "topic_answer_so_far": "",
+        "topic_just_saved": True,
+        "topics_remaining_estimate": 0,
+        "done": True,
+    }
 
 
 class PersonalityRollbackRequest(BaseModel):

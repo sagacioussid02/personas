@@ -11,13 +11,7 @@ interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-}
-
-interface FieldUpdates {
-  pastDecisions?: string;
-  nonNegotiables?: string;
-  softPreferences?: string;
-  mindChange?: string;
+  savedTopic?: boolean;
 }
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -32,8 +26,9 @@ function DeepenChat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
-  const [topicsCovered, setTopicsCovered] = useState<string[]>([]);
-  const [fieldsCollected, setFieldsCollected] = useState<Record<string, string>>({});
+  const [topicAnswerSoFar, setTopicAnswerSoFar] = useState('');
+  const [topicsSavedThisSession, setTopicsSavedThisSession] = useState(0);
+  const [topicsRemainingEstimate, setTopicsRemainingEstimate] = useState(0);
   const [done, setDone] = useState(false);
   const [countdown, setCountdown] = useState(5);
   const [loadError, setLoadError] = useState('');
@@ -117,8 +112,7 @@ function DeepenChat() {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           history: newHistory.map(m => ({ role: m.role, content: m.content })),
-          topics_covered: topicsCovered,
-          fields_collected: fieldsCollected,
+          topic_answer_so_far: topicAnswerSoFar,
         }),
       });
 
@@ -127,25 +121,15 @@ function DeepenChat() {
 
       setMessages(prev => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'assistant', content: data.message },
+        { id: crypto.randomUUID(), role: 'assistant', content: data.message, savedTopic: !!data.topic_just_saved },
       ]);
 
-      if (data.topics_covered?.length) setTopicsCovered(data.topics_covered);
-      if (data.field_updates && Object.keys(data.field_updates).length) {
-        setFieldsCollected(prev => {
-          const next = { ...prev };
-          for (const [k, v] of Object.entries(data.field_updates as FieldUpdates)) {
-            if (v) {
-              if (k === 'pastDecisions' && next[k]) {
-                next[k] = next[k] + '\n\n' + v;
-              } else {
-                next[k] = v as string;
-              }
-            }
-          }
-          return next;
-        });
-      }
+      // A saved topic means the interview has moved on to a new (or no)
+      // topic — reset the accumulated answer so the next turn starts fresh
+      // instead of carrying over the just-saved topic's content.
+      setTopicAnswerSoFar(data.topic_just_saved ? '' : (data.topic_answer_so_far || ''));
+      if (data.topic_just_saved) setTopicsSavedThisSession(prev => prev + 1);
+      setTopicsRemainingEstimate(data.topics_remaining_estimate || 0);
 
       if (data.done) setDone(true);
     } catch {
@@ -205,18 +189,22 @@ function DeepenChat() {
             </div>
             <div>
               <h1 className="text-xl font-bold text-gray-800">Deepen {firstName}&apos;s twin</h1>
-              <p className="text-sm text-gray-500">3 quick questions to sharpen how your twin reasons</p>
+              <p className="text-sm text-gray-500">
+                As many questions as it takes to sharpen how your twin reasons — each answer is saved as soon as it&apos;s specific enough
+              </p>
             </div>
           </div>
 
-          {/* Progress dots */}
-          <div className="flex items-center gap-2 mb-4">
-            {['PAST_DECISIONS', 'NON_NEGOTIABLES', 'MIND_CHANGE'].map(topic => (
-              <div
-                key={topic}
-                className={`h-1.5 flex-1 rounded-full transition-colors ${topicsCovered.includes(topic) ? 'bg-purple-500' : 'bg-gray-200'}`}
-              />
-            ))}
+          {/* Progress — saved traits this session, plus a rough sense of what's left */}
+          <div className="flex items-center justify-between text-xs text-gray-500 mb-4 px-1">
+            <span>
+              {topicsSavedThisSession > 0
+                ? `${topicsSavedThisSession} trait${topicsSavedThisSession === 1 ? '' : 's'} saved this session`
+                : 'Nothing saved yet — keep answering'}
+            </span>
+            {!done && topicsRemainingEstimate > 0 && (
+              <span className="text-gray-400">~{topicsRemainingEstimate} more worth covering</span>
+            )}
           </div>
 
           {/* Chat */}
@@ -235,6 +223,11 @@ function DeepenChat() {
                     </div>
                   )}
                   <div className={`max-w-[80%] rounded-lg p-3 text-sm ${m.role === 'user' ? 'bg-slate-700 text-white' : 'bg-gray-50 border border-gray-200 text-gray-800'}`}>
+                    {m.savedTopic && (
+                      <p className="flex items-center gap-1 text-xs text-purple-600 font-medium mb-1.5">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Saved
+                      </p>
+                    )}
                     <p className="whitespace-pre-wrap">{m.content}</p>
                   </div>
                 </div>
@@ -260,15 +253,14 @@ function DeepenChat() {
             {done ? (
               <div className="border-t border-gray-100 p-6 bg-purple-50 rounded-b-xl text-center">
                 <CheckCircle2 className="w-10 h-10 text-purple-500 mx-auto mb-3" />
-                <p className="text-base font-semibold text-purple-800 mb-2">Interview complete!</p>
+                <p className="text-base font-semibold text-purple-800 mb-2">Nothing more to cover right now</p>
                 <div className="flex items-center justify-center gap-2 mb-3">
-                  <span className="text-xs text-gray-400">Twin depth upgraded to</span>
-                  <span className="text-xs font-semibold bg-purple-100 text-purple-700 border border-purple-200 px-2 py-0.5 rounded-full">
-                    Deep
+                  <span className="text-xs text-gray-400">
+                    {topicsSavedThisSession} trait{topicsSavedThisSession === 1 ? '' : 's'} saved this session
                   </span>
                 </div>
                 <p className="text-sm text-gray-600 mb-1">
-                  {firstName}&apos;s answers are now saved and will make future chats sharper and higher fidelity.
+                  {firstName}&apos;s answers are saved and will make future chats sharper and higher fidelity.
                 </p>
                 <p className="text-xs text-gray-400 mb-4">
                   Redirecting to dashboard in {countdown}s…
