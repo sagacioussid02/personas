@@ -2972,7 +2972,19 @@ words/content, not your own questions. Leave it empty if there's no new user ans
 is the opening question).
 - 2-4 sentences max. Be direct and warm. Never sound like a form ("Question 1 of 3").
 
-RETURN ONLY valid JSON — no markdown, no text outside the JSON:
+Do not think out loud, plan, or explain your reasoning anywhere in your reply. Do not narrate what \
+you are about to extract or why. The first character of your response must be "{{" — no preamble, \
+no commentary, no markdown fences, nothing before or after the JSON object. Do not wrap the JSON in \
+quotes or escape it as a string — output the raw JSON object itself, not a JSON-encoded string of it.
+
+RETURN ONLY valid JSON — no markdown, no text outside the JSON. For example, a good response looks \
+exactly like this (note: raw object, not stringified, no text around it):
+{{"message": "That's a big call — what made the MIT program feel worth the risk over something with a clearer payoff?", "answer_delta": "Chose the MIT quantum computing course over learning ML/AI, even though quantum was unfamiliar territory and the professors were intimidating."}}
+
+A BAD response (never do this) explains itself first or stringifies the JSON:
+Okay, let me extract the answer and think about a good follow-up... "{{\\"message\\": \\"...\\"}}"
+
+Now produce your own JSON object in the same raw, unescaped shape as the good example:
 {{
   "message": "your question, as natural prose",
   "answer_delta": "the user's new answer content this turn, or empty string"
@@ -3738,7 +3750,7 @@ async def deepen_message(
             modelId=BEDROCK_MODEL_ID,
             system=[{"text": system_prompt}],
             messages=messages,
-            inferenceConfig={"maxTokens": 400, "temperature": 0.9, "topP": 0.95},
+            inferenceConfig={"maxTokens": 600, "temperature": 0.9, "topP": 0.95},
         )
         raw = response["output"]["message"]["content"][0]["text"].strip()
         data = _extract_json_object(raw, required_key="message")
@@ -3750,8 +3762,13 @@ async def deepen_message(
         answer_delta = str(data.get("answer_delta") or "").strip()
 
     except (ValueError, json.JSONDecodeError) as exc:
+        # Never surface raw model output here: on a parse failure the "raw"
+        # text is often the model's own reasoning/preamble rather than a
+        # user-facing reply (observed live - the model narrated its JSON
+        # construction in prose and ran out of tokens before emitting it),
+        # and showing that verbatim leaks internal reasoning to the user.
         print(f"Deepen JSON parse error: {exc!r}")
-        reply_message = raw if "raw" in locals() and raw.strip() and not raw.strip().startswith("{") else fallback_message
+        reply_message = fallback_message
         answer_delta = ""
     except Exception as exc:
         print(f"Unexpected error in /twin/{{twin_id}}/deepen/message: {exc}")
