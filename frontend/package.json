@@ -11,7 +11,7 @@
   "dependencies": {
     "@clerk/nextjs": "^7.3.5",
     "lucide-react": "^0.575.0",
-    "next": "16.2.6",
+    "next": "^16.2.11",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },
@@ -26,6 +26,7 @@
     "typescript": "^5.9.3"
   },
   "overrides": {
-    "sharp": "0.35.3"
+    "sharp": "0.35.3",
+    "postcss": "8.5.22"
   }
 }
