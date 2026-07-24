@@ -116,6 +116,13 @@ function DeepenChat() {
         }),
       });
 
+      if (res.status === 429) {
+        setMessages(prev => [
+          ...prev,
+          { id: crypto.randomUUID(), role: 'assistant', content: "You've hit today's usage limit for this account. Please try again tomorrow." },
+        ]);
+        return;
+      }
       if (!res.ok) throw new Error('Request failed');
       const data = await res.json();
 

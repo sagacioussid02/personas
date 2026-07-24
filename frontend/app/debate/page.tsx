@@ -191,6 +191,9 @@ export default function DebatePage() {
           body: JSON.stringify({ twin_id: currentTwinId, topic: topic.trim(), history }),
           signal: controller.signal,
         });
+        if (res.status === 429) {
+          throw new Error("You've hit today's usage limit for this account. Please try again tomorrow.");
+        }
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error((err as { detail?: string }).detail || 'Turn failed');

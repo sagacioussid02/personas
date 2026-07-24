@@ -94,6 +94,9 @@ sessions/{session_id}.json       # Conversation history
 ### Anonymous feedback rate limiter
 `backend/server.py` keeps the feedback-notification rate-limiter state (anonymous per-IP rolling 7 days, authenticated per-`chatter_id` rolling 7 days, plus per-session one-shot behavior) in module-level memory, so it lives in the warm Lambda container and resets on cold start. Acceptable today because the SES daily quota is the hard ceiling and the only destination is `ADMIN_EMAILS`. If real abuse appears, move the limiter to DynamoDB or Redis.
 
+### Per-user LLM usage rate limiting
+`/chat` (authenticated callers only — anonymous callers instead hit the tighter `PUBLIC_PERSONA_ANON_LIMIT`), `/chat/debate`, and `/twin/{twin_id}/deepen/message` all share a single rolling 24-hour cap per `user_id` (`_check_and_consume_message_quota` in `backend/server.py`), returning `429 RATE_LIMIT_REACHED` once exhausted. This is a blunt cost-control safety net, not a monetization feature — it exists because those three endpoints each call Bedrock with no other quota. Same module-level-memory tradeoff as the feedback limiter above (resets on cold start; move to DynamoDB/Redis for stricter enforcement across horizontal scale).
+
 ## Deployment
 - CI/CD deploys automatically on push to `main` via `.github/workflows/deploy.yml`
 - Lambda is built inside a Docker container matching the Lambda runtime to ensure binary compatibility
@@ -117,6 +120,7 @@ sessions/{session_id}.json       # Conversation history
 | `ADMIN_EMAILS` | Comma-separated admin recipients for feedback/contact alerts. Empty disables notifications. |
 | `FEEDBACK_NOTIFY_RATE_LIMIT` | Max anonymous feedback notifications per source IP per rolling 7 days (default `3`; `0` disables the anonymous path while keeping the authenticated one) |
 | `AUTH_FEEDBACK_NOTIFY_RATE_LIMIT` | Max authenticated feedback notifications per `chatter_id` per rolling 7 days (default `5`; `0` disables the authenticated path while keeping the anonymous one) |
+| `USER_MESSAGE_RATE_LIMIT` | Max Bedrock-calling requests per authenticated `user_id` per rolling 24 hours, shared across `/chat`, `/chat/debate`, `/twin/{id}/deepen/message` (default `300`; `0` disables the cap) |
 
 **Frontend:**
 | Variable | Purpose |

@@ -193,6 +193,19 @@ function TwinChat() {
         setIsLoading(false);
         return;
       }
+      if (res.status === 429) {
+        setMessages(prev => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: 'assistant',
+            content: "You've hit today's usage limit for this account. Please try again tomorrow.",
+            timestamp: new Date(),
+          },
+        ]);
+        setIsLoading(false);
+        return;
+      }
       if (!res.ok) throw new Error('Failed to send');
       const data = await res.json();
       setMessages(prev => [...prev, {

@@ -248,6 +248,39 @@ def _set_pending_connect(session_id: str, message: str, intent_type: str) -> Non
         }
 
 
+# ── Per-user LLM usage rate limiting ──────────────────────────────────────────
+# There was previously no cap at all on authenticated usage: /chat, /chat/debate,
+# and /twin/{id}/deepen/message each call Bedrock with no per-user quota, so one
+# account (malicious or just a runaway client) could generate unbounded LLM
+# spend. This is a blunt, cheap safety net - a rolling 24h cap per user_id
+# shared across all three endpoints, not a monetization feature. Same
+# in-memory-per-warm-container tradeoff as the feedback notify limiter above
+# (resets on cold start; move to DynamoDB/Redis if stricter enforcement across
+# horizontal scale is ever needed).
+_USER_MESSAGE_RATE_LIMIT = _get_int_env("USER_MESSAGE_RATE_LIMIT", 300)
+_USER_MESSAGE_WINDOW_SECONDS = 24 * 3600.0  # 24 hours
+_user_message_history: dict[str, deque] = defaultdict(deque)
+_user_message_lock = threading.Lock()
+
+
+def _check_and_consume_message_quota(user_id: str) -> bool:
+    """Return True iff the caller has quota remaining this rolling 24h window,
+    consuming one slot. Returns True (unlimited) when the env flag is <= 0."""
+    if _USER_MESSAGE_RATE_LIMIT <= 0:
+        return True
+    with _user_message_lock:
+        now = time.monotonic()
+        history = _user_message_history[user_id]
+        while history and now - history[0] > _USER_MESSAGE_WINDOW_SECONDS:
+            history.popleft()
+        if not history:
+            _user_message_history.pop(user_id, None)
+        if len(history) >= _USER_MESSAGE_RATE_LIMIT:
+            return False
+        _user_message_history[user_id].append(now)  # re-creates via defaultdict if key was just removed
+        return True
+
+
 def _truncate_ip(ip: str) -> str:
     """Return a /24-truncated IPv4 address (last octet zeroed) for reduced PII.
 
@@ -1169,6 +1202,12 @@ async def chat(
     try:
         # Resolve caller identity (optional — anonymous callers are allowed)
         chatter_id, user_email = await _decode_user_claims(credentials)
+
+        # Authenticated callers get a generous but real daily cap (anonymous
+        # callers already have the tighter, twin-scoped PUBLIC_PERSONA_ANON_LIMIT
+        # below, which doubles as their abuse protection).
+        if chatter_id and not _check_and_consume_message_quota(chatter_id):
+            raise HTTPException(status_code=429, detail="RATE_LIMIT_REACHED")
 
         # Derive an opaque stable session key for authenticated users so memory
         # persists across devices and page reloads. Anonymous users fall back to
@@ -2534,6 +2573,9 @@ async def debate_turn(
     (typing indicator while waiting, typewriter animation on arrival) without
     requiring Lambda response streaming.
     """
+    if not _check_and_consume_message_quota(user_id):
+        raise HTTPException(status_code=429, detail="RATE_LIMIT_REACHED")
+
     twin_data = load_twin(request.twin_id)
     if not twin_data or not _is_debate_authorized(twin_data, user_id):
         raise HTTPException(status_code=404, detail="Twin not found")
@@ -2598,6 +2640,9 @@ async def debate(
     True token-level streaming requires Lambda Function URL response streaming
     and is a planned future upgrade.
     """
+    if not _check_and_consume_message_quota(user_id):
+        raise HTTPException(status_code=429, detail="RATE_LIMIT_REACHED")
+
     twin_a_data = load_twin(request.twin_id_a)
     twin_b_data = load_twin(request.twin_id_b)
 
@@ -3679,6 +3724,9 @@ async def deepen_message(
     call, so a twin can always be deepened again once new gaps, thin fields,
     or research-agent candidate topics exist.
     """
+    if not _check_and_consume_message_quota(user_id):
+        raise HTTPException(status_code=429, detail="RATE_LIMIT_REACHED")
+
     twin_data = load_twin(twin_id)
     if not twin_data or twin_data.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Twin not found")
