@@ -28,6 +28,7 @@ import jwt
 from urllib.parse import quote
 from agent_orchestrator import run_chat_orchestration
 from personality_agent import detect_archetype, get_archetype, get_all_archetypes, review_response
+from context import prompt
 from source_memory import (
     build_correction_source,
     build_deepen_sources,
