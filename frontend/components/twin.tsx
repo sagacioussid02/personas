@@ -150,6 +150,18 @@ export default function Twin() {
                 ]);
                 return;
             }
+            if (response.status === 429) {
+                setMessages(prev => [
+                    ...prev,
+                    {
+                        id: (Date.now() + 1).toString(),
+                        role: 'assistant',
+                        content: "You've hit today's usage limit for this account. Please try again tomorrow.",
+                        timestamp: new Date(),
+                    },
+                ]);
+                return;
+            }
             if (!response.ok) throw new Error('Failed to send message');
 
             const data = await response.json();
