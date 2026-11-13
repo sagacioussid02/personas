@@ -1,43 +1,150 @@
 # Contributing to Personality Twin
 
-## Monorepo Package Boundary
+Welcome to the twin project. This guide covers local setup, the build pipeline, contribution workflow, and how we make decisions as a team.
 
-This project uses a monorepo structure with two distinct package.json files:
+## Quick Start
 
-### Root `package.json`
+See the [README](./README.md) for local setup (Node 20+, Python 3.12+, Clerk account, AWS credentials).
 
-The root package.json (12 dependencies) contains **shared tooling and build infrastructure** only:
-- Linting and formatting tools (eslint, prettier)
-- Build and deployment utilities
-- Shared development dependencies
+## Contribution Workflow
 
-**Rule:** Do not add application dependencies to the root package.json. The root is for tooling only.
+### Before You Start
 
-### Frontend `package.json`
+1. **Check the backlog** — Is the work already tracked? If not, file an issue.
+2. **Assign yourself** — Let the team know you're working on it.
+3. **Check for Decision Records** — If the work is material (new feature, dependency upgrade, infra change, team change), it needs DR approval. See [DECISIONS.md](./DECISIONS.md).
+4. **Create a feature branch** — Use the naming pattern: `minions/<role>/<short-summary>`
 
-The frontend/package.json (13 dependencies) contains **all frontend application code dependencies**:
-- React, Next.js, and related libraries
-- UI component libraries
-- Frontend-specific utilities
+### During Development
 
-**Rule:** All new frontend code must use `.tsx` or `.ts` file extensions. Do not create new `.js` or `.mjs` files in the frontend directory.
+1. **Write code** — Follow the language-specific guides below.
+2. **Run tests and linters locally** — No surprises in CI.
+3. **Commit with conventional messages** — See [COMMIT_STANDARDS.md](./COMMIT_STANDARDS.md).
+4. **Keep commits focused** — One logical change per commit.
+5. **Update lock files** — `npm ci` (frontend), `uv pip compile` (backend).
 
-## When to Edit Which File
+### Before You Push
 
-| Change Type | Edit | Reason |
-|---|---|---|
-| Add a linting rule, formatter config, or build tool | Root `package.json` | Shared across the monorepo |
-| Add a React component, utility, or library for the UI | Frontend `package.json` | Frontend-specific dependency |
-| Add a backend Python dependency | `backend/pyproject.toml` | Backend uses Python, not npm |
-| Add a TypeScript type definition | Frontend `package.json` | Frontend uses TypeScript |
+1. **Read your own diff** — Catch obvious issues before review.
+2. **Run full test suite:**
+   - Frontend: `npm run type-check && npm run lint && npm test && npm run build`
+   - Backend: `pylint backend/ && pytest`
+3. **Ensure lock files are committed** — These are required for reproducible builds.
 
-## Backend Dependencies
+### Opening a Pull Request
 
-Backend dependencies are managed in `backend/pyproject.toml` and locked in `backend/requirements.lock`. To add a new backend dependency:
+1. Push your branch: `git push origin minions/engineer/my-feature`
+2. Open PR against `main` (not `production`)
+3. Title should match your commit message (conventional format)
+4. Body should explain: what, why, testing approach
+5. Link any related issues
 
-1. Edit `backend/pyproject.toml` and add the dependency to the `dependencies` list
-2. Run `uv pip compile backend/pyproject.toml -o backend/requirements.lock` to regenerate the lock file
-3. Commit both `pyproject.toml` and `requirements.lock`
+### Code Review
+
+- **Peer engineer reviews first** — Checks logic, style, and test coverage
+- **Operator reviews second** — Verifies alignment and approves merge
+- **Respond to feedback** — Either push a fix commit or explain your reasoning
+- **All CI must pass** — Green tests and linters required
+- **You cannot merge your own PR** — Even if approved, wait for another engineer or operator to merge
+
+See [COMMIT_STANDARDS.md](./COMMIT_STANDARDS.md) for detailed review expectations.
+
+## Monorepo Package Boundaries
+
+This project uses a monorepo structure with distinct responsibilities:
+
+### Root `package.json` (Tooling Only)
+
+The root contains **shared build and development tools**:
+- Linting (ESLint, Prettier)
+- Build utilities
+- Shared dev dependencies
+
+**Rule:** Do not add application dependencies here. The root is for tooling only.
+
+### Frontend `package.json` (Application Dependencies)
+
+The frontend contains **all UI application code and libraries**:
+- React, Next.js
+- UI components and utilities
+- Frontend-specific tools
+
+**Rule:** All new frontend code must use `.tsx` or `.ts` extensions. No `.js` or `.mjs` files in the frontend directory.
+
+### Backend `pyproject.toml` (Backend Dependencies)
+
+The backend uses Python and is managed via `pyproject.toml`:
+- FastAPI, Bedrock client libraries
+- Backend-specific utilities
+- Locked in `requirements.lock` for reproducible builds
+
+**To add a backend dependency:**
+
+```bash
+# 1. Edit backend/pyproject.toml and add the package
+# 2. Regenerate the lock file
+cd backend
+uv pip compile pyproject.toml -o requirements.lock
+# 3. Commit both pyproject.toml and requirements.lock
+```
+
+## Language-Specific Guidelines
+
+### Frontend (TypeScript / Next.js / React)
+
+- **File extensions:** `.tsx` for components, `.ts` for utilities. No `.js` or `.mjs`.
+- **Type safety:** Use TypeScript; avoid `any` unless unavoidable.
+- **Testing:** Jest unit tests in `__tests__` or alongside source.
+- **Linting:** `npm run lint` (ESLint + Prettier)
+- **Build:** `npm run build` catches issues early.
+- **Clerk integration:** Follow the @clerk/nextjs docs for auth.
+
+**Example component:**
+
+```typescript
+// frontend/components/ChatMessage.tsx
+import React from 'react';
+
+interface ChatMessageProps {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export const ChatMessage: React.FC<ChatMessageProps> = ({ role, content }) => {
+  return (
+    <div className={`message message-${role}`}>
+      {content}
+    </div>
+  );
+};
+```
+
+### Backend (Python / FastAPI)
+
+- **Python version:** 3.12+
+- **Style:** PEP 8. Run `pylint` locally.
+- **Type hints:** Use for function signatures and complex logic.
+- **Testing:** `pytest` with fixtures for Bedrock mocking.
+- **Environment:** Use `.env` for local secrets (not committed). See `backend/.env.example`.
+
+**Example FastAPI endpoint:**
+
+```python
+# backend/routes/chat.py
+from fastapi import APIRouter, HTTPException
+from app.services.bedrock import invoke_model
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+@router.post("/")
+async def chat(user_id: str, message: str):
+    """Send a message to a personality twin."""
+    try:
+        response = await invoke_model(user_id, message)
+        return {"role": "assistant", "content": response}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+```
 
 ## Installing Dependencies
 
@@ -45,44 +152,57 @@ Backend dependencies are managed in `backend/pyproject.toml` and locked in `back
 
 ```bash
 cd frontend
-npm ci  # Use npm ci for reproducible installs in CI
-npm install  # Use npm install locally to add new dependencies
+npm ci        # Use npm ci for reproducible installs (CI & production)
+npm install   # Use npm install locally when adding new deps
 ```
 
 ### Backend
 
 ```bash
 cd backend
-pip install --require-hashes -r requirements.lock  # CI and production
-pip install -e .  # Local development
+pip install --require-hashes -r requirements.lock  # CI & production
+pip install -e .                                   # Local development
 ```
 
 ## Code Style
 
-- **Frontend:** TypeScript (.tsx, .ts only). Run `npm run lint` to check.
-- **Backend:** Python 3.12+. Follow PEP 8.
-- **Commits:** Use conventional commits (feat:, fix:, docs:, etc.)
+- **Commits:** Conventional commits (feat:, fix:, docs:, etc.). See [COMMIT_STANDARDS.md](./COMMIT_STANDARDS.md).
+- **Frontend:** TypeScript, ESLint, Prettier. Run `npm run lint`.
+- **Backend:** Python 3.12+, PEP 8. Run `pylint`.
+- **Documentation:** Clear, present tense, examples where helpful.
+- **Comments:** Explain *why*, not *what* (the code shows what).
 
 ## Testing
 
-- Frontend: `npm test` (Jest)
-- Backend: `pytest` (from backend directory)
+### Frontend
 
-## Before You Push
+```bash
+cd frontend
+npm test                   # Jest
+npm run type-check         # TypeScript
+npm run lint               # ESLint + Prettier
+npm run build              # Catch production issues
+```
 
-1. Run linters locally: `npm run lint` (frontend), `pylint` (backend)
-2. Run tests: `npm test` (frontend), `pytest` (backend)
-3. Ensure lock files are up to date
-4. Use conventional commit messages
-Welcome! This guide covers local setup, the build pipeline, and deployment for Personality Twin.
+### Backend
 
-## Prerequisites
+```bash
+cd backend
+pytest                     # Unit & integration tests
+pylint **/*.py             # Code style
+```
 
-- **Node.js** 20+ (for frontend)
-- **Python** 3.12+ (for backend)
-- **AWS credentials** with Bedrock access (for chat features)
-- **Clerk account** (free tier works for local dev)
-- **Git** (for version control)
+## Decision Records
+
+Material changes require a Decision Record (DR) and operator approval. See [DECISIONS.md](./DECISIONS.md) for:
+
+- When a DR is required (features, deps, infra, team changes)
+- How to propose one
+- Approval workflow
+
+## Code Ownership
+
+See [CODEOWNERS](./CODEOWNERS) for domain ownership and review requirements.
 
 ## Local Development Setup
 
@@ -101,23 +221,23 @@ Welcome! This guide covers local setup, the build pipeline, and deployment for P
 
 3. **Install dependencies from the lock file:**
    ```bash
-   pip install -r requirements.txt
+   pip install -r requirements.lock
    ```
-   
-   > **Note:** `requirements.txt` is auto-generated from `pyproject.toml` via `pip-compile`. It is the source of truth for reproducible builds. Do not edit it directly.
+
+   > **Note:** `requirements.lock` is auto-generated from `pyproject.toml` via `uv pip compile`. It is the source of truth for reproducible builds. Do not edit it directly.
 
 4. **Set up environment variables:**
    ```bash
    cp .env.example .env
    ```
-   
+
    Required variables:
    - `CLERK_JWKS_URL` — From your Clerk dashboard → API Keys
    - `SESSION_HMAC_SECRET` — 64-char hex. Generate with:
      ```bash
      python -c "import secrets; print(secrets.token_hex(32))"
      ```
-   
+
    Optional:
    - `USE_S3=false` — Use local disk instead of S3 (fine for dev)
 
@@ -125,7 +245,7 @@ Welcome! This guide covers local setup, the build pipeline, and deployment for P
    ```bash
    uvicorn server:app --reload --port 8000
    ```
-   
+
    API is now at `http://localhost:8000`. Visit `/docs` for the auto-generated Swagger UI.
 
 ### Frontend (Next.js + React)
@@ -139,14 +259,14 @@ Welcome! This guide covers local setup, the build pipeline, and deployment for P
    ```bash
    npm ci
    ```
-   
+
    > **Note:** `package-lock.json` is committed and enforced in CI. Use `npm ci` for reproducible installs. Only use `npm install` if you intentionally update dependencies, then commit the updated lock file.
 
 3. **Set up environment variables:**
    ```bash
    cp .env.local.example .env.local
    ```
-   
+
    Required variables:
    - `NEXT_PUBLIC_API_URL=http://localhost:8000`
    - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_...` (from Clerk dashboard)
@@ -155,7 +275,7 @@ Welcome! This guide covers local setup, the build pipeline, and deployment for P
    ```bash
    npm run dev
    ```
-   
+
    App is now at `http://localhost:3000`.
 
 ## Build Pipeline
@@ -165,15 +285,14 @@ Welcome! This guide covers local setup, the build pipeline, and deployment for P
 **Single source of truth:** `backend/pyproject.toml`
 
 - All Python dependencies are declared in `pyproject.toml`
-- `requirements.txt` is generated via `pip-compile` in CI and committed for reproducibility
-- CI enforces that `requirements.txt` matches the generated output from `pyproject.toml`
+- `requirements.lock` is generated via `uv pip compile` in CI and committed for reproducibility
+- CI enforces that `requirements.lock` matches the generated output from `pyproject.toml`
 - If you add or update a Python dependency:
   1. Edit `backend/pyproject.toml`
-  2. Regenerate `requirements.txt` locally:
+  2. Regenerate `requirements.lock` locally:
      ```bash
      cd backend
-     pip install pip-compile  # if not already installed
-     pip-compile pyproject.toml
+     uv pip compile pyproject.toml -o requirements.lock
      ```
   3. Commit both files
 
@@ -226,7 +345,7 @@ npm test
    ```bash
    # Backend
    cd backend && pytest
-   
+
    # Frontend
    cd frontend && npm test
    ```
@@ -257,7 +376,7 @@ Production deployments are managed by the DevOps team via the `destroy.yml` and 
 twin/
 ├── backend/                    # FastAPI application
 │   ├── pyproject.toml         # Python dependencies (source of truth)
-│   ├── requirements.txt       # Generated lock file (auto-generated in CI)
+│   ├── requirements.lock      # Generated lock file (auto-generated in CI)
 │   ├── server/                # FastAPI app code
 │   └── tests/                 # Backend tests
 ├── frontend/                  # Next.js application
@@ -280,7 +399,7 @@ twin/
 ```bash
 cd backend
 source venv/bin/activate  # or: venv\Scripts\activate on Windows
-pip install -r requirements.txt
+pip install -r requirements.lock
 ```
 
 ### "Cannot find module" errors in frontend
@@ -296,27 +415,32 @@ npm ci
 
 ### Lambda build fails with dependency errors
 
-**Cause:** `requirements.txt` out of sync with `pyproject.toml`.
+**Cause:** `requirements.lock` out of sync with `pyproject.toml`.
 
 **Fix:**
 ```bash
 cd backend
-pip-compile pyproject.toml
-git add requirements.txt
-git commit -m "chore: regenerate requirements.txt"
+uv pip compile pyproject.toml -o requirements.lock
+git add requirements.lock
+git commit -m "chore: regenerate requirements.lock"
 ```
 
-### CI validation fails: "requirements.txt does not match generated output"
+### CI validation fails: "requirements.lock does not match generated output"
 
-**Cause:** You edited `requirements.txt` directly or `pyproject.toml` changed without regenerating.
+**Cause:** You edited `requirements.lock` directly or `pyproject.toml` changed without regenerating.
 
 **Fix:**
 ```bash
 cd backend
-pip-compile pyproject.toml
-git add requirements.txt
-git commit -m "chore: regenerate requirements.txt"
+uv pip compile pyproject.toml -o requirements.lock
+git add requirements.lock
+git commit -m "chore: regenerate requirements.lock"
 ```
+
+## Architecture & Ops
+
+- **System design:** See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full stack breakdown (CloudFront, Lambda, Bedrock, S3).
+- **Deployment:** See [docs/operations/](./docs/operations/) for runbooks and operational procedures.
 
 ## Getting Help
 
