@@ -1,0 +1,26 @@
+# Twin Project Code Ownership
+# This file defines responsibility boundaries and review requirements
+# See DECISIONS.md for material change approval process
+
+# Backend services - FastAPI, AWS integration
+backend/ @minions/twin-engineers
+
+# Frontend application - Next.js, React, TypeScript
+frontend/ @minions/twin-engineers
+
+# Architecture and infrastructure documentation
+ARCHITECTURE.md @minions/twin-engineers
+
+# Deployment and operational runbooks
+docs/operations/ @minions/twin-engineers
+
+# Dependency declarations
+backend/pyproject.toml @minions/twin-engineers
+frontend/package.json @minions/twin-engineers
+package.json @minions/twin-engineers
+
+# Processes and contributor guidance
+CONTRIBUTING.md @minions/operator
+DECISIONS.md @minions/operator
+COMMIT_STANDARDS.md @minions/operator
+CODEOWNERS @minions/operator
